@@ -1,4 +1,13 @@
+mod selectors;
 mod settings;
+use gpui_kit::component::{
+    calendar::Date,
+    date_picker::{DatePicker, DatePickerEvent, DatePickerState},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
+};
+use lark2tapd_bridge::installer::{CliTool, InstallationPlan};
+use lark2tapd_core::{DirectoryCache, SourcePerson, TapdWorkspace};
+use selectors::{ChoiceList, ChoiceState, selected};
 mod tasks;
 // 主界面只管理视图和输入；同步、认证和持久化通过工作队列执行。
 use crate::{
@@ -23,6 +32,10 @@ pub struct Model {
     pub error: bool,
     pub preview: Option<Preview>,
     pub mode: Mode,
+    pub install_plan: Option<InstallationPlan>,
+    pub lark_diagnostic: String,
+    pub tapd_diagnostic: String,
+    config_revision: u64,
     pending_request: u64,
     profile: String,
     jobs: std::sync::mpsc::Sender<Request>,
@@ -86,7 +99,7 @@ impl Model {
                 let count = snapshot
                     .records
                     .iter()
-                    .filter(|r| r.status() == SyncStatus::Unimported)
+                    .filter(|r| r.in_scope && r.status() == SyncStatus::Unimported)
                     .count();
                 if let Some(tray) = &self.tray {
                     tray.update(
@@ -109,9 +122,58 @@ impl Model {
                 ) {
                     self.preview = None;
                 }
+                if message == "installed" {
+                    self.config_revision += 1;
+                }
+                if matches!(
+                    message,
+                    "installed"
+                        | "settings_saved"
+                        | "credentials_saved"
+                        | "credentials_cleared"
+                        | "authorized"
+                ) {
+                    self.lark_diagnostic.clear();
+                    self.tapd_diagnostic.clear();
+                }
+                if matches!(message, "installed" | "install_cancelled") {
+                    self.install_plan = None;
+                }
+                if self.preview.as_ref().is_some_and(|p| {
+                    !snapshot
+                        .records
+                        .iter()
+                        .any(|r| r.source.guid == p.guid && r.in_scope)
+                }) {
+                    self.preview = None;
+                }
+                gpui_kit::component::set_locale(&snapshot.settings.language);
                 self.snapshot = Some(snapshot);
                 self.busy = false;
                 self.error = false;
+            }
+            Event::InstallPlan(plan) => {
+                self.install_plan = Some(plan);
+            }
+            Event::Diagnostic {
+                tool,
+                version,
+                connected,
+                detail,
+            } => {
+                let version = version.unwrap_or_else(|| {
+                    text(self.language(), "CLI 不可用", "CLI unavailable").into()
+                });
+                let status = if connected {
+                    text(self.language(), "连接通过", "Connected")
+                } else {
+                    text(self.language(), "连接未通过", "Connection failed")
+                };
+                let result = format!("{version} · {status} {detail}");
+                match tool {
+                    CliTool::Lark => self.lark_diagnostic = result,
+                    CliTool::Tapd => self.tapd_diagnostic = result,
+                }
             }
             Event::Preview(preview) => {
                 self.preview = Some(preview);
@@ -156,6 +218,10 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
         error: false,
         preview: None,
         mode,
+        install_plan: None,
+        config_revision: 0,
+        lark_diagnostic: String::new(),
+        tapd_diagnostic: String::new(),
         pending_request: 0,
         profile: String::new(),
         jobs: worker.jobs,
@@ -301,6 +367,17 @@ fn apply_theme(mode: &str, cx: &mut App) {
         theme.colors.primary = rgb(if dark { 0x59c3bc } else { 0x006764 }).into();
         theme.colors.primary_foreground = rgb(if dark { 0x052925 } else { 0xffffff }).into();
         theme.colors.ring = rgb(0x008c8c).into();
+        // Kit 的按钮采用独立令牌，不能只改 primary；同时覆盖交互状态和次级操作。
+        theme.colors.button_primary = theme.colors.primary;
+        theme.colors.button_primary_foreground = theme.colors.primary_foreground;
+        theme.colors.button_primary_hover = rgb(if dark { 0x71d1ca } else { 0x007873 }).into();
+        theme.colors.button_primary_active = rgb(if dark { 0x46aaa4 } else { 0x00534f }).into();
+        theme.colors.button_secondary = rgb(if dark { 0x103d39 } else { 0xedf7f5 }).into();
+        theme.colors.button_secondary_foreground = theme.colors.primary;
+        theme.colors.button_secondary_hover = rgb(if dark { 0x194d47 } else { 0xd6efea }).into();
+        theme.colors.button_secondary_active = rgb(if dark { 0x235e57 } else { 0xbfe5de }).into();
+        theme.colors.secondary_foreground = theme.colors.primary;
+        theme.colors.accent_foreground = theme.colors.primary;
         theme.font_size = px(14.);
         theme.radius = px(7.);
     });
@@ -316,6 +393,9 @@ enum Filter {
 }
 impl Filter {
     fn matches(self, r: &SyncRecord) -> bool {
+        if !r.in_scope {
+            return false;
+        }
         match self {
             Self::Pending => r.status() == SyncStatus::Unimported,
             Self::Changed => matches!(r.status(), SyncStatus::Changed | SyncStatus::Uncertain),
@@ -333,15 +413,18 @@ pub struct Workspace {
     edit_source: Option<SourceTask>,
     edit_profile: String,
     clear_confirmation: bool,
-    display_mode: Mode,
+    last_directory: Option<DirectoryCache>,
+    applied_config_revision: u64,
+    manual_workspace_id: Entity<InputState>,
+    manual_workspace_name: Entity<InputState>,
     search: Entity<InputState>,
     title: Entity<InputState>,
     description: Entity<TextareaState>,
-    owner: Entity<InputState>,
-    workspace: Entity<InputState>,
-    settings_workspace: Entity<InputState>,
-    settings_owner: Entity<InputState>,
-    due: Entity<InputState>,
+    owner: Entity<ChoiceState>,
+    workspace: Entity<ChoiceState>,
+    settings_workspace: Entity<ChoiceState>,
+    settings_owner: Entity<ChoiceState>,
+    due: Entity<DatePickerState>,
     poll: Entity<InputState>,
     lark_path: Entity<InputState>,
     tapd_path: Entity<InputState>,
@@ -369,21 +452,49 @@ impl Workspace {
             this.selected = Some(editor.source.guid.clone());
             let d = &editor.draft;
             set(&this.title, d.title.clone(), window, cx);
-            set(&this.workspace, d.workspace_id.clone(), window, cx);
-            set(&this.owner, d.owner.clone(), window, cx);
-            set(&this.due, d.due.clone().unwrap_or_default(), window, cx);
+            this.fill_projects(false, &d.workspace_id, window, cx);
+            this.fill_members(false, &d.owner, window, cx);
+            this.due.update(cx, |state, cx| {
+                state.set_date(
+                    Date::Single(
+                        d.due
+                            .as_ref()
+                            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
+                    ),
+                    window,
+                    cx,
+                )
+            });
             this.description
                 .update(cx, |s, cx| s.set_value(d.description.clone(), window, cx));
             cx.notify();
         })
         .detach();
         cx.observe_in(&model, window, |this, _, window, cx| {
-            let mode = this.model.read(cx).mode;
-            if this.display_mode != mode {
-                this.display_mode = mode;
-                if this.filter == Filter::Settings {
-                    this.open_settings(window, cx);
+            let revision = this.model.read(cx).config_revision;
+            if revision != this.applied_config_revision {
+                this.applied_config_revision = revision;
+                if let Some(settings) = this
+                    .model
+                    .read(cx)
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.settings.clone())
+                {
+                    set(&this.lark_path, settings.lark_path, window, cx);
+                    set(&this.tapd_path, settings.tapd_path, window, cx);
                 }
+            }
+            this.sync_directory(window, cx);
+            if this.selected.as_ref().is_some_and(|id| {
+                this.model
+                    .read(cx)
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| !s.records.iter().any(|r| &r.source.guid == id && r.in_scope))
+            }) {
+                this.selected = None;
+                this.edit_source = None;
             }
             if !this.edit_profile.is_empty() && this.edit_profile != this.model.read(cx).profile {
                 this.selected = None;
@@ -411,10 +522,49 @@ impl Workspace {
                 }
             })
             .detach();
-        let display_mode = model.read(cx).mode;
-        Self {
+        let workspace = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(Vec::<selectors::Choice>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let settings_workspace = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(Vec::<selectors::Choice>::new()),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        cx.subscribe_in(
+            &workspace,
+            window,
+            |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
+                this.project_changed(false, window, cx)
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &settings_workspace,
+            window,
+            |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
+                this.project_changed(true, window, cx)
+            },
+        )
+        .detach();
+        let due = cx.new(|cx| DatePickerState::new(window, cx).date_format("%Y-%m-%d"));
+        cx.subscribe(&due, |_, _, _: &DatePickerEvent, cx| cx.notify())
+            .detach();
+        let mut this = Self {
             model,
-            display_mode,
+            last_directory: None,
+            applied_config_revision: 0,
+            manual_workspace_id: cx.new(|cx| InputState::new(window, cx)),
+            manual_workspace_name: cx.new(|cx| InputState::new(window, cx)),
             filter: Filter::Pending,
             selected: None,
             edit_source: None,
@@ -423,11 +573,27 @@ impl Workspace {
             search,
             title: cx.new(|cx| InputState::new(window, cx)),
             description: cx.new(|cx| TextareaState::new(window, cx)),
-            owner: cx.new(|cx| InputState::new(window, cx)),
-            workspace: cx.new(|cx| InputState::new(window, cx)),
-            settings_workspace: cx.new(|cx| InputState::new(window, cx)),
-            settings_owner: cx.new(|cx| InputState::new(window, cx)),
-            due: cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD")),
+            owner: cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(Vec::<selectors::Choice>::new()),
+                    None,
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            }),
+            workspace,
+            settings_workspace,
+            settings_owner: cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(Vec::<selectors::Choice>::new()),
+                    None,
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            }),
+            due,
             poll: cx.new(|cx| InputState::new(window, cx)),
             lark_path: cx.new(|cx| InputState::new(window, cx)),
             tapd_path: cx.new(|cx| InputState::new(window, cx)),
@@ -439,7 +605,9 @@ impl Workspace {
             recover_id: cx.new(|cx| InputState::new(window, cx)),
             recover_kind: "story".into(),
             pending_seen: 0,
-        }
+        };
+        this.sync_directory(window, cx);
+        this
     }
     fn tr<'a>(&self, cx: &App, zh: &'a str, en: &'a str) -> &'a str {
         text(self.model.read(cx).language(), zh, en)
@@ -455,18 +623,23 @@ impl Workspace {
         Draft {
             title: self.title.read(cx).value().to_string(),
             description: self.description.read(cx).value().to_string(),
-            workspace_id: self.workspace.read(cx).value().trim().into(),
-            owner: self.owner.read(cx).value().trim().into(),
-            due: nonempty(self.due.read(cx).value().as_ref()),
+            workspace_id: selected(&self.workspace, cx),
+            owner: selected(&self.owner, cx),
+            due: match self.due.read(cx).date() {
+                Date::Single(date) => date.map(|d| d.format("%Y-%m-%d").to_string()),
+                _ => None,
+            },
         }
     }
     fn select(&mut self, record: SyncRecord, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.read(cx).busy {
             return;
         }
-        for input in [&self.title, &self.workspace, &self.owner, &self.due] {
-            set(input, String::new(), window, cx);
-        }
+        set(&self.title, String::new(), window, cx);
+        self.fill_projects(false, "", window, cx);
+        self.fill_members(false, "", window, cx);
+        self.due
+            .update(cx, |s, cx| s.set_date(Date::Single(None), window, cx));
         self.description
             .update(cx, |s, cx| s.set_value(String::new(), window, cx));
         self.selected = Some(record.source.guid.clone());
@@ -483,9 +656,9 @@ impl Workspace {
         self.filter = Filter::Settings;
         if let Some(snapshot) = &self.model.read(cx).snapshot {
             let s = snapshot.settings.clone();
+            self.fill_projects(true, &s.workspace_id, window, cx);
+            self.fill_members(true, &s.owner, window, cx);
             for (field, value) in [
-                (&self.settings_workspace, s.workspace_id),
-                (&self.settings_owner, s.owner),
                 (&self.poll, s.poll_minutes.to_string()),
                 (&self.lark_path, s.lark_path),
                 (&self.tapd_path, s.tapd_path),
@@ -498,8 +671,8 @@ impl Workspace {
     }
     fn settings(&self, cx: &App) -> Option<Settings> {
         let mut s = self.model.read(cx).snapshot.as_ref()?.settings.clone();
-        s.workspace_id = self.settings_workspace.read(cx).value().trim().into();
-        s.owner = self.settings_owner.read(cx).value().trim().into();
+        s.workspace_id = selected(&self.settings_workspace, cx);
+        s.owner = selected(&self.settings_owner, cx);
         s.poll_minutes = self.poll.read(cx).value().parse().unwrap_or(0);
         s.lark_path = self.lark_path.read(cx).value().trim().into();
         s.tapd_path = self.tapd_path.read(cx).value().trim().into();
@@ -703,10 +876,6 @@ fn section(label: &str) -> impl IntoElement {
         .text_lg()
         .child(label.to_owned())
 }
-fn nonempty(s: &str) -> Option<String> {
-    let s = s.trim();
-    if s.is_empty() { None } else { Some(s.into()) }
-}
 fn status_text(language: &str, status: SyncStatus) -> &'static str {
     match status {
         SyncStatus::Unimported => text(language, "未同步", "Unimported"),
@@ -717,6 +886,41 @@ fn status_text(language: &str, status: SyncStatus) -> &'static str {
 }
 fn message_text<'a>(language: &str, key: &'a str) -> &'a str {
     match key {
+        "projects_loaded" => text(
+            language,
+            "项目列表已刷新并缓存",
+            "Project options refreshed and cached",
+        ),
+        "members_loaded" => text(
+            language,
+            "处理人列表已刷新并缓存",
+            "Assignee options refreshed and cached",
+        ),
+        "project_added" => text(
+            language,
+            "项目已验证并加入缓存",
+            "Project verified and cached",
+        ),
+        "install_plan" => text(
+            language,
+            "请核对安装来源与目录，再确认安装",
+            "Review the installation source and destination before confirming",
+        ),
+        "install_cancelled" => text(
+            language,
+            "已取消安装，未修改本机工具",
+            "Installation cancelled; local tools unchanged",
+        ),
+        "installed" => text(
+            language,
+            "CLI 已安装，路径已保存",
+            "CLI installed and executable path saved",
+        ),
+        "diagnosed" => text(
+            language,
+            "连接诊断完成，请查看各 CLI 结果",
+            "Connection diagnostics finished; see each CLI result",
+        ),
         "editor_ready" => text(language, "已读取草稿", "Draft loaded"),
         "mode_changed" => text(
             language,

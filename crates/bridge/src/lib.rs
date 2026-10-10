@@ -1,11 +1,15 @@
 mod credentials;
+pub mod installer;
 mod process;
 use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Local, TimeZone, Utc};
 pub use credentials::{
     Credentials, clear_credentials, credentials_namespace, load_credentials, save_credentials,
 };
-use lark2tapd_core::{Draft, Gateway, Settings, SourceTask, TargetTask};
+use lark2tapd_core::{
+    Draft, Gateway, Settings, SourceMetadata, SourcePerson, SourceTask, TapdMember, TapdWorkspace,
+    TargetTask,
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -24,33 +28,45 @@ pub struct AuthStatus {
 }
 impl CliGateway {
     pub fn new(settings: Settings, credentials: Credentials) -> Result<Self> {
-        ensure!(
-            Path::new(&settings.lark_path).is_absolute()
-                && Path::new(&settings.tapd_path).is_absolute(),
-            "Configure absolute CLI executable paths"
-        );
-        let endpoint = url::Url::parse(&settings.tapd_endpoint)
-            .map_err(|_| anyhow::anyhow!("Invalid TAPD endpoint"))?;
-        ensure!(
-            endpoint.scheme() == "https"
-                && endpoint.host_str() == Some("api.tapd.cn")
-                && endpoint.username().is_empty()
-                && endpoint.password().is_none()
-                && endpoint.port().is_none()
-                && endpoint.path() == "/"
-                && endpoint.query().is_none()
-                && endpoint.fragment().is_none(),
-            "TAPD endpoint must be https://api.tapd.cn"
-        );
-        ensure!(
-            (credentials.lark_app_secret.is_empty() && credentials.lark_user_token.is_empty())
-                || !credentials.lark_app_id.is_empty(),
-            "Lark App ID is required with a secret or user token"
-        );
+        // 独立连接测试只校验当前使用的平台；实际调用前仍严格校验路径与凭据。
         Ok(Self {
             settings,
             credentials,
         })
+    }
+    fn validate_provider(&self, lark: bool) -> Result<()> {
+        let path = if lark {
+            &self.settings.lark_path
+        } else {
+            &self.settings.tapd_path
+        };
+        ensure!(
+            Path::new(path).is_absolute(),
+            "Configure an absolute CLI executable path"
+        );
+        if lark {
+            ensure!(
+                (self.credentials.lark_app_secret.is_empty()
+                    && self.credentials.lark_user_token.is_empty())
+                    || !self.credentials.lark_app_id.is_empty(),
+                "Lark App ID is required with a secret or user token"
+            );
+        } else {
+            let endpoint = url::Url::parse(&self.settings.tapd_endpoint)
+                .map_err(|_| anyhow::anyhow!("Invalid TAPD endpoint"))?;
+            ensure!(
+                endpoint.scheme() == "https"
+                    && endpoint.host_str() == Some("api.tapd.cn")
+                    && endpoint.username().is_empty()
+                    && endpoint.password().is_none()
+                    && endpoint.port().is_none()
+                    && endpoint.path() == "/"
+                    && endpoint.query().is_none()
+                    && endpoint.fragment().is_none(),
+                "TAPD endpoint must be https://api.tapd.cn"
+            );
+        }
+        Ok(())
     }
     fn env(&self, lark: bool) -> Vec<(String, String)> {
         let c = &self.credentials;
@@ -83,6 +99,7 @@ impl CliGateway {
         input: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        self.validate_provider(lark)?;
         let path = if lark {
             &self.settings.lark_path
         } else {
@@ -98,17 +115,7 @@ impl CliGateway {
             zeroize::Zeroizing::new(process::run(Path::new(path), &args, &env, &bytes, timeout)?);
         serde_json::from_slice(&output).map_err(|_| anyhow::anyhow!("CLI returned invalid JSON"))
     }
-    fn lark(&self, verb: &str, params: Value) -> Result<Value> {
-        self.lark_until(verb, params, Instant::now() + Duration::from_secs(30))
-    }
     fn lark_until(&self, verb: &str, params: Value, deadline: Instant) -> Result<Value> {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Lark refresh deadline exceeded; no partial results accepted")
-            })?
-            .min(Duration::from_secs(30));
         let v = self.invoke(
             true,
             [
@@ -117,7 +124,7 @@ impl CliGateway {
             .map(String::from)
             .to_vec(),
             params,
-            timeout,
+            remaining(deadline)?,
         )?;
         ensure!(
             v.get("ok").and_then(Value::as_bool) == Some(true),
@@ -134,7 +141,8 @@ impl CliGateway {
             "Configure a TAPD token in the app"
         );
         ensure!(
-            matches!(kind, "task" | "story") || (kind == "user" && verb == "info"),
+            matches!(kind, "task" | "story")
+                || (kind == "user" && matches!(verb, "info" | "members" | "workspaces")),
             "Invalid TAPD resource kind"
         );
         let mut args = vec![kind.into(), verb.into()];
@@ -149,25 +157,81 @@ impl CliGateway {
             .ok_or_else(|| anyhow::anyhow!("TAPD response missing data"))
     }
     pub fn check_lark(&self) -> Result<()> {
-        self.lark(
-            "list",
-            json!({"type":"my_tasks","page_size":1,"user_id_type":"open_id"}),
-        )?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        self.verified_self_until(deadline)?;
+        // 只读一页验证最小任务权限，不依赖 TAPD 安装或项目配置。
+        self.related_until("", deadline)?;
         Ok(())
     }
     pub fn check_tapd(&self) -> Result<()> {
-        valid_id(&self.settings.workspace_id)?;
         self.tapd_user_id()?;
-        self.tapd(
-            "story",
-            "list",
+        if !self.settings.workspace_id.is_empty() {
+            valid_id(&self.settings.workspace_id)?;
+            self.tapd(
+                "story",
+                "list",
+                vec![
+                    format!("workspaceid={}", self.settings.workspace_id),
+                    "limit=1".into(),
+                    "page=1".into(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+    /// 普通成员可显式输入项目 ID；成员读取成功才视为项目已验证。
+    pub fn verify_workspace(&self, id: &str) -> Result<()> {
+        self.list_members(id)?;
+        Ok(())
+    }
+    /// 此接口仅列出管理员项目，不能当成当前用户所有可访问项目。
+    pub fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
+        let data = self.tapd("user", "workspaces", Vec::new())?;
+        let items = data
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("TAPD response missing administrator workspace list"))?;
+        // 父任务只读观察确认 Workspace 包装；不猜测其他接口的同名字段。
+        items
+            .iter()
+            .map(|item| {
+                let workspace = item
+                    .get("Workspace")
+                    .ok_or_else(|| anyhow::anyhow!("TAPD response missing Workspace"))?;
+                let id = required(workspace, "id")?;
+                valid_id(&id)?;
+                Ok(TapdWorkspace {
+                    id,
+                    name: required(workspace, "name")?,
+                })
+            })
+            .collect()
+    }
+    pub fn list_members(&self, workspace: &str) -> Result<Vec<TapdMember>> {
+        valid_id(workspace)?;
+        let data = self.tapd(
+            "user",
+            "members",
             vec![
-                format!("workspaceid={}", self.settings.workspace_id),
-                "limit=1".into(),
-                "page=1".into(),
+                format!("workspaceid={workspace}"),
+                "fields=user,name".into(),
             ],
         )?;
-        Ok(())
+        let items = data
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("TAPD response missing member list"))?;
+        // user 是后端接受的昵称账号，不是用户数字 ID；名字缺失时拒绝伪造显示名。
+        items
+            .iter()
+            .map(|item| {
+                let member = item
+                    .get("UserWorkspace")
+                    .ok_or_else(|| anyhow::anyhow!("TAPD response missing UserWorkspace"))?;
+                Ok(TapdMember {
+                    account: required(member, "user")?,
+                    name: required(member, "name")?,
+                })
+            })
+            .collect()
     }
     /// 必须由用户主动触发并在工作线程执行；CLI 自行打开浏览器和管理其凭据。
     pub fn login_lark(&self) -> Result<()> {
@@ -190,6 +254,9 @@ impl CliGateway {
         Ok(())
     }
     fn lark_identity(&self) -> Result<Value> {
+        self.lark_identity_until(Instant::now() + Duration::from_secs(30))
+    }
+    fn lark_identity_until(&self, deadline: Instant) -> Result<Value> {
         // whoami 只诊断本地保存身份，不能证明注入令牌的主体；未知主体必须拒绝。
         ensure!(
             self.credentials.lark_user_token.is_empty(),
@@ -201,11 +268,14 @@ impl CliGateway {
                 .map(String::from)
                 .to_vec(),
             Value::Null,
-            Duration::from_secs(30),
+            remaining(deadline)?,
         )
     }
     pub fn oauth_status(&self) -> Result<AuthStatus> {
-        let v = self.lark_identity()?;
+        self.oauth_status_until(Instant::now() + Duration::from_secs(30))
+    }
+    fn oauth_status_until(&self, deadline: Instant) -> Result<AuthStatus> {
+        let v = self.lark_identity_until(deadline)?;
         let user = v
             .pointer("/identities/user/openId")
             .and_then(Value::as_str)
@@ -213,9 +283,14 @@ impl CliGateway {
         let verified = v.get("verified").and_then(Value::as_bool) == Some(true)
             && v.get("identity").and_then(Value::as_str) == Some("user");
         Ok(AuthStatus {
-            authenticated: verified && !user.is_empty(),
+            authenticated: verified && !user.trim().is_empty(),
             user_id: user.to_owned(),
         })
+    }
+    fn verified_self_until(&self, deadline: Instant) -> Result<String> {
+        let status = self.oauth_status_until(deadline)?;
+        ensure!(status.authenticated, "Lark user OAuth is not verified");
+        Ok(status.user_id)
     }
     fn tapd_user_id(&self) -> Result<String> {
         let user = self.tapd("user", "info", Vec::new())?;
@@ -337,7 +412,9 @@ impl CliGateway {
                 Some(due_date(millis, Local)?)
             }
         };
+        let metadata = source_metadata(task)?;
         Ok(SourceTask {
+            metadata,
             guid: guid.to_owned(),
             title: required(task, "summary")?,
             description: text(task, "description"),
@@ -347,46 +424,87 @@ impl CliGateway {
                 || !matches!(text(task, "completed_at").as_str(), "" | "0"),
         })
     }
+    fn related_until(&self, page: &str, deadline: Instant) -> Result<Value> {
+        let mut args: Vec<String> = [
+            "task",
+            "+get-related-tasks",
+            "--as",
+            "user",
+            "--format",
+            "json",
+            "--page-limit",
+            "1",
+        ]
+        .map(String::from)
+        .to_vec();
+        if !page.is_empty() {
+            args.extend(["--page-token".into(), page.into()]);
+        }
+        let response = self.invoke(true, args, Value::Null, remaining(deadline)?)?;
+        ensure!(
+            response.get("ok").and_then(Value::as_bool) == Some(true),
+            "Lark related task request failed; check user task permission"
+        );
+        let data = response
+            .get("data")
+            .ok_or_else(|| anyhow::anyhow!("Lark response missing data"))?;
+        ensure!(
+            data.get("items").and_then(Value::as_array).is_some(),
+            "Lark response missing task list"
+        );
+        let more = data
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("Lark response missing pagination status"))?;
+        if more {
+            required(data, "page_token")?;
+        }
+        Ok(data.clone())
+    }
     fn fetch_tasks_until(&self, deadline: Instant) -> Result<Vec<SourceTask>> {
+        // 每次刷新只验证一次 OAuth 主体；所有分页和详情共享同一个截止时间。
+        let user = self.verified_self_until(deadline)?;
         let mut tasks = Vec::new();
         let mut page = String::new();
         let mut pages = HashSet::new();
         let mut ids = HashSet::new();
-        loop {
-            let mut params = json!({"type":"my_tasks","page_size":100,"user_id_type":"open_id"});
-            if !page.is_empty() {
-                params["page_token"] = json!(page);
-            }
-            let data = self.lark_until("list", params, deadline)?;
-            let items = data
-                .get("items")
-                .and_then(Value::as_array)
-                .ok_or_else(|| anyhow::anyhow!("Lark response missing task list"))?;
+        let mut count = 0;
+        for page_index in 0..40 {
+            let data = self.related_until(&page, deadline)?;
+            let items = data["items"]
+                .as_array()
+                .expect("validated related task list");
+            count += items.len();
             ensure!(
-                tasks.len() + items.len() <= 1000,
+                count <= 1000,
                 "Lark refresh exceeds 1000 tasks; no partial results accepted"
             );
             for item in items {
                 let guid = required(item, "guid")?;
-                ensure!(
-                    ids.insert(guid.clone()),
-                    "Lark pagination repeated a task; refresh required"
-                );
-                tasks.push(self.source_until(&guid, deadline)?);
+                valid_source_id(&guid)?;
+                // 快捷命令的日期已格式化，这里只看身份；原生详情才是元数据来源。
+                let (creator, assignees) = source_people(item);
+                let related = creator.as_ref().is_some_and(|p| p.id == user)
+                    || assignees.iter().any(|p| p.id == user);
+                if !related || !ids.insert(guid.clone()) {
+                    continue;
+                }
+                let task = self.source_until(&guid, deadline)?;
+                // 从列表到详情之间关系可能已移除，不能把旧列表关系当作授权。
+                if task.is_related_to(&user) {
+                    tasks.push(task);
+                }
             }
-            let more = data
-                .get("has_more")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| anyhow::anyhow!("Lark response missing pagination status"))?;
-            if !more {
+            if data["has_more"] == false {
                 return Ok(tasks);
             }
             page = required(&data, "page_token")?;
             ensure!(
-                pages.insert(page.clone()) && pages.len() < 1000,
-                "Lark pagination did not finish; no partial results accepted"
+                pages.insert(page.clone()) && page_index < 39,
+                "Lark pagination did not finish within 40 pages; no partial results accepted"
             );
         }
+        unreachable!("last page rejects continuation")
     }
 }
 impl Gateway for CliGateway {
@@ -405,10 +523,24 @@ impl Gateway for CliGateway {
         Ok(())
     }
     fn get_source(&self, guid: &str) -> Result<SourceTask> {
-        self.source_until(guid, Instant::now() + Duration::from_secs(30))
+        valid_source_id(guid)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let user = self.verified_self_until(deadline)?;
+        let task = self.source_until(guid, deadline)?;
+        ensure!(
+            task.is_related_to(&user),
+            "Source task is no longer created by or assigned to the verified user"
+        );
+        Ok(task)
     }
     fn fetch_tasks(&self) -> Result<Vec<SourceTask>> {
         self.fetch_tasks_until(Instant::now() + Duration::from_secs(120))
+    }
+    fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
+        CliGateway::list_workspaces(self)
+    }
+    fn list_members(&self, workspace: &str) -> Result<Vec<TapdMember>> {
+        CliGateway::list_members(self, workspace)
     }
     fn get_target(&self, workspace: &str, id: &str, kind: &str) -> Result<TargetTask> {
         valid_id(workspace)?;
@@ -446,6 +578,65 @@ impl Gateway for CliGateway {
         self.write_target(Some(old), draft, source)
     }
 }
+// 普通调用最多 30 秒，整个刷新（含认证）最多 120 秒。
+fn remaining(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .map(|d| d.min(Duration::from_secs(30)))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Lark refresh deadline exceeded; no partial results accepted")
+        })
+}
+fn source_people(task: &Value) -> (Option<SourcePerson>, Vec<SourcePerson>) {
+    let person = |v: &Value| {
+        let id = text(v, "id");
+        if id.trim().is_empty()
+            || v.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "user")
+        {
+            return None;
+        }
+        Some(SourcePerson {
+            id,
+            name: text(v, "name"),
+        })
+    };
+    let creator = task.get("creator").and_then(person);
+    let assignees = task
+        .get("members")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|v| text(v, "role") == "assignee")
+        .filter_map(person)
+        .collect();
+    (creator, assignees)
+}
+fn source_metadata(task: &Value) -> Result<SourceMetadata> {
+    let (creator, assignees) = source_people(task);
+    // 原生时间戳保留毫秒字符串（包括 completed_at="0"），不借用快捷命令的本地日期。
+    let raw_time = |value: Option<&Value>| -> Result<Option<String>> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if s.is_empty() => Ok(None),
+            Some(Value::String(s))
+                if s.bytes().all(|c| c.is_ascii_digit()) && s.parse::<i64>().is_ok() =>
+            {
+                Ok(Some(s.clone()))
+            }
+            _ => bail!("Invalid native Lark millisecond timestamp"),
+        }
+    };
+    Ok(SourceMetadata {
+        creator,
+        assignees,
+        created_at: raw_time(task.get("created_at"))?,
+        completed_at: raw_time(task.get("completed_at"))?,
+        due_at: raw_time(task.pointer("/due/timestamp"))?,
+    })
+}
 // TAPD 仅支持日期；全天和定时任务均按本机时区取日历日期，明确丢弃时分。
 fn due_date(millis: i64, zone: impl TimeZone) -> Result<String> {
     Ok(DateTime::<Utc>::from_timestamp_millis(millis)
@@ -473,7 +664,7 @@ fn text(v: &Value, key: &str) -> String {
 }
 fn required(v: &Value, key: &str) -> Result<String> {
     let s = text(v, key);
-    ensure!(!s.is_empty(), "CLI response missing required field");
+    ensure!(!s.trim().is_empty(), "CLI response missing required field");
     Ok(s)
 }
 fn target_fields(v: &Value) -> Result<(&str, &Value)> {

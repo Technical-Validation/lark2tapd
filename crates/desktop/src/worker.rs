@@ -1,8 +1,12 @@
 //! 单线程工作队列拥有数据库和 CLI；GPUI 主线程只收发消息，不等待网络或 SQLite。
 use anyhow::{Result, bail};
+use lark2tapd_bridge::installer::{
+    CliTool, InstallationPlan, install_cli, installation_plan, probe_cli,
+};
 use lark2tapd_bridge::{CliGateway, Credentials, load_credentials, save_credentials};
 use lark2tapd_core::{
-    Draft, Engine, Gateway, MockGateway, Settings, Snapshot, SourceTask, TargetTask,
+    Draft, Engine, Gateway, MockGateway, Settings, Snapshot, SourceTask, TapdMember, TapdWorkspace,
+    TargetTask,
 };
 use std::{
     path::PathBuf,
@@ -17,7 +21,12 @@ pub enum Mode {
 }
 
 pub enum Job {
-    SwitchMode(Mode),
+    LoadProjects,
+    LoadMembers(String),
+    AddWorkspace(TapdWorkspace),
+    PlanInstall(CliTool),
+    Install(CliTool),
+    CancelInstall,
     Refresh,
     OpenDraft(String, bool),
     ClearCredentials,
@@ -27,7 +36,7 @@ pub enum Job {
     Commit(String, Draft, Option<TargetTask>),
     SaveCredentials(Credentials),
     Login,
-    Check,
+    Check(CliTool),
     ChangeDemo,
     Recover {
         guid: String,
@@ -63,6 +72,13 @@ pub enum Event {
     },
     Preview(Preview),
     Editor(Editor),
+    InstallPlan(InstallationPlan),
+    Diagnostic {
+        tool: CliTool,
+        version: Option<String>,
+        connected: bool,
+        detail: String,
+    },
     Error(String),
 }
 
@@ -82,6 +98,18 @@ enum Connection {
     Live(Box<CliGateway>),
 }
 impl Gateway for Connection {
+    fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
+        match self {
+            Self::Mock(g) => g.list_workspaces(),
+            Self::Live(g) => g.list_workspaces(),
+        }
+    }
+    fn list_members(&self, workspace: &str) -> Result<Vec<TapdMember>> {
+        match self {
+            Self::Mock(g) => g.list_members(workspace),
+            Self::Live(g) => g.list_members(workspace),
+        }
+    }
     fn get_source(&self, guid: &str) -> Result<SourceTask> {
         match self {
             Self::Mock(g) => g.get_source(guid),
@@ -120,7 +148,7 @@ impl Gateway for Connection {
     }
 }
 
-pub fn start(root: PathBuf, mut mode: Mode) -> WorkerHandle {
+pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
     let (jobs, input) = mpsc::channel::<Request>();
     let (output, events) = async_channel::unbounded();
     std::thread::spawn(move || {
@@ -150,7 +178,14 @@ pub fn start(root: PathBuf, mut mode: Mode) -> WorkerHandle {
                 settings.lark_path = discover_executable(&settings.lark_path, "lark-cli");
                 settings.tapd_path = discover_executable(&settings.tapd_path, "tapd-cli");
                 engine.save_settings(settings.clone()).await?;
-                let mut mock = MockGateway::from_snapshot(engine.snapshot());
+                let mock = MockGateway::from_snapshot(engine.snapshot());
+                if mode==Mode::Mock && engine.snapshot().directory.workspaces_fetched_at.is_none() {
+                    engine.refresh_workspaces(&mock).await?;
+                    engine.refresh_members(&mock,"demo").await?;
+                    engine.refresh_members(&mock,"demo-2").await?;
+                }
+                let tools_dir=std::fs::canonicalize(&root)?.join("tools");
+                let mut pending_install=None;
                 let mut namespace = if mode == Mode::Mock { "mock".to_owned() } else { settings.last_profile.clone().unwrap_or_default() };
                 let mut next_check = Instant::now() + interval(&settings);
                 output.send(Event::State { mode, snapshot: engine.snapshot().clone(), profile:namespace.clone(), message: "ready", new_count: 0 }).await?;
@@ -166,24 +201,27 @@ pub fn start(root: PathBuf, mut mode: Mode) -> WorkerHandle {
                     let refresh_attempt=matches!(&job,Job::Refresh);
                     let mut new_count = 0;
                     let result: Result<&'static str> = async {
-                        if mode == Mode::Mock && matches!(job, Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login | Job::Check) {
-                            bail!("Demo mode never accesses credentials or external accounts. Switch to Live mode to connect.");
+                        if mode == Mode::Mock && matches!(job, Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login | Job::Check(_) | Job::PlanInstall(_) | Job::Install(_)) {
+                            bail!("Demo mode never accesses credentials or external accounts. Restart with LARK2TAPD_MOCK=0 to connect.");
                         }
                         // 配置与认证不依赖已连通的任务账户，因此未配置时也可修复连接。
                         match job {
-                            Job::SwitchMode(next) => {
-                                let mut next_preferences = Engine::open(&root.join(if next == Mode::Mock {"preferences-mock.db"} else {"preferences-live.db"})).await?;
-                                let mut next_settings = next_preferences.snapshot().settings.clone();
-                                let mut next_engine = Engine::open(&root.join(profile_file(next,next_settings.last_profile.as_deref())?)).await?;
-                                if next == Mode::Mock && next_settings.workspace_id.is_empty() {next_settings.workspace_id="demo".into();}
-                                next_settings.lark_path=discover_executable(&next_settings.lark_path,"lark-cli");
-                                next_settings.tapd_path=discover_executable(&next_settings.tapd_path,"tapd-cli");
-                                next_preferences.save_settings(next_settings.clone()).await?;
-                                next_engine.save_settings(next_settings.clone()).await?;
-                                preferences=next_preferences;engine=next_engine;settings=next_settings;mode=next;
-                                mock=MockGateway::from_snapshot(engine.snapshot());
-                                namespace=if mode==Mode::Mock {"mock".into()} else {settings.last_profile.clone().unwrap_or_default()};
-                                return Ok("mode_changed");
+                            Job::PlanInstall(tool)=>{
+                                let plan=installation_plan(tool,&tools_dir)?;
+                                pending_install=Some(tool);
+                                output.send(Event::InstallPlan(plan)).await?;
+                                return Ok("install_plan");
+                            }
+                            Job::CancelInstall=>{pending_install=None;return Ok("install_cancelled");}
+                            Job::Install(tool)=>{
+                                if pending_install.take()!=Some(tool){bail!("Review the installation source and destination before confirming");}
+                                let path=install_cli(tool,&tools_dir)?.to_string_lossy().into_owned();
+                                let mut next=settings.clone();
+                                match tool {CliTool::Lark=>next.lark_path=path,CliTool::Tapd=>next.tapd_path=path}
+                                preferences.save_settings(next.clone()).await?;
+                                engine.save_settings(next.clone()).await?;
+                                settings=next;
+                                return Ok("installed");
                             }
                             Job::SaveSettings(next) => {
                                 preferences.save_settings(next.clone()).await?;
@@ -213,11 +251,18 @@ pub fn start(root: PathBuf, mut mode: Mode) -> WorkerHandle {
                                 engine.save_settings(settings.clone()).await?;
                                 return Ok("authorized");
                             }
-                            Job::Check => {
-                                let cli = CliGateway::new(settings.clone(), load_credentials()?)?;
-                                cli.check_lark()?;
-                                cli.check_tapd()?;
-                                return Ok("connected");
+                            Job::Check(tool) => {
+                                let path=if tool==CliTool::Lark {&settings.lark_path}else{&settings.tapd_path};
+                                let mut version=None;
+                                let result=(||->Result<()>{
+                                    version=Some(probe_cli(tool,std::path::Path::new(path))?);
+                                    let cli=CliGateway::new(settings.clone(),load_credentials()?)?;
+                                    match tool{CliTool::Lark=>cli.check_lark(),CliTool::Tapd=>cli.check_tapd()}
+                                })();
+                                let connected=result.is_ok();
+                                let detail=result.err().map(|e|e.to_string()).unwrap_or_default();
+                                output.send(Event::Diagnostic {tool,version,connected,detail}).await?;
+                                return Ok("diagnosed");
                             }
                             _ => {}
                         }
@@ -249,13 +294,22 @@ pub fn start(root: PathBuf, mut mode: Mode) -> WorkerHandle {
                             }
                             Connection::Live(Box::new(cli))
                         };
-                        if !matches!(job, Job::Refresh | Job::ChangeDemo) && profile != namespace {
+                        if !matches!(job, Job::Refresh | Job::ChangeDemo | Job::LoadProjects) && profile != namespace {
                             bail!("Account changed. Refresh tasks before editing or importing.");
                         }
                         match job {
+                            Job::LoadProjects=>{engine.refresh_workspaces(&gateway).await?;Ok("projects_loaded")}
+                            Job::LoadMembers(workspace)=>{engine.refresh_members(&gateway,&workspace).await?;Ok("members_loaded")}
+                            Job::AddWorkspace(workspace)=>{
+                                if workspace.name.trim().is_empty(){bail!("Project display name is required");}
+                                engine.refresh_members(&gateway,&workspace.id).await?;
+                                engine.add_workspace(workspace).await?;
+                                Ok("project_added")
+                            }
                             Job::Refresh => { new_count = engine.refresh(&gateway).await?; Ok("refreshed") }
                             Job::Preview(guid,draft,source) => {
                                 gateway.validate_draft(&draft)?;
+                                engine.validate_destination(&draft)?;
                                 engine.save_draft_for_source(&guid,&draft,&source).await?;
                                 let target = engine.preview_target(&gateway,&guid)?;
                                 output.send(Event::Preview(Preview {source,profile:namespace.clone(),guid,draft,target})).await?;
@@ -305,7 +359,7 @@ fn profile_file(mode: Mode, profile: Option<&str>) -> Result<String> {
 
 fn resets_polling(job: &Job, settings: &Settings) -> bool {
     match job {
-        Job::Refresh | Job::SwitchMode(_) => true,
+        Job::Refresh => true,
         Job::SaveSettings(next) => {
             (next.poll_enabled, next.poll_minutes) != (settings.poll_enabled, settings.poll_minutes)
         }
@@ -342,7 +396,7 @@ mod tests {
         for job in [
             Job::OpenDraft("guid".into(), false),
             Job::Login,
-            Job::Check,
+            Job::Check(CliTool::Lark),
             Job::SaveSettings(theme),
         ] {
             assert!(!resets_polling(&job, &settings));
@@ -351,7 +405,6 @@ mod tests {
         interval.poll_minutes = 60;
         assert!(resets_polling(&Job::SaveSettings(interval), &settings));
         assert!(resets_polling(&Job::Refresh, &settings));
-        assert!(resets_polling(&Job::SwitchMode(Mode::Live), &settings));
     }
     #[test]
     fn cached_identity_cannot_escape_data_directory() {

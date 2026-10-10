@@ -37,6 +37,20 @@ fn gateway(body: &str) -> (tempfile::TempDir, CliGateway) {
         .unwrap(),
     )
 }
+// OAuth 身份仅由假进程提供；检查每次刷新恰好验证一次。
+fn oauth_gateway(body: &str) -> (tempfile::TempDir, CliGateway) {
+    let (d, mut g) = gateway(&format!(
+        r#"
+if a==['auth','status','--json','--verify']:
+ with open(__file__+'.auth','a') as f: f.write('verify\n')
+ print('{{"identity":"user","verified":true,"identities":{{"user":{{"openId":"self"}}}}}}')
+ sys.exit(0)
+{body}
+"#
+    ));
+    g.credentials.lark_user_token.clear();
+    (d, g)
+}
 fn source() -> SourceTask {
     SourceTask {
         guid: "guid-1".into(),
@@ -45,6 +59,7 @@ fn source() -> SourceTask {
         url: "https://example.feishu.cn/task/1".into(),
         due: None,
         completed: false,
+        metadata: SourceMetadata::default(),
     }
 }
 fn draft() -> Draft {
@@ -57,40 +72,79 @@ fn draft() -> Draft {
     }
 }
 #[test]
-fn paginates_and_fetches_full_details() {
-    let (_d, g) = gateway(
+fn related_union_paginates_filters_and_deduplicates_before_details() {
+    let (d, g) = oauth_gateway(
         r#"
-assert a[:2]==['task','tasks'] and '--params' in a and '--as' in a
-assert os.environ['LARKSUITE_CLI_USER_ACCESS_TOKEN']=='user-token'
-p=json.load(sys.stdin)
-if a[2]=='list':
- assert p['type']=='my_tasks'
- second=p.get('page_token')=='next'
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'b' if second else 'a'}],'has_more':not second,'page_token':'' if second else 'next'}}))
+if a[:2]==['task','+get-related-tasks']:
+ assert a[:8]==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']
+ second='--page-token' in a
+ if second: assert a[8:]==['--page-token','next']
+ own={'id':'self','name':'快捷姓名'}
+ items=([{'guid':'both','creator':own,'members':[dict(own,role='assignee')]},{'guid':'removed','creator':own}] if second else [
+  {'guid':'creator','creator':own},
+  {'guid':'assignee','creator':{'id':'other'},'members':[dict(own,role='assignee')]},
+  {'guid':'both','creator':own,'members':[dict(own,role='assignee')]},
+  {'guid':'followed','members':[dict(own,role='follower')]},
+  {'guid':'other','creator':{'id':'other'}},
+  {'guid':'missing','creator':{'name':'self'},'members':[{'role':'assignee'}]}])
+ for t in items: t['created_at']='2025-01-01 08:00:00'
+ print(json.dumps({'ok':True,'identity':'user','data':{'items':items,'has_more':not second,'page_token':'next' if not second else ''},'meta':{'count':len(items)}}))
 else:
- print(json.dumps({'ok':True,'data':{'task':{'guid':p['task_guid'],'summary':'Full','description':'Details','completed_at':'0','due':{'timestamp':'1735689600000','is_all_day':True},'url':'https://evil.example/'}}}))
+ assert a[:3]==['task','tasks','get']
+ p=json.load(sys.stdin); guid=p['task_guid']
+ assert guid in ['creator','assignee','both','removed']
+ with open(__file__+'.details','a') as f: f.write(guid+'\n')
+ t={'guid':guid,'summary':'Full','description':'Details','created_at':'1735689600000','completed_at':'0','due':{'timestamp':'1735689600000','is_all_day':True},'creator':{'id':'other' if guid in ['assignee','removed'] else 'self','name':'原生姓名'},'members':[],'url':'https://evil.example/'}
+ if guid in ['assignee','both']: t['members']=[{'id':'self','name':'负责人','role':'assignee','type':'user'}]
+ print(json.dumps({'ok':True,'data':{'task':t}}))
 "#,
     );
     let tasks = g.fetch_tasks().unwrap();
-    assert_eq!(tasks.len(), 2);
-    assert_eq!(tasks[1].guid, "b");
+    assert_eq!(
+        tasks.iter().map(|t| t.guid.as_str()).collect::<Vec<_>>(),
+        ["creator", "assignee", "both"]
+    );
+    assert_eq!(
+        fs::read_to_string(d.path().join("fake.auth")).unwrap(),
+        "verify\n"
+    );
+    assert_eq!(
+        fs::read_to_string(d.path().join("fake.details")).unwrap(),
+        "creator\nassignee\nboth\nremoved\n"
+    );
+    assert_eq!(tasks[0].metadata.creator.as_ref().unwrap().name, "原生姓名");
+    assert_eq!(tasks[1].metadata.assignees[0].name, "负责人");
+    assert_eq!(
+        tasks[0].metadata.created_at.as_deref(),
+        Some("1735689600000")
+    );
+    assert_eq!(tasks[0].metadata.completed_at.as_deref(), Some("0"));
+    assert_eq!(tasks[0].metadata.due_at.as_deref(), Some("1735689600000"));
     assert_eq!(tasks[0].description, "Details");
-    // 分页测试不假设执行机器的时区；日期语义由固定偏移回归单独验证。
     assert!(tasks[0].due.is_some());
     assert!(tasks[0].url.is_empty());
 }
 #[test]
-fn commit_source_read_fetches_only_selected_task() {
-    let (_d, g) = gateway(
-        r#"
+fn commit_source_read_verifies_self_and_selected_task_relation() {
+    for (creator, accepted) in [("self", true), ("other", false), ("", false)] {
+        let (_d, g) = oauth_gateway(&format!(
+            r#"
 assert a[:3]==['task','tasks','get']
 p=json.load(sys.stdin)
 assert p['task_guid']=='guid-1'
-print('{"ok":true,"data":{"task":{"guid":"guid-1","summary":"selected"}}}')
-"#,
-    );
-    assert_eq!(g.get_source("guid-1").unwrap().title, "selected");
-    assert!(g.get_source("bad@id").is_err());
+print(json.dumps({{'ok':True,'data':{{'task':{{'guid':'guid-1','summary':'selected','creator':{{'id':'{creator}'}}}}}}}}))
+"#
+        ));
+        assert_eq!(g.get_source("guid-1").is_ok(), accepted);
+        assert!(g.get_source("bad@id").is_err());
+    }
+}
+#[test]
+fn tapd_auth_check_without_workspace_does_not_read_a_project() {
+    let (_d, mut g) =
+        gateway("assert a==['user','info']; print('{\"status\":1,\"data\":{\"id\":\"1\"}}')");
+    g.settings.workspace_id.clear();
+    g.check_tapd().unwrap();
 }
 #[test]
 fn draft_preflight_rejects_invalid_workspace_without_invoking_cli() {
@@ -105,10 +159,10 @@ fn draft_preflight_rejects_invalid_workspace_without_invoking_cli() {
 }
 #[test]
 fn invalid_source_ids_are_rejected_during_refresh() {
-    let (_d, g) = gateway(
+    let (_d, g) = oauth_gateway(
         r#"
-if a[2]=='list': print('{"ok":true,"data":{"items":[{"guid":"bad@id"}],"has_more":false}}')
-else: print('{"ok":true,"data":{"task":{"guid":"bad@id","summary":"title"}}}')
+if a[1]=='+get-related-tasks': print('{"ok":true,"data":{"items":[{"guid":"bad@id","creator":{"id":"self"}}],"has_more":false}}')
+else: print('{"ok":true,"data":{"task":{"guid":"bad@id","creator":{"id":"self"},"summary":"title"}}}')
 "#,
     );
     assert!(g.fetch_tasks().is_err());
@@ -124,12 +178,12 @@ fn due_day_uses_local_calendar_not_utc_and_drops_time() {
 }
 #[test]
 fn refresh_deadline_covers_all_pages_and_details() {
-    let (_d, g) = gateway(
+    let (_d, g) = oauth_gateway(
         r#"
 import time
 time.sleep(0.2)
-if a[2]=='list':
- print('{"ok":true,"data":{"items":[{"guid":"g1"},{"guid":"g2"},{"guid":"g3"}],"has_more":false}}')
+if a[1]=='+get-related-tasks':
+ print('{"ok":true,"data":{"items":[{"guid":"g1","creator":{"id":"self"}},{"guid":"g2","creator":{"id":"self"}},{"guid":"g3","creator":{"id":"self"}}],"has_more":false}}')
 else:
  p=json.load(sys.stdin)
  print(json.dumps({'ok':True,'data':{'task':{'guid':p['task_guid'],'summary':'full'}}}))
@@ -142,10 +196,10 @@ else:
 }
 #[test]
 fn oversized_refresh_is_rejected_before_fetching_details() {
-    let (_d, g) = gateway(
+    let (_d, g) = oauth_gateway(
         r#"
-if a[2]=='list':
- print(json.dumps({'ok':True,'data':{'items':[{'guid':str(i)} for i in range(1001)],'has_more':False}}))
+if a[1]=='+get-related-tasks':
+ print(json.dumps({'ok':True,'data':{'items':[{'guid':str(i),'creator':{'id':'self'}} for i in range(1001)],'has_more':False}}))
 else:
  print('{"ok":false}')
 "#,
@@ -159,7 +213,7 @@ fn rejects_partial_pagination_and_business_errors() {
         "print('{\"ok\":false,\"error\":\"secret\"}')",
         "print('not JSON secret')",
     ] {
-        let (_d, g) = gateway(body);
+        let (_d, g) = oauth_gateway(body);
         let e = g.fetch_tasks().unwrap_err();
         assert!(!format!("{e:?}").contains("secret"));
     }
@@ -389,4 +443,165 @@ fn legacy_task_and_missing_id_are_not_confused() {
     assert_eq!(g.get_target("42", "9", "task").unwrap().kind, "task");
     let (_d, g) = gateway("print('{\"status\":1,\"data\":{\"Task\":{\"name\":\"n\"}}}')");
     assert!(g.create_target(&draft(), &source()).is_err());
+}
+
+// 分页控制必须拒绝重复游标、缺游标和超页数，不能用半份列表覆盖缓存。
+#[test]
+fn related_pagination_never_returns_partial_results() {
+    for response in [
+        r#"{'items':[],'has_more':True}"#,
+        r#"{'items':[],'has_more':True,'page_token':'repeat'}"#,
+        r#"{'items':[],'has_more':True,'page_token':str(int(a[-1])+1) if '--page-token' in a else '1'}"#,
+        r#"{'items':[]}"#,
+        r#"{'items':{},'has_more':False}"#,
+    ] {
+        let (_d, g) = oauth_gateway(&format!(
+            "assert a[1]=='+get-related-tasks'; print(json.dumps({{'ok':True,'data':{response}}}))"
+        ));
+        assert!(g.fetch_tasks().is_err(), "{response}");
+    }
+}
+#[test]
+fn lark_connection_verifies_oauth_and_related_permission_without_tapd() {
+    let (_d, mut g) = oauth_gateway(
+        "assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']; print('{\"ok\":true,\"data\":{\"items\":[],\"has_more\":false}}')",
+    );
+    g.settings.tapd_path = "/does/not/exist/tapd".into();
+    g.check_lark().unwrap();
+    g.credentials.lark_user_token = "manual-token".into();
+    assert!(g.check_lark().is_err());
+    assert!(g.fetch_tasks().is_err());
+    assert!(g.get_source("guid-1").is_err());
+}
+
+// 管理员项目列表只认实际观察的 Workspace 包装；字段不全必须报错而非空下拉。
+#[test]
+fn workspace_directory_requires_observed_named_workspace_shape() {
+    let (_d, g) = gateway(
+        "assert a==['user','workspaces']; print('{\"status\":1,\"data\":[{\"Workspace\":{\"id\":\"42\",\"name\":\"项目甲\",\"pretty_name\":\"甲\"}}],\"info\":\"success\"}')",
+    );
+    let items = g.list_workspaces().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, "42");
+    assert_eq!(items[0].name, "项目甲");
+    for data in [
+        r#"{}"#,
+        r#"[{"id":"42","name":"项目"}]"#,
+        r#"[{"Workspace":{"id":"42"}}]"#,
+        r#"[{"Workspace":{"id":"42","name":" "}}]"#,
+        r#"[{"Workspace":{"id":"bad","name":"项目"}}]"#,
+        r#"null"#,
+    ] {
+        let (_d, g) = gateway(&format!("print('{{\"status\":1,\"data\":{data}}}')"));
+        assert!(g.list_workspaces().is_err(), "{data}");
+    }
+    let (_d, g) = gateway("print('{\"status\":1,\"data\":[]}')");
+    assert!(g.list_workspaces().unwrap().is_empty());
+}
+#[test]
+fn member_directory_uses_nickname_account_and_requires_meaningful_names() {
+    let (_d, g) = gateway(
+        "assert a==['user','members','workspaceid=42','fields=user,name']; print('{\"status\":1,\"data\":[{\"UserWorkspace\":{\"user\":\"nickname\",\"name\":\"显示名\",\"id\":\"999\"}}]}')",
+    );
+    let items = g.list_members("42").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].account, "nickname");
+    assert_eq!(items[0].name, "显示名");
+    g.verify_workspace("42").unwrap();
+    assert!(g.verify_workspace("not-an-id").is_err());
+    for data in [
+        r#"{}"#,
+        r#"[{"user":"nickname","name":"显示名"}]"#,
+        r#"[{"UserWorkspace":{"user":"nickname"}}]"#,
+        r#"[{"UserWorkspace":{"id":"999","name":"显示名"}}]"#,
+        r#"[{"UserWorkspace":{"user":"nickname","name":" "}}]"#,
+        r#"null"#,
+    ] {
+        let (_d, g) = gateway(&format!("print('{{\"status\":1,\"data\":{data}}}')"));
+        assert!(g.list_members("42").is_err(), "{data}");
+        assert!(g.verify_workspace("42").is_err(), "{data}");
+    }
+}
+#[test]
+fn native_metadata_rejects_formatted_time_and_preserves_unknown_names() {
+    for (timestamp, accepted) in [
+        ("1735689600000", true),
+        ("2025-01-01 08:00:00", false),
+        ("NaN", false),
+    ] {
+        let (_d, g) = oauth_gateway(&format!(
+            r#"
+assert a[:3]==['task','tasks','get']
+print(json.dumps({{'ok':True,'data':{{'task':{{'guid':'guid-1','summary':'task','creator':{{'id':'self'}},'created_at':'{timestamp}'}}}}}}))
+"#
+        ));
+        let result = g.get_source("guid-1");
+        assert_eq!(result.is_ok(), accepted);
+        if let Ok(task) = result {
+            assert_eq!(task.metadata.creator.unwrap().name, "");
+            assert_eq!(task.metadata.completed_at, None);
+        }
+    }
+}
+
+// 即使任务接口可读，也不能用机器人、未验证身份或空主体建立本人范围。
+#[test]
+fn task_reads_fail_closed_without_verified_user_identity() {
+    for patch in [
+        "v['verified']=False",
+        "v['identity']='bot'",
+        "v['identities']['user']['openId']=''",
+        "v['identities']['user']['openId']=' '",
+        "del v['identities']",
+    ] {
+        let (_d, mut g) = gateway(&format!(
+            r#"
+if a==['auth','status','--json','--verify']:
+ v={{'identity':'user','verified':True,'identities':{{'user':{{'openId':'self'}}}}}}
+ {patch}
+ print(json.dumps(v))
+elif a[1]=='+get-related-tasks':
+ print('{{"ok":true,"data":{{"items":[{{"guid":"guid-1","creator":{{"id":"self"}}}}],"has_more":false}}}}')
+else:
+ print('{{"ok":true,"data":{{"task":{{"guid":"guid-1","summary":"readable","creator":{{"id":"self"}}}}}}}}')
+"#
+        ));
+        g.credentials.lark_user_token.clear();
+        assert!(g.fetch_tasks().is_err(), "{patch}");
+        assert!(g.get_source("guid-1").is_err(), "{patch}");
+        assert!(g.check_lark().is_err(), "{patch}");
+    }
+}
+
+#[test]
+fn page_limit_refuses_the_forty_first_page() {
+    let (d, g) = oauth_gateway(
+        r#"
+assert a[1]=='+get-related-tasks'
+n=int(a[-1]) if '--page-token' in a else 1
+with open(__file__+'.pages','a') as f: f.write(str(n)+'\n')
+print(json.dumps({'ok':True,'data':{'items':[],'has_more':True,'page_token':str(n+1)}}))
+"#,
+    );
+    assert!(g.fetch_tasks().is_err());
+    let calls = fs::read_to_string(d.path().join("fake.pages")).unwrap();
+    assert_eq!(calls.lines().count(), 40);
+    assert!(calls.ends_with("40\n"));
+}
+
+#[test]
+fn connection_checks_ignore_other_provider_configuration() {
+    let (_d, mut lark) = oauth_gateway(
+        "assert a[:2]==['task','+get-related-tasks'];print('{\"ok\":true,\"data\":{\"items\":[],\"has_more\":false,\"page_token\":\"\"}}')",
+    );
+    lark.settings.tapd_path = "not-installed".into();
+    lark.settings.tapd_endpoint = "not-configured".into();
+    let lark = CliGateway::new(lark.settings, lark.credentials).unwrap();
+    lark.check_lark().unwrap();
+    let (_d, mut tapd) =
+        gateway("assert a==['user','info'];print('{\"status\":1,\"data\":{\"id\":\"123\"}}')");
+    tapd.settings.lark_path = "not-installed".into();
+    tapd.settings.workspace_id.clear();
+    let tapd = CliGateway::new(tapd.settings, tapd.credentials).unwrap();
+    tapd.check_tapd().unwrap();
 }

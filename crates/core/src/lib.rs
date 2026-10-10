@@ -7,6 +7,46 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourcePerson {
+    pub id: String,
+    pub name: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SourceMetadata {
+    pub creator: Option<SourcePerson>,
+    pub assignees: Vec<SourcePerson>,
+    // 保留飞书原始毫秒时间戳；显示时再按用户本地时区转换。
+    pub created_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub due_at: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TapdWorkspace {
+    pub id: String,
+    pub name: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TapdMember {
+    pub account: String,
+    pub name: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberCache {
+    pub items: Vec<TapdMember>,
+    pub fetched_at: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryCache {
+    pub workspaces: Vec<TapdWorkspace>,
+    /// 管理员枚举不包含普通成员项目；显式补充的项目跨刷新保留。
+    #[serde(default)]
+    pub manual_workspaces: Vec<TapdWorkspace>,
+    pub workspaces_fetched_at: Option<String>,
+    pub members: BTreeMap<String, MemberCache>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceTask {
     pub guid: String,
@@ -15,6 +55,24 @@ pub struct SourceTask {
     pub url: String,
     pub due: Option<String>,
     pub completed: bool,
+    #[serde(default)]
+    pub metadata: SourceMetadata,
+}
+impl SourceTask {
+    // 仅比较稳定身份；缺少身份或同名不能推断为本人。
+    pub fn is_related_to(&self, user_id: &str) -> bool {
+        !user_id.trim().is_empty()
+            && (self
+                .metadata
+                .creator
+                .as_ref()
+                .is_some_and(|person| person.id == user_id)
+                || self
+                    .metadata
+                    .assignees
+                    .iter()
+                    .any(|person| person.id == user_id))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Draft {
@@ -36,6 +94,8 @@ pub struct TargetTask {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncRecord {
+    #[serde(default)]
+    pub in_scope: bool,
     pub source: SourceTask,
     pub baseline: Option<SourceTask>,
     pub target: Option<TargetTask>,
@@ -100,10 +160,18 @@ pub struct Snapshot {
     pub settings: Settings,
     pub records: Vec<SyncRecord>,
     pub last_checked: Option<String>,
+    #[serde(default)]
+    pub directory: DirectoryCache,
 }
 
 // 网关保持同步；桌面端必须在后台 actor 线程调用，不能阻塞 UI。
 pub trait Gateway: Send {
+    fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
+        Err(anyhow!("Workspace enumeration is not supported"))
+    }
+    fn list_members(&self, _workspace: &str) -> Result<Vec<TapdMember>> {
+        Err(anyhow!("Member enumeration is not supported"))
+    }
     /// 仅做本地预检；不得进行外部写入，失败时不生成不确定日志。
     fn validate_draft(&self, draft: &Draft) -> Result<()> {
         validate_draft(draft)
@@ -260,6 +328,10 @@ impl Engine {
     pub async fn refresh(&mut self, gateway: &impl Gateway) -> Result<usize> {
         let tasks = validated_tasks(gateway)?;
         let mut state = self.state.clone();
+        // 只有完整读取及验证成功后才更新范围；旧映射和不确定日志永久保留。
+        for record in &mut state.snapshot.records {
+            record.in_scope = false;
+        }
         let mut discovered = 0;
         for source in tasks {
             if let Some(record) = state
@@ -270,8 +342,10 @@ impl Engine {
             {
                 // 保留导入基线和人工草稿；缺失任务也不会从缓存删除。
                 record.source = source;
+                record.in_scope = true;
             } else {
                 state.snapshot.records.push(SyncRecord {
+                    in_scope: true,
                     source,
                     baseline: None,
                     target: None,
@@ -286,6 +360,79 @@ impl Engine {
         state.snapshot.last_checked = Some(Utc::now().to_rfc3339());
         self.persist(state).await?;
         Ok(discovered)
+    }
+    // 全量目录先校验再原子替换；网络、校验或落盘失败都保留旧缓存。
+    pub async fn refresh_workspaces(&mut self, gateway: &impl Gateway) -> Result<()> {
+        let mut workspaces = gateway.list_workspaces()?;
+        validate_directory(
+            workspaces
+                .iter()
+                .map(|item| (item.id.as_str(), item.name.as_str())),
+        )?;
+        let mut state = self.state.clone();
+        for manual in &state.snapshot.directory.manual_workspaces {
+            if !workspaces.iter().any(|w| w.id == manual.id) {
+                workspaces.push(manual.clone());
+            }
+        }
+        state.snapshot.directory.workspaces = workspaces;
+        state.snapshot.directory.workspaces_fetched_at = Some(Utc::now().to_rfc3339());
+        self.persist(state).await
+    }
+    pub async fn refresh_members(&mut self, gateway: &impl Gateway, workspace: &str) -> Result<()> {
+        ensure!(!workspace.trim().is_empty(), "Workspace is required");
+        let items = gateway.list_members(workspace)?;
+        validate_directory(
+            items
+                .iter()
+                .map(|item| (item.account.as_str(), item.name.as_str())),
+        )?;
+        let mut state = self.state.clone();
+        state.snapshot.directory.members.insert(
+            workspace.into(),
+            MemberCache {
+                items,
+                fetched_at: Utc::now().to_rfc3339(),
+            },
+        );
+        self.persist(state).await
+    }
+    // 调用方先验证项目访问权限；手工补充不冒充全量目录刷新。
+    pub async fn add_workspace(&mut self, workspace: TapdWorkspace) -> Result<()> {
+        validate_directory([(workspace.id.as_str(), workspace.name.as_str())])?;
+        let mut state = self.state.clone();
+        for items in [
+            &mut state.snapshot.directory.workspaces,
+            &mut state.snapshot.directory.manual_workspaces,
+        ] {
+            if let Some(existing) = items.iter_mut().find(|item| item.id == workspace.id) {
+                *existing = workspace.clone();
+            } else {
+                items.push(workspace.clone());
+            }
+        }
+        self.persist(state).await
+    }
+    /// 旧选中值可以显示，但不能绕过项目及成员缓存校验进入远端写入。
+    pub fn validate_destination(&self, draft: &Draft) -> Result<()> {
+        let directory = &self.snapshot().directory;
+        ensure!(
+            directory
+                .workspaces
+                .iter()
+                .any(|w| w.id == draft.workspace_id),
+            "Refresh project options or verify and add this project before importing"
+        );
+        if !draft.owner.is_empty() {
+            ensure!(
+                directory
+                    .members
+                    .get(&draft.workspace_id)
+                    .is_some_and(|c| c.items.iter().any(|m| m.account == draft.owner)),
+                "Refresh assignees and select a current project member before importing"
+            );
+        }
+        Ok(())
     }
     pub async fn save_settings(&mut self, settings: Settings) -> Result<()> {
         ensure!(
@@ -324,6 +471,10 @@ impl Engine {
     ) -> Result<()> {
         let index = self.index(guid)?;
         ensure!(
+            self.snapshot().records[index].in_scope,
+            "Task is outside the current self scope; refresh first"
+        );
+        ensure!(
             &self.snapshot().records[index].source == expected_source,
             "Source changed since the editor was opened; reload and review again"
         );
@@ -352,6 +503,10 @@ impl Engine {
     }
     pub fn prepare(&self, guid: &str) -> Result<Draft> {
         let record = &self.snapshot().records[self.index(guid)?];
+        ensure!(
+            record.in_scope,
+            "Task is outside the current self scope; refresh first"
+        );
         // 不能把旧草稿返回给新编辑器，再通过保存悄悄洗成最新来源的草稿。
         ensure!(
             record.draft.is_none() || self.state.draft_sources.get(guid) == Some(&record.source),
@@ -397,6 +552,10 @@ impl Engine {
         let index = self.index(guid)?;
         let record = self.snapshot().records[index].clone();
         ensure!(
+            record.in_scope,
+            "Task is outside the current self scope; refresh first"
+        );
+        ensure!(
             !record.uncertain,
             "Uncertain write: do not retry; inspect TAPD and bind the existing remote task"
         );
@@ -406,6 +565,7 @@ impl Engine {
         );
         validate_draft(draft)?;
         gateway.validate_draft(draft)?;
+        self.validate_destination(draft)?;
         ensure!(
             record.draft.as_ref() == Some(draft),
             "Save the draft before confirming"
@@ -488,6 +648,18 @@ impl Engine {
     }
 }
 
+fn validate_directory<'a>(items: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<()> {
+    let mut ids = HashSet::new();
+    for (id, name) in items {
+        ensure!(
+            !id.trim().is_empty() && !name.trim().is_empty(),
+            "Directory identity and name are required"
+        );
+        ensure!(ids.insert(id), "Duplicate directory identity: {id}");
+    }
+    Ok(())
+}
+
 fn validate_due(due: &Option<String>) -> Result<()> {
     if let Some(due) = due {
         let parsed = NaiveDate::parse_from_str(due, "%Y-%m-%d")?;
@@ -562,6 +734,19 @@ impl Default for MockGateway {
                         ),
                         due: Some("2026-07-01".into()),
                         completed: false,
+                        metadata: SourceMetadata {
+                            creator: Some(SourcePerson {
+                                id: "demo-self".into(),
+                                name: "演示用户".into(),
+                            }),
+                            assignees: vec![SourcePerson {
+                                id: "demo-self".into(),
+                                name: "演示用户".into(),
+                            }],
+                            created_at: Some("1780272000000".into()),
+                            completed_at: None,
+                            due_at: Some("1782864000000".into()),
+                        },
                     })
                     .collect(),
                 targets: BTreeMap::new(),
@@ -613,6 +798,30 @@ impl MockGateway {
     }
 }
 impl Gateway for MockGateway {
+    fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
+        Ok(vec![
+            TapdWorkspace {
+                id: "demo".into(),
+                name: "演示项目".into(),
+            },
+            TapdWorkspace {
+                id: "demo-2".into(),
+                name: "演示项目二".into(),
+            },
+        ])
+    }
+    fn list_members(&self, workspace: &str) -> Result<Vec<TapdMember>> {
+        ensure!(
+            ["demo", "demo-2"].contains(&workspace),
+            "Workspace not found"
+        );
+        // 同名成员使用不同账号，便于演示项目隔离与稳定身份选择。
+        let account = if workspace == "demo" { "alice" } else { "bob" };
+        Ok(vec![TapdMember {
+            account: account.into(),
+            name: "演示成员".into(),
+        }])
+    }
     fn fetch_tasks(&self) -> Result<Vec<SourceTask>> {
         Ok(self
             .store

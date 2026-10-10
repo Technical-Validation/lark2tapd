@@ -14,6 +14,8 @@ struct FaultGateway {
     remote_title: Option<String>,
     journal_path: Option<std::path::PathBuf>,
     replace_result_id: bool,
+    workspaces: Option<Vec<TapdWorkspace>>,
+    members: Option<Vec<TapdMember>>,
 }
 impl FaultGateway {
     fn new(inner: MockGateway) -> Self {
@@ -28,10 +30,22 @@ impl FaultGateway {
             remote_title: None,
             journal_path: None,
             replace_result_id: false,
+            workspaces: None,
+            members: None,
         }
     }
 }
 impl Gateway for FaultGateway {
+    fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
+        self.workspaces
+            .clone()
+            .ok_or_else(|| anyhow!("Directory unavailable"))
+    }
+    fn list_members(&self, _workspace: &str) -> Result<Vec<TapdMember>> {
+        self.members
+            .clone()
+            .ok_or_else(|| anyhow!("Directory unavailable"))
+    }
     fn validate_draft(&self, _draft: &Draft) -> Result<()> {
         ensure!(!self.reject_draft, "Transport draft rejected");
         Ok(())
@@ -221,6 +235,9 @@ async fn configured(path: &Path, gateway: &impl Gateway) -> Result<Engine> {
         })
         .await?;
     engine.refresh(gateway).await?;
+    let directory = MockGateway::default();
+    engine.refresh_workspaces(&directory).await?;
+    engine.refresh_members(&directory, "demo").await?;
     Ok(engine)
 }
 
@@ -310,7 +327,11 @@ async fn invalid_fetch_is_atomic_and_disappeared_tasks_are_retained() -> Result<
     assert_eq!(engine.snapshot(), &before);
     gateway.tasks = Some(vec![]);
     engine.refresh(&gateway).await?;
-    assert_eq!(engine.snapshot().records, before.records);
+    let mut hidden = before.records;
+    for record in &mut hidden {
+        record.in_scope = false;
+    }
+    assert_eq!(engine.snapshot().records, hidden);
     Ok(())
 }
 
@@ -358,6 +379,7 @@ fn status_uses_every_source_field_and_uncertainty_takes_priority() -> Result<()>
         due: source.due.clone(),
     };
     let mut record = SyncRecord {
+        in_scope: true,
         source: source.clone(),
         baseline: Some(source.clone()),
         target: Some(mock_target("1".into(), "story".into(), &draft, &source)),
@@ -477,11 +499,13 @@ async fn mock_sync_survives_restart_and_requires_confirmation() -> anyhow::Resul
     let mut engine = Engine::open(&path).await?;
     let settings = Settings {
         workspace_id: "demo".into(),
-        owner: "roxi".into(),
+        owner: "alice".into(),
         ..Settings::default()
     };
     engine.save_settings(settings.clone()).await?;
     assert_eq!(engine.refresh(&gateway).await?, 3);
+    engine.refresh_workspaces(&gateway).await?;
+    engine.refresh_members(&gateway, "demo").await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
     let mut draft = engine.prepare(&guid)?;
     draft.title = "人工编辑标题".into();
@@ -518,5 +542,271 @@ async fn mock_sync_survives_restart_and_requires_confirmation() -> anyhow::Resul
     let engine = Engine::open(&path).await?;
     assert_eq!(engine.snapshot().records[0].status(), SyncStatus::Synced);
     assert!(engine.snapshot().last_checked.is_some());
+    Ok(())
+}
+
+// 旧缓存缺少新字段时，来源信息未知且任务必须先重新验证范围。
+#[test]
+fn legacy_snapshot_defaults_hide_unverified_records() -> Result<()> {
+    let mut value = serde_json::to_value(Snapshot::default())?;
+    value.as_object_mut().unwrap().remove("directory");
+    value["records"] = serde_json::json!([{
+        "source":{"guid":"old","title":"Old","description":"","url":"","due":null,"completed":false},
+        "baseline":null,"target":null,"target_workspace":null,"draft":null,"uncertain":false,"last_error":null
+    }]);
+    let snapshot: Snapshot = serde_json::from_value(value)?;
+    let serialized = serde_json::to_value(snapshot)?;
+    assert_eq!(serialized["records"][0]["in_scope"], false);
+    assert_eq!(
+        serialized["records"][0]["source"]["metadata"]["assignees"],
+        serde_json::json!([])
+    );
+    assert_eq!(serialized["directory"]["workspaces"], serde_json::json!([]));
+    Ok(())
+}
+
+// 完整刷新后只隐藏已离开范围的记录，不能丢弃草稿或映射。
+#[tokio::test]
+async fn absent_record_cannot_be_edited_or_written() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&dir.path().join("scope.sqlite"), &gateway).await?;
+    let source = engine.snapshot().records[0].source.clone();
+    let draft = engine.prepare(&source.guid)?;
+    engine.save_draft(&source.guid, &draft).await?;
+    gateway.tasks = Some(vec![]);
+    engine.refresh(&gateway).await?;
+    assert!(engine.prepare(&source.guid).is_err());
+    assert!(
+        engine
+            .save_draft_for_source(&source.guid, &draft, &source)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .commit(&gateway, &source.guid, &draft, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.snapshot().records[0].draft.as_ref(), Some(&draft));
+    Ok(())
+}
+
+#[test]
+fn self_scope_matches_creator_or_assignee_not_unknown_identity() -> Result<()> {
+    let mut source = MockGateway::default().fetch_tasks()?.remove(0);
+    source.metadata = SourceMetadata {
+        creator: Some(SourcePerson {
+            id: "creator".into(),
+            name: String::new(),
+        }),
+        assignees: vec![SourcePerson {
+            id: "assignee".into(),
+            name: "同名".into(),
+        }],
+        ..Default::default()
+    };
+    assert!(source.is_related_to("creator"));
+    assert!(source.is_related_to("assignee"));
+    assert!(!source.is_related_to("同名"));
+    assert!(!source.is_related_to(""));
+    source.metadata = SourceMetadata::default();
+    assert!(!source.is_related_to("creator"));
+    Ok(())
+}
+
+// 缓存走真实持久化；项目间成员不能串用，失败不能覆盖旧内容。
+#[tokio::test]
+async fn directory_cache_is_atomic_isolated_and_durable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("directory.sqlite");
+    let gateway = MockGateway::default();
+    let mut engine = Engine::open(&path).await?;
+    engine.refresh_workspaces(&gateway).await?;
+    engine.refresh_members(&gateway, "demo").await?;
+    let first = engine.snapshot().directory.members["demo"].clone();
+    engine.refresh_members(&gateway, "demo-2").await?;
+    assert_eq!(engine.snapshot().directory.members["demo"], first);
+    assert_ne!(
+        first.items,
+        engine.snapshot().directory.members["demo-2"].items
+    );
+    let before = engine.snapshot().clone();
+    let unsupported = FaultGateway::new(gateway.clone());
+    assert!(engine.refresh_workspaces(&unsupported).await.is_err());
+    assert!(engine.refresh_members(&unsupported, "demo").await.is_err());
+    assert!(engine.refresh_members(&gateway, " ").await.is_err());
+    assert_eq!(engine.snapshot(), &before);
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    assert_eq!(engine.snapshot(), &before);
+    chrono::DateTime::parse_from_rfc3339(&first.fetched_at)?;
+    chrono::DateTime::parse_from_rfc3339(before.directory.workspaces_fetched_at.as_ref().unwrap())?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_workspace_add_validates_and_updates_unique_id() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut engine = Engine::open(&dir.path().join("directory.sqlite")).await?;
+    for (id, name) in [("", "name"), ("id", " ")] {
+        assert!(
+            engine
+                .add_workspace(TapdWorkspace {
+                    id: id.into(),
+                    name: name.into()
+                })
+                .await
+                .is_err()
+        );
+    }
+    for name in ["Old", "New"] {
+        engine
+            .add_workspace(TapdWorkspace {
+                id: "id".into(),
+                name: name.into(),
+            })
+            .await?;
+    }
+    assert_eq!(
+        engine.snapshot().directory.workspaces,
+        vec![TapdWorkspace {
+            id: "id".into(),
+            name: "New".into()
+        }]
+    );
+    assert!(engine.snapshot().directory.workspaces_fetched_at.is_none());
+    Ok(())
+}
+
+// 任意一条目录数据损坏都会拒绝整批，不能写入部分项目或成员。
+#[tokio::test]
+async fn malformed_directory_batch_preserves_both_caches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut engine = Engine::open(&dir.path().join("cache.sqlite")).await?;
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    engine.refresh_workspaces(&gateway.inner).await?;
+    engine.refresh_members(&gateway.inner, "demo").await?;
+    let before = engine.snapshot().clone();
+    for (id, name) in [("", "name"), ("id", " "), ("same", "same")] {
+        gateway.workspaces = Some(vec![
+            TapdWorkspace {
+                id: "same".into(),
+                name: "valid".into(),
+            },
+            TapdWorkspace {
+                id: id.into(),
+                name: name.into(),
+            },
+        ]);
+        gateway.members = Some(vec![
+            TapdMember {
+                account: "same".into(),
+                name: "valid".into(),
+            },
+            TapdMember {
+                account: id.into(),
+                name: name.into(),
+            },
+        ]);
+        assert!(engine.refresh_workspaces(&gateway).await.is_err());
+        assert!(engine.refresh_members(&gateway, "demo").await.is_err());
+        assert_eq!(engine.snapshot(), &before);
+    }
+    // 空目录是有效全量结果，但不能误删另一个资源的缓存。
+    gateway.workspaces = Some(vec![]);
+    engine.refresh_workspaces(&gateway).await?;
+    assert!(engine.snapshot().directory.workspaces.is_empty());
+    assert_eq!(
+        engine.snapshot().directory.members,
+        before.directory.members
+    );
+    gateway.members = Some(vec![]);
+    engine.refresh_members(&gateway, "demo").await?;
+    assert!(engine.snapshot().directory.members["demo"].items.is_empty());
+    Ok(())
+}
+
+// 离开范围不等于撤销已发生的远端写入；恢复日志仍可内部核对绑定。
+#[tokio::test]
+async fn hidden_uncertain_record_retains_recovery_across_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("hidden.sqlite");
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let draft = engine.prepare(&guid)?;
+    engine.save_draft(&guid, &draft).await?;
+    gateway.fail_write = true;
+    assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
+    let mut retained = engine.snapshot().records[0].clone();
+    gateway.tasks = Some(vec![]);
+    engine.refresh(&gateway).await?;
+    retained.in_scope = false;
+    assert_eq!(engine.snapshot().records[0], retained);
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    assert_eq!(engine.snapshot().records[0], retained);
+    engine
+        .bind_existing(&gateway, &guid, "demo", "mock-demo-1", "story")
+        .await?;
+    assert!(!engine.snapshot().records[0].in_scope);
+    assert!(engine.snapshot().records[0].target.is_some());
+    gateway.tasks = None;
+    engine.refresh(&gateway).await?;
+    assert!(engine.snapshot().records[0].in_scope);
+    assert!(engine.snapshot().records[0].target.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn refreshing_admin_projects_preserves_manual_member_projects() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cache.db");
+    let mut engine = Engine::open(&path).await?;
+    engine
+        .add_workspace(TapdWorkspace {
+            id: "member-only".into(),
+            name: "成员项目".into(),
+        })
+        .await?;
+    engine.refresh_workspaces(&MockGateway::default()).await?;
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    assert!(
+        engine
+            .snapshot()
+            .directory
+            .workspaces
+            .iter()
+            .any(|p| p.id == "member-only" && p.name == "成员项目")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_removed_after_preview_is_blocked_before_write_journal() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&dir.path().join("removed-owner.db"), &gateway).await?;
+    engine.refresh_workspaces(&gateway.inner).await?;
+    engine.refresh_members(&gateway.inner, "demo").await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut draft = engine.prepare(&guid)?;
+    draft.owner = "alice".into();
+    engine.save_draft(&guid, &draft).await?;
+    let preview = engine.preview_target(&gateway, &guid)?;
+    gateway.members = Some(vec![]);
+    engine.refresh_members(&gateway, "demo").await?;
+    assert!(
+        engine
+            .commit(&gateway, &guid, &draft, preview)
+            .await
+            .is_err()
+    );
+    assert!(!engine.snapshot().records[0].uncertain);
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
     Ok(())
 }

@@ -108,6 +108,70 @@ impl Workspace {
                                         self.tr(cx, "无截止日期", "No due date").into()
                                     })),
                             )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: {}",
+                                        self.tr(cx, "创建人", "Created by"),
+                                        person_name(
+                                            record.source.metadata.creator.as_ref(),
+                                            model.language()
+                                        )
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: {}",
+                                        self.tr(cx, "负责人", "Assignees"),
+                                        assignee_names(&record.source, model.language())
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: {}",
+                                        self.tr(cx, "创建时间", "Created"),
+                                        format_time(
+                                            record.source.metadata.created_at.as_deref(),
+                                            model.language()
+                                        )
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: {}",
+                                        self.tr(cx, "截止时间", "Due"),
+                                        format_time(
+                                            record.source.metadata.due_at.as_deref(),
+                                            model.language()
+                                        )
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{}: {}",
+                                        self.tr(cx, "结束时间", "Completed"),
+                                        format_time(
+                                            record.source.metadata.completed_at.as_deref(),
+                                            model.language()
+                                        )
+                                    )),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
@@ -169,8 +233,9 @@ impl Workspace {
             .when(stale,|d|d.child(div().flex().flex_col().gap_2().child(self.tr(cx,"来源已变化或草稿未加载。重新读取来源将丢弃当前编辑及已保存草稿。","Source changed or draft not loaded. Reload discards current edits and the saved draft.")).child(Button::new("reload-source").label(self.tr(cx,"丢弃草稿并重新读取","Discard draft and reload")).disabled(busy||is_uncertain).on_click(cx.listener({let guid=guid.clone();move |this,_,_,cx|this.send(Job::OpenDraft(guid.clone(),true),cx)})))))
             .child(field(self.tr(cx,"标题","Title"),Input::new(&self.title).id("draft-title").aria_label(self.tr(cx,"标题","Title")).disabled(busy||is_uncertain)))
             .child(field(self.tr(cx,"内容","Description"),Textarea::new(&self.description).accessibility_id("draft-description").aria_label(self.tr(cx,"内容","Description")).h(px(210.)).disabled(busy||is_uncertain)))
-            .child(div().flex().gap_3().child(field(self.tr(cx,"目标项目 ID","Workspace ID"),Input::new(&self.workspace).id("draft-workspace").disabled(busy||record.target.is_some()))).child(field(self.tr(cx,"TAPD 负责人账号","TAPD owner account"),Input::new(&self.owner).id("draft-owner").disabled(busy||is_uncertain))))
-            .child(field(self.tr(cx,"截止日期（本机时区，仅日期）","Due date (local timezone, date only)"),Input::new(&self.due).id("draft-due").disabled(busy||is_uncertain)))
+            .child(div().flex().gap_3().child(field(self.tr(cx,"目标项目","Target project"),Select::new(&self.workspace).id("draft-workspace").placeholder(self.tr(cx,"选择项目","Select project")).search_placeholder(self.tr(cx,"搜索项目","Search projects")).disabled(busy||record.target.is_some()))).child(field(self.tr(cx,"TAPD 处理人","TAPD assignee"),Select::new(&self.owner).id("draft-owner").placeholder(self.tr(cx,"选择处理人","Select assignee")).search_placeholder(self.tr(cx,"搜索处理人","Search assignees")).cleanable(true).disabled(busy||is_uncertain))))
+            .child(field(self.tr(cx,"截止日期（本机时区，仅日期）","Due date (local timezone, date only)"),DatePicker::new(&self.due).placeholder(self.tr(cx,"选择日期","Select date")).cleanable(true).disabled(busy||is_uncertain)))
+            .child(div().flex().gap_2().child(Button::new("reload-projects").label(self.tr(cx,"刷新项目列表","Refresh projects")).ghost().disabled(busy).on_click(cx.listener(|this,_,_,cx|this.send(Job::LoadProjects,cx)))).child(Button::new("reload-members").label(self.tr(cx,"刷新处理人","Refresh assignees")).ghost().disabled(busy||selected(&self.workspace,cx).is_empty()).on_click(cx.listener(|this,_,_,cx|this.send(Job::LoadMembers(selected(&this.workspace,cx)),cx)))))
             .when_some(record.last_error.clone(),|d,error|d.child(div().text_color(cx.theme().danger).text_sm().child(error)))
             .when(is_uncertain,|d|d.child(div().p_4().bg(cx.theme().muted).rounded_md().flex().flex_col().gap_3()
                 .child(self.tr(cx,"上次写入结果不确定。请先在 TAPD 查找来源标记，填写已有条目 ID 验证关联。不会盲目重试创建。","The last write is uncertain. Find its source marker in TAPD and verify the existing item ID. Creation will not be blindly retried."))
@@ -195,4 +260,36 @@ impl Workspace {
             .child(div().flex().gap_3().child(Button::new("back-to-edit").label(self.tr(cx,"返回编辑","Back to editing")).disabled(busy).on_click(cx.listener(|this,_,_,cx|this.model.update(cx,|m,cx|{if let Some(p)=m.preview.take(){cx.emit(Editor{source:p.source,draft:p.draft,profile:p.profile});}cx.notify();}))))
                 .child(Button::new("confirm-import").label(self.tr(cx,"确认写入 TAPD","Confirm write to TAPD")).primary().disabled(busy).on_click(cx.listener(move |this,_,_,cx|this.model.update(cx,|m,cx|m.send_at(Job::Commit(preview.guid.clone(),preview.draft.clone(),preview.target.clone()),preview.profile.clone(),cx))))))
     }
+}
+
+// 人员和时间来自源任务；缺失时明确显示不可用，不把不透明 ID 当成人名。
+fn person_name(person: Option<&SourcePerson>, language: &str) -> String {
+    person
+        .filter(|p| !p.name.trim().is_empty())
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| text(language, "姓名未提供", "Name unavailable").into())
+}
+fn assignee_names(source: &SourceTask, language: &str) -> String {
+    if source.metadata.assignees.is_empty() {
+        return text(language, "未分配", "Unassigned").into();
+    }
+    source
+        .metadata
+        .assignees
+        .iter()
+        .map(|p| person_name(Some(p), language))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+fn format_time(value: Option<&str>, language: &str) -> String {
+    value
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| text(language, "未提供", "Not available").into())
 }

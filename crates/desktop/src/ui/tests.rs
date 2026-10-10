@@ -52,6 +52,10 @@ fn setup(
         error: false,
         preview: None,
         mode: Mode::Mock,
+        install_plan: None,
+        config_revision: 0,
+        lark_diagnostic: String::new(),
+        tapd_diagnostic: String::new(),
         pending_request: 0,
         profile: String::new(),
         jobs: worker.jobs,
@@ -81,6 +85,25 @@ fn click(cx: &mut TestAppContext, window: AnyWindowHandle, id: &str) {
         window.click(SharedString::from(id.to_owned()), cx);
     })
     .unwrap();
+}
+
+fn choose(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &str, query: &str) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .within(SharedString::from(id.to_owned()))
+            .click("input", cx);
+        window.input(query, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
 }
 
 #[gpui_kit::test]
@@ -176,9 +199,11 @@ fn gui_settings_switch_language_theme_and_validate_interval(cx: &mut TestAppCont
         window.click("poll-minutes", cx);
         window.press("cmd-a", cx);
         window.input("0", cx);
-        window.click("save-settings", cx);
     })
     .unwrap();
+    cx.run_until_parked();
+    click(cx, window, "save-settings");
+    cx.read(|cx| assert!(model.read(cx).busy, "save button must enqueue validation"));
     assert!(!drain(&events, &model, cx));
     cx.read(|cx| {
         assert_eq!(
@@ -229,7 +254,10 @@ fn actor_rejects_mock_auth_and_cross_profile_requests() {
     let _ = receive(&worker.events);
     for job in [
         Job::Login,
-        Job::Check,
+        Job::Check(CliTool::Lark),
+        Job::Check(CliTool::Tapd),
+        Job::PlanInstall(CliTool::Lark),
+        Job::Install(CliTool::Tapd),
         Job::SaveCredentials(Credentials::default()),
         Job::ClearCredentials,
     ] {
@@ -273,20 +301,14 @@ fn settings_do_not_overwrite_task_destination(cx: &mut TestAppContext) {
     });
     click(cx, window, &format!("select-{guid}"));
     assert!(drain(&events, &model, cx));
-    cx.update_window(window, |_, window, cx| {
-        window.click("draft-workspace", cx);
-        window.press("cmd-a", cx);
-        window.input("123456", cx);
-        window.click("draft-owner", cx);
-        window.input("task-owner", cx);
-    })
-    .unwrap();
+    choose(cx, window, "draft-workspace", "演示项目二");
+    choose(cx, window, "draft-owner", "bob");
     click(cx, window, "nav-settings");
     click(cx, window, "nav-pending");
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        assert_eq!(window.find("draft-workspace").value(), Some("123456"));
-        assert_eq!(window.find("draft-owner").value(), Some("task-owner"));
+        assert_eq!(window.find("draft-workspace").value(), Some("演示项目二"));
+        assert_eq!(window.find("draft-owner").value(), Some("演示成员 (bob)"));
     })
     .unwrap();
 }
@@ -379,4 +401,196 @@ fn actor_excludes_second_writer() {
         Event::Error(e) => assert!(e.contains("already open")),
         _ => panic!("second writer accepted"),
     }
+}
+
+#[gpui_kit::test]
+fn gui_standard_project_member_and_date_selection(cx: &mut TestAppContext) {
+    let (_dir, events, model, window, view) = setup(cx);
+    click(cx, window, "refresh");
+    assert!(drain(&events, &model, cx));
+    let guid = cx.read(|cx| {
+        model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .source
+            .guid
+            .clone()
+    });
+    click(cx, window, &format!("select-{guid}"));
+    assert!(drain(&events, &model, cx));
+    choose(cx, window, "draft-owner", "alice");
+    cx.read(|cx| assert_eq!(view.read(cx).draft(cx).owner, "alice"));
+    choose(cx, window, "draft-workspace", "演示项目二");
+    cx.read(|cx| {
+        let d = view.read(cx).draft(cx);
+        assert_eq!(d.workspace_id, "demo-2");
+        assert!(d.owner.is_empty());
+    });
+    choose(cx, window, "draft-owner", "bob");
+    let due = cx.read(|cx| view.read(cx).due.clone());
+    let picker_id: ElementId = ("date-picker", due.entity_id()).into();
+    cx.update_window(window, |_, window, cx| {
+        due.update(cx, |s, cx| {
+            s.set_date(
+                chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.click(picker_id.clone(), cx);
+        window.click("calendar-2026-09-16-0-2", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| assert_eq!(view.read(cx).draft(cx).due.as_deref(), Some("2026-09-16")));
+    click(cx, window, "preview");
+    assert!(drain(&events, &model, cx));
+    cx.read(|cx| {
+        let d = &model.read(cx).preview.as_ref().unwrap().draft;
+        assert_eq!(d.workspace_id, "demo-2");
+        assert_eq!(d.owner, "bob");
+        assert_eq!(d.due.as_deref(), Some("2026-09-16"));
+    });
+    click(cx, window, "confirm-import");
+    assert!(drain(&events, &model, cx));
+    cx.read(|cx| {
+        let r = &model.read(cx).snapshot.as_ref().unwrap().records[0];
+        assert_eq!(r.target_workspace.as_deref(), Some("demo-2"));
+        assert_eq!(r.target.as_ref().unwrap().owner, "bob");
+    });
+    // 标准日期组件清空行为也进入相同的业务草稿值。
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.within(picker_id.clone()).click("clean", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| assert!(view.read(cx).draft(cx).due.is_none()));
+}
+
+#[gpui_kit::test]
+fn branding_reaches_component_button_tokens_in_both_themes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    for mode in ["light", "dark"] {
+        cx.update(|cx| {
+            apply_theme(mode, cx);
+            let theme = Theme::global(cx);
+            assert_eq!(theme.tokens.button_primary, theme.colors.primary.into());
+            assert_eq!(
+                theme.tokens.button_primary_foreground,
+                theme.colors.primary_foreground.into()
+            );
+            assert_eq!(
+                theme.tokens.button_secondary_foreground,
+                theme.colors.primary.into()
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn mock_settings_exposes_diagnostics_without_mode_switches(cx: &mut TestAppContext) {
+    let (_dir, _events, model, window, _view) = setup(cx);
+    click(cx, window, "nav-settings");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mode-mock").is_none());
+        assert!(window.try_find("mode-live").is_none());
+    })
+    .unwrap();
+    // 结果处理是逐平台的，不能把版本存在误报为账号连接通过。
+    cx.update(|cx| {
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::Diagnostic {
+                    tool: CliTool::Lark,
+                    version: Some("1.0.96".into()),
+                    connected: false,
+                    detail: "Permission missing".into(),
+                },
+                cx,
+            )
+        })
+    });
+    cx.read(|cx| {
+        assert!(model.read(cx).lark_diagnostic.contains("1.0.96"));
+        assert!(
+            model
+                .read(cx)
+                .lark_diagnostic
+                .contains("Permission missing")
+        );
+        assert!(model.read(cx).tapd_diagnostic.is_empty());
+    });
+}
+
+#[test]
+fn live_installer_requires_confirmation_and_cancel_has_no_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let worker = worker::start(dir.path().into(), Mode::Live);
+    let _ = receive(&worker.events);
+    let send = |job| {
+        worker
+            .jobs
+            .send(Request {
+                job,
+                profile: String::new(),
+            })
+            .unwrap()
+    };
+    send(Job::Install(CliTool::Tapd));
+    let _ = receive(&worker.events);
+    match receive(&worker.events) {
+        Event::Error(e) => assert!(e.contains("before confirming")),
+        _ => panic!("install without confirmation"),
+    }
+    send(Job::PlanInstall(CliTool::Tapd));
+    match receive(&worker.events) {
+        Event::InstallPlan(p) => {
+            assert!(
+                p.source
+                    .starts_with("https://cnb.cool/tapd.cn/skills/tapd-cli/")
+            );
+            assert!(
+                p.destination
+                    .starts_with(dir.path().canonicalize().unwrap())
+            );
+        }
+        _ => panic!("missing install plan"),
+    }
+    let _ = receive(&worker.events);
+    send(Job::CancelInstall);
+    let _ = receive(&worker.events);
+    send(Job::Install(CliTool::Tapd));
+    let _ = receive(&worker.events);
+    assert!(matches!(receive(&worker.events), Event::Error(_)));
+    assert!(!dir.path().join("tools").exists());
+}
+
+#[gpui_kit::test]
+fn successful_installation_projects_saved_path_into_settings(cx: &mut TestAppContext) {
+    let (_dir, _events, model, window, view) = setup(cx);
+    click(cx, window, "nav-settings");
+    let mut snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
+    snapshot.settings.lark_path = "/private/application/tools/lark-cli".into();
+    cx.update(|cx| {
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::State {
+                    snapshot,
+                    profile: "mock".into(),
+                    mode: Mode::Mock,
+                    message: "installed",
+                    new_count: 0,
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert_eq!(
+            view.read(cx).lark_path.read(cx).value().as_ref(),
+            "/private/application/tools/lark-cli"
+        )
+    });
 }
