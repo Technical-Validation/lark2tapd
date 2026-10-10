@@ -19,6 +19,9 @@
 - `account_namespace() -> Result<String>`：要求 Lark 状态 `identity=user`、`verified=true`，公开 `brand` / `appId` / `identities.user.openId` 均有效；再通过 `tapd-cli user info` 的 `data.id` 验证实际 TAPD Token 主体。稳定键仅包含版本、语义提供商标识和以上公开身份，同一账户轮换令牌或搬迁 CLI 不改变键。手动注入 Lark user token 一律拒绝，提示清除凭据后使用 CLI OAuth。桌面端应在操作前重新计算并阻止跨账户复用草稿。
 - 实现 `lark2tapd_core::Gateway` 全部方法。`validate_draft` 本地验证数字 workspace、标题和日期，供核心在不确定日志之前调用；`get_source` 重新验证 OAuth 主体，只读选中的单个原生任务，并再次确认创建者或负责人包含本人；关系已移除则拒绝提交。写入成功后根据实际返回的 `Task` / `Story` 类型读回并核对 title / description / owner / due；读回失败或任何字段不符仍返回错误，由核心保留不确定结果，不自动重试写入。
 - `safe_url(raw, lark) -> String`：仅保留 HTTPS 飞书 / Lark 或 TAPD 域名 URL；无可靠 URL 时返回空字符串。
+- `render_description(&Draft, &SourceTask) -> Result<String>`：纯本地 Markdown 转安全 HTML。使用固定 `markdown=1.0.0`，不执行原始 HTML、不允许危险协议。仅 HTTP(S) 链接保留可点击语义；图片只解析当前草稿的 `attachment:<id>`，并只使用已确认上传回执中的安全 TAPD 地址。未上传、未知、重复 ID 或不确定图片显示可见占位文字；普通文件只作为 TAPD 原生附件，不插入本地 URL。
+- `validate_attachment_for_upload(&DraftAttachment) -> Result<()>`：任务写入/上传日志之前的纯本地预检，核验缓存内容哈希、类型和大小。此辅助函数从 `root/media/<hash>` 反推 root，**不能代替调用方使用当前已验证账户的真实 root 做归属检查**。图片要求 PNG/GIF/JPEG/BMP 且严格小于 5 MiB，WebP 必须先由桌面端转换。普通文件还受核心 20 MiB 缓存上限约束。
+- `CliGateway::upload_draft_attachment(media_root: &Path, workspace: &str, target: &TargetTask, attachment: &DraftAttachment) -> Result<DraftAttachment>`：显式传入账户拥有的根目录，再读核验后的字节并写到私有临时目录；CLI 不重新打开原缓存路径。只调用一次，绝不自动重试。返回克隆的元数据与远端回执；错误不包含文件路径、原始输出或服务端敏感文本。桌面 actor 必须先持久化目标映射和上传不确定日志，成功持久化回执后才补交图片描述。图片回执为 `remote_url`、普通文件为 `remote_id`；已含回执或不确定的附件拒绝再次上传。
 
 ## 应用内安装接口
 
@@ -38,7 +41,7 @@
 
 用于 TAPD 的 `due` 仍按本机时区转换为 `YYYY-MM-DD`，丢弃时分；原始 `metadata.due_at` 独立保留。不能据此恢复任务作者原始时区。
 
-描述转义所有 HTML 特殊字符，再追加可见文本 `[lark-task:{guid}]` 及通过白名单验证的来源 URL。返回的远端 HTML 作为冲突基线，不作为本地可执行 HTML 渲染。
+描述先按 Markdown AST 消除非授权图片和不安全链接，再使用安全编译选项生成 HTML；不下载任何 Markdown 图片，也不读取其中的本地路径。来源标记 `[lark-task:{guid}]` 在 Markdown 渲染后追加，防止被代码块或引用语法吞掉；随后追加白名单验证的来源 URL。远端写入标题使用 `Draft::rendered_title()`，保留固定 `【前缀】` 与原始标题。返回的远端 HTML 作为冲突基线，不作为本地可执行 HTML 渲染。
 
 ## 身份协议证据与未验证边界
 
@@ -48,5 +51,8 @@
 - 飞书相关列表及日期格式依据官方 v1.0.96 [`task_get_related_tasks.go`](https://github.com/larksuite/cli/blob/v1.0.96/shortcuts/task/task_get_related_tasks.go) 和 [`task_query_helpers.go`](https://github.com/larksuite/cli/blob/v1.0.96/shortcuts/task/task_query_helpers.go)；成员字段以原生任务详情为准。
 - TAPD 管理员列表的 `Workspace` 包装由父任务授权的只读 `user workspaces` 调用观察确认：`status=1`，数组元素含字符串 `id` / `name` / `pretty_name`。测试仅保留合成数据，不保存真实项目名或 ID。成员 `UserWorkspace.user/name` 结构依据[官方成员接口文档](https://open.tapd.cn/document/api-doc/API文档/api_reference/workspace/get_workspace_users.html)。不借用其他 workspace 接口的结构猜测。
 - 本桥接实现和回归测试未调用真实账户 API、OAuth、Keychain 或安装器；全部调用边界由临时目录中的假可执行文件覆盖。Keychain 仅编译验证。父任务的上述只读结构观察不代表桥接层已经做过真实端到端同步。清空日期是否被服务端接受仍需授权环境验证，忽略清空时会保留不确定状态。
-- 描述采用严格读回相等策略。TAPD 若规范化 HTML（即使语义相同），仍会安全地报不确定，需人工核对；未用可能掩盖数据丢失的 HTML 去标签比较。
+- 描述读回只接受精确相等，或已安装 TAPD CLI `ensureHtml` 对整个生成结果追加的单层 `<p>…</p>` 包装；不去标签、不折叠空白、不忽略属性。CLI 源码还会按连续空行分段，并可能把代码文本中的 Markdown 符号重新判为 Markdown；这些未证明无损的转换仍报不确定，不冒充成功。假 CLI 覆盖了已知单层包装，未做真实服务端写入验证。
+- 附件命令依据已安装 TAPD CLI 1.8.1 help 与官方源码：图片 `attachment upload-image workspaceid=… file=…`；普通附件 `attachment upload workspaceid=… type=story|task entry-id=… file=…`。官方腾讯域文档 [`upload_attachment`](https://o.tapd.tencent.com/document/api-doc/API文档/api_reference/attachment/upload_attachment.html) 描述 `data.Attachment` 回执与 250 MB 契约，但 `open.tapd.cn` 另有仅支持 `story_custom_field` / 150 MB 的文档；当前 `api.tapd.cn` 是否支持前者未经实写验证，不支持时安全报错并保留不确定记录。
+- 官方 [`upload_image`](https://o.tapd.tencent.com/document/api-doc/API文档/api_reference/attachment/upload_image.html) 的回执为 `data.image_src` 与 `html_code`。只取 `image_src`：支持严格 `/tfl/pictures/…` 路径或安全 TAPD HTTPS URL，拒绝路径遍历、查询/片段形式的相对地址；忽略不可信 `html_code`，不猜测绝对域名。该图片是 TAPD 内部资源，不承诺外部热链；桌面预览使用已核验本地字节。
+- 普通附件要求回执证明数字 ID、workspace、类型和父项身份。超过 JavaScript 安全整数的数字型父项 ID 不能单独证明精确身份（CLI 会先 JSON.parse）。回执有精确附件 ID、无明确冲突但缺少完整身份时，按[官方列表接口](https://open.tapd.cn/document/api-doc/API文档/api_reference/attachment/get_attachments.html)执行 `attachment list workspaceid=… entry_id=… id=… type=… limit=2 page=1` 读回：要求唯一附件、精确 ID/workspace/type，且父项不能明确冲突；大数字父项的精确归属依赖服务端遵守文档中的 `entry_id` 筛选。读回失败仍不确定，不重试上传。无法精确识别附件 ID 或明确冲突则直接拒绝。所有新上传测试均使用假进程和合成回执，没有真实上传、授权、安装或账户 API 调用。
 - 新版稳定键与旧版凭据哈希键不同。旧库尤其不确定写入不能自动丢弃或猜测迁移，调用方必须保留并安排显式核对；此桥接层不执行历史库迁移。

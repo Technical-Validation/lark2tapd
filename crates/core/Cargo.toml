@@ -9,6 +9,8 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+sha2 = "0.10"
+libc = "0.2"
 tokio.workspace = true
 toasty = { version = "0.11", features = ["sqlite"] }
 toasty-driver-sqlite = "0.11"

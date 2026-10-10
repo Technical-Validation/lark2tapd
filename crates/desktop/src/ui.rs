@@ -1,3 +1,4 @@
+mod media;
 mod selectors;
 mod settings;
 use gpui_kit::component::{
@@ -5,15 +6,21 @@ use gpui_kit::component::{
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     select::{SearchableVec, Select, SelectEvent, SelectState},
 };
+use gpui_kit::component::{collapsible::Collapsible, switch::Switch};
 use lark2tapd_bridge::installer::{CliTool, InstallationPlan};
-use lark2tapd_core::{DirectoryCache, SourcePerson, TapdWorkspace};
+use lark2tapd_core::{DirectoryCache, DraftAttachment, TapdWorkspace};
 use selectors::{ChoiceList, ChoiceState, selected};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
+    sync::Arc,
+};
 mod tasks;
 // 主界面只管理视图和输入；同步、认证和持久化通过工作队列执行。
 use crate::{
     i18n::text,
     native::{self, NativeAction, StatusMenu},
-    worker::{Editor, Event, Job, Mode, Preview, Request, WorkerHandle},
+    worker::{Editor, Event, Job, Mode, Preference, Request, WorkerHandle, WorkerSender},
 };
 use gpui_kit::base::Disableable;
 use gpui_kit::component::{
@@ -23,49 +30,108 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use lark2tapd_bridge::Credentials;
-use lark2tapd_core::{Draft, Settings, Snapshot, SourceTask, SyncRecord, SyncStatus};
+use lark2tapd_core::{Draft, Snapshot, SourceTask, SyncRecord, SyncStatus};
+
+#[derive(Clone)]
+struct MediaReady {
+    guid: String,
+    profile: String,
+    attachment: DraftAttachment,
+    marker: Option<String>,
+    session: u64,
+}
+
+#[derive(Clone)]
+struct MediaFailure {
+    guid: String,
+    profile: String,
+    session: u64,
+    marker: Option<String>,
+    message: String,
+}
+#[derive(Clone)]
+struct RemoteContext {
+    guid: String,
+    profile: String,
+    session: u64,
+    target: lark2tapd_core::TargetTask,
+}
+static EDITOR_SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn editor_session() -> u64 {
+    EDITOR_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 pub struct Model {
     pub snapshot: Option<Snapshot>,
     pub busy: bool,
     pub notice: String,
     pub error: bool,
-    pub preview: Option<Preview>,
     pub mode: Mode,
     pub install_plan: Option<InstallationPlan>,
     pub lark_diagnostic: String,
     pub tapd_diagnostic: String,
-    config_revision: u64,
+    pub activities: BTreeSet<String>,
+    pub errors: BTreeMap<&'static str, String>,
+    pub checked_workspace: Option<TapdWorkspace>,
+    pub data_root: PathBuf,
+    state_revision: u64,
+    last_action: &'static str,
     pending_request: u64,
     profile: String,
-    jobs: std::sync::mpsc::Sender<Request>,
+    jobs: WorkerSender,
     tray: Option<StatusMenu>,
 }
-
 impl EventEmitter<Editor> for Model {}
+impl EventEmitter<MediaReady> for Model {}
+impl EventEmitter<MediaFailure> for Model {}
+impl EventEmitter<RemoteContext> for Model {}
 impl Model {
     fn send(&mut self, job: Job, cx: &mut Context<Self>) {
         self.send_at(job, self.profile.clone(), cx);
     }
     fn send_at(&mut self, job: Job, profile: String, cx: &mut Context<Self>) {
-        if self.busy {
+        // 测试按钮始终可点；演示模式解释边界，不伪装为真实连接成功。
+        if let Job::Check(tool) = &job
+            && self.mode == Mode::Mock
+        {
+            let note=text(self.language(),"演示模式：未执行真实连接测试。以 LARK2TAPD_MOCK=0 重启后可测试真实服务。","Demo mode: no real connection test was run. Restart with LARK2TAPD_MOCK=0 to test real services.").to_owned();
+            match tool {
+                CliTool::Lark => self.lark_diagnostic = note,
+                CliTool::Tapd => self.tapd_diagnostic = note,
+            }
+            cx.notify();
             return;
         }
-        match self.jobs.send(Request { job, profile }) {
-            Ok(()) => {
-                self.busy = true;
-                self.error = false;
-                self.notice = text(self.language(), "正在处理…", "Working…").into();
+        let field = match &job {
+            Job::SetPreference(Preference::PollMinutes(_)) => Some("poll"),
+            Job::SetPreference(Preference::DefaultDestination { .. }) => Some("destination"),
+            Job::SetPreference(Preference::WorkspacePrefixes { .. }) => Some("prefixes"),
+            Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
+            Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
+            Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login => Some("credentials"),
+            Job::LocalFile { .. } | Job::PastedImage { .. } => Some("attachments"),
+            _ => None,
+        };
+        if let Some(field) = field {
+            self.errors.remove(field);
+        }
+        if matches!(&job, Job::Submit(..)) {
+            if self.activities.contains("submit") {
+                return;
             }
-            Err(_) => {
-                self.error = true;
-                self.notice = text(
-                    self.language(),
-                    "后台服务已停止，请重启应用。",
-                    "Background service stopped. Restart the app.",
-                )
-                .into();
-            }
+            self.activities.insert("submit".into());
+            self.busy = true;
+        }
+        if self.jobs.send(Request { job, profile }).is_err() {
+            self.error = true;
+            self.notice = text(
+                self.language(),
+                "后台服务已停止，请重启应用。",
+                "Background service stopped. Restart the app.",
+            )
+            .into();
+            self.activities.clear();
+            self.busy = false;
         }
         cx.notify();
     }
@@ -78,24 +144,29 @@ impl Model {
                 message,
                 new_count,
             } => {
-                let profile_changed = self.profile != profile;
-                if profile_changed {
-                    self.preview = None;
-                }
-                if self.language() != snapshot.settings.language {
-                    set_app_menu(&snapshot.settings.language, cx);
-                }
-                self.profile = profile;
-                self.mode = mode;
-                let old_theme = self.snapshot.as_ref().map(|s| s.settings.theme.clone());
-                let first = profile_changed
+                let changed = self.profile != profile;
+                let first = changed
                     || self
                         .snapshot
                         .as_ref()
                         .is_none_or(|s| s.last_checked.is_none());
-                if old_theme.as_deref() != Some(&snapshot.settings.theme) {
+                if changed {
+                    self.checked_workspace = None;
+                    self.errors.remove("submit");
+                    self.errors.remove("attachments");
+                }
+                if self.language() != snapshot.settings.language {
+                    set_app_menu(&snapshot.settings.language, cx);
+                }
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|s| s.settings.theme != snapshot.settings.theme)
+                {
                     apply_theme(&snapshot.settings.theme, cx);
                 }
+                self.profile = profile;
+                self.mode = mode;
                 let count = snapshot
                     .records
                     .iter()
@@ -108,30 +179,12 @@ impl Model {
                         snapshot.settings.poll_enabled,
                     );
                 }
-                if new_count > 0 && !first && self.mode == Mode::Live {
+                if new_count > 0 && !first && mode == Mode::Live {
                     native::notify_new(&snapshot.settings.language, new_count);
                 }
-                self.notice = message_text(&snapshot.settings.language, message).into();
                 if matches!(
                     message,
-                    "imported"
-                        | "recovered"
-                        | "credentials_saved"
-                        | "credentials_cleared"
-                        | "authorized"
-                ) {
-                    self.preview = None;
-                }
-                if message == "installed" {
-                    self.config_revision += 1;
-                }
-                if matches!(
-                    message,
-                    "installed"
-                        | "settings_saved"
-                        | "credentials_saved"
-                        | "credentials_cleared"
-                        | "authorized"
+                    "installed" | "credentials_saved" | "credentials_cleared" | "authorized"
                 ) {
                     self.lark_diagnostic.clear();
                     self.tapd_diagnostic.clear();
@@ -139,18 +192,78 @@ impl Model {
                 if matches!(message, "installed" | "install_cancelled") {
                     self.install_plan = None;
                 }
-                if self.preview.as_ref().is_some_and(|p| {
-                    !snapshot
-                        .records
-                        .iter()
-                        .any(|r| r.source.guid == p.guid && r.in_scope)
-                }) {
-                    self.preview = None;
+                if !message.is_empty() {
+                    self.notice = message_text(&snapshot.settings.language, message).into();
+                    self.error = false;
                 }
                 gpui_kit::component::set_locale(&snapshot.settings.language);
                 self.snapshot = Some(snapshot);
-                self.busy = false;
-                self.error = false;
+                self.state_revision += 1;
+                self.last_action = message;
+            }
+            Event::Activity { key, active } => {
+                if active {
+                    self.activities.insert(key);
+                } else {
+                    self.activities.remove(&key);
+                }
+                self.busy =
+                    self.activities.contains("submit") || self.activities.contains("install");
+            }
+            Event::FormError { field, message } => {
+                if field == "attachments" {
+                    return;
+                }
+                if field == "submit" {
+                    self.activities.remove("submit");
+                    self.busy = false;
+                }
+                self.errors.insert(field, message);
+            }
+            Event::WorkspaceChecked(workspace) => {
+                self.checked_workspace = Some(workspace);
+            }
+            Event::AttachmentReady {
+                guid,
+                profile,
+                attachment,
+                marker,
+                session,
+            } => cx.emit(MediaReady {
+                guid,
+                profile,
+                attachment,
+                marker,
+                session,
+            }),
+            Event::AttachmentFailed {
+                guid,
+                profile,
+                marker,
+                session,
+                message,
+            } => cx.emit(MediaFailure {
+                guid,
+                profile,
+                marker,
+                session,
+                message,
+            }),
+            Event::RemoteTarget {
+                guid,
+                profile,
+                session,
+                target,
+            } => cx.emit(RemoteContext {
+                guid,
+                profile,
+                session,
+                target,
+            }),
+            Event::Editor(editor) => {
+                self.errors.remove("submit");
+                self.errors.remove("attachments");
+                cx.emit(editor);
             }
             Event::InstallPlan(plan) => {
                 self.install_plan = Some(plan);
@@ -175,15 +288,7 @@ impl Model {
                     CliTool::Tapd => self.tapd_diagnostic = result,
                 }
             }
-            Event::Preview(preview) => {
-                self.preview = Some(preview);
-            }
-            Event::Editor(editor) => {
-                self.preview = None;
-                cx.emit(editor);
-            }
             Event::Error(error) => {
-                self.busy = false;
                 self.error = true;
                 self.notice = format!(
                     "{} {error}",
@@ -216,12 +321,16 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
         busy: false,
         notice: String::new(),
         error: false,
-        preview: None,
         mode,
         install_plan: None,
-        config_revision: 0,
         lark_diagnostic: String::new(),
         tapd_diagnostic: String::new(),
+        activities: BTreeSet::new(),
+        errors: BTreeMap::new(),
+        checked_workspace: None,
+        data_root: worker.data_root.clone(),
+        state_revision: 0,
+        last_action: "",
         pending_request: 0,
         profile: String::new(),
         jobs: worker.jobs,
@@ -269,7 +378,7 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
                         if let Some(s) = &m.snapshot {
                             let mut s = s.settings.clone();
                             s.poll_enabled = !s.poll_enabled;
-                            m.send(Job::SaveSettings(s), cx);
+                            m.send(Job::SetPreference(Preference::Polling(s.poll_enabled)), cx);
                         }
                     });
                 }
@@ -316,6 +425,8 @@ pub fn show_window(cx: &mut App) {
             })
             .is_ok()
     {
+        let m = cx.global::<Shell>().model.clone();
+        m.update(cx, |m, cx| m.send(Job::Refresh, cx));
         return;
     }
     let model = cx.global::<Shell>().model.clone();
@@ -347,6 +458,8 @@ pub fn show_window(cx: &mut App) {
         Ok((handle, _)) => {
             cx.global_mut::<Shell>().window = Some(handle);
             cx.activate(true);
+            let m = cx.global::<Shell>().model.clone();
+            m.update(cx, |m, cx| m.send(Job::Refresh, cx));
         }
         Err(error) => {
             eprintln!("Unable to open application window: {error}");
@@ -365,7 +478,7 @@ fn apply_theme(mode: &str, cx: &mut App) {
         // 马尔斯绿的深浅变体保证小字号按钮文字对比度，焦点环保留品牌原色。
         let dark = theme.mode == ThemeMode::Dark;
         theme.colors.primary = rgb(if dark { 0x59c3bc } else { 0x006764 }).into();
-        theme.colors.primary_foreground = rgb(if dark { 0x052925 } else { 0xffffff }).into();
+        theme.colors.primary_foreground = rgb(if dark { 0x171b1b } else { 0xffffff }).into();
         theme.colors.ring = rgb(0x008c8c).into();
         // Kit 的按钮采用独立令牌，不能只改 primary；同时覆盖交互状态和次级操作。
         theme.colors.button_primary = theme.colors.primary;
@@ -373,11 +486,14 @@ fn apply_theme(mode: &str, cx: &mut App) {
         theme.colors.button_primary_hover = rgb(if dark { 0x71d1ca } else { 0x007873 }).into();
         theme.colors.button_primary_active = rgb(if dark { 0x46aaa4 } else { 0x00534f }).into();
         theme.colors.button_secondary = rgb(if dark { 0x103d39 } else { 0xedf7f5 }).into();
-        theme.colors.button_secondary_foreground = theme.colors.primary;
+        theme.colors.button_secondary_foreground = theme.colors.foreground;
         theme.colors.button_secondary_hover = rgb(if dark { 0x194d47 } else { 0xd6efea }).into();
         theme.colors.button_secondary_active = rgb(if dark { 0x235e57 } else { 0xbfe5de }).into();
-        theme.colors.secondary_foreground = theme.colors.primary;
-        theme.colors.accent_foreground = theme.colors.primary;
+        theme.colors.secondary_foreground = theme.colors.foreground;
+        theme.colors.accent_foreground = theme.colors.foreground;
+        theme.colors.link = theme.colors.foreground;
+        theme.colors.link_hover = theme.colors.foreground;
+        theme.colors.link_active = theme.colors.foreground;
         theme.font_size = px(14.);
         theme.radius = px(7.);
     });
@@ -398,8 +514,11 @@ impl Filter {
         }
         match self {
             Self::Pending => r.status() == SyncStatus::Unimported,
-            Self::Changed => matches!(r.status(), SyncStatus::Changed | SyncStatus::Uncertain),
-            Self::Synced => r.status() == SyncStatus::Synced,
+            Self::Changed => {
+                r.has_pending_attachments()
+                    || matches!(r.status(), SyncStatus::Changed | SyncStatus::Uncertain)
+            }
+            Self::Synced => r.status() == SyncStatus::Synced && !r.has_pending_attachments(),
             Self::All => true,
             Self::Settings => false,
         }
@@ -412,19 +531,28 @@ pub struct Workspace {
     selected: Option<String>,
     edit_source: Option<SourceTask>,
     edit_profile: String,
+    editor_session: u64,
+    remote_target: Option<lark2tapd_core::TargetTask>,
+    source_open: bool,
+    new_workspace_open: bool,
     clear_confirmation: bool,
     last_directory: Option<DirectoryCache>,
-    applied_config_revision: u64,
-    manual_workspace_id: Entity<InputState>,
-    manual_workspace_name: Entity<InputState>,
+    last_prefixes: BTreeMap<String, Vec<String>>,
+    seen_state_revision: u64,
+    pending_seen: u64,
     search: Entity<InputState>,
     title: Entity<InputState>,
     description: Entity<TextareaState>,
-    owner: Entity<ChoiceState>,
     workspace: Entity<ChoiceState>,
+    owner: Entity<ChoiceState>,
+    prefix: Entity<ChoiceState>,
+    due: Entity<DatePickerState>,
     settings_workspace: Entity<ChoiceState>,
     settings_owner: Entity<ChoiceState>,
-    due: Entity<DatePickerState>,
+    prefix_workspace: Entity<ChoiceState>,
+    prefix_options: Entity<TextareaState>,
+    manual_workspace_id: Entity<InputState>,
+    manual_workspace_name: Entity<InputState>,
     poll: Entity<InputState>,
     lark_path: Entity<InputState>,
     tapd_path: Entity<InputState>,
@@ -435,9 +563,14 @@ pub struct Workspace {
     tapd_token: Entity<InputState>,
     recover_id: Entity<InputState>,
     recover_kind: String,
-    pending_seen: u64,
+    attachments: Vec<DraftAttachment>,
+    images: HashMap<String, Arc<Image>>,
+    loading_images: BTreeSet<String>,
+    pending_pastes: BTreeSet<String>,
+    pending_files: usize,
+    pending_file_paths: BTreeSet<PathBuf>,
+    next_paste: u64,
 }
-
 impl Workspace {
     fn new(model: Entity<Model>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search / 搜索任务"));
@@ -446,7 +579,67 @@ impl Workspace {
             |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
         )
         .detach();
+        let description = cx.new(|cx| TextareaState::new(window, cx));
+        cx.subscribe(
+            &description,
+            |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
+        )
+        .detach();
+        let poll = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe(
+            &poll,
+            |this, input, event: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    match input.read(cx).value().parse::<u32>() {
+                        Ok(minutes) if (1..=1440).contains(&minutes) => {
+                            this.preference(Preference::PollMinutes(minutes), cx)
+                        }
+                        _ => this.form_error(
+                            "poll",
+                            this.tr(cx, "请输入 1–1440 分钟", "Enter 1–1440 minutes")
+                                .into(),
+                            cx,
+                        ),
+                    }
+                }
+            },
+        )
+        .detach();
+        let workspace = choice_state(window, cx);
+        let settings_workspace = choice_state(window, cx);
+        let prefix_workspace = choice_state(window, cx);
+        cx.subscribe_in(
+            &workspace,
+            window,
+            |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
+                this.project_changed(false, window, cx)
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &settings_workspace,
+            window,
+            |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
+                this.project_changed(true, window, cx)
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &prefix_workspace,
+            window,
+            |this, _, _: &SelectEvent<ChoiceList>, window, cx| this.load_prefix_form(window, cx),
+        )
+        .detach();
+        let due = cx.new(|cx| DatePickerState::new(window, cx).date_format("%Y-%m-%d"));
+        cx.subscribe(&due, |_, _, _: &DatePickerEvent, cx| cx.notify())
+            .detach();
         cx.subscribe_in(&model, window, |this, _, editor: &Editor, window, cx| {
+            if this.editor_session != editor.session
+                || this.selected.as_ref() != Some(&editor.source.guid)
+                || this.edit_profile != editor.profile
+            {
+                return;
+            }
             this.edit_source = Some(editor.source.clone());
             this.edit_profile = editor.profile.clone();
             this.selected = Some(editor.source.guid.clone());
@@ -454,12 +647,13 @@ impl Workspace {
             set(&this.title, d.title.clone(), window, cx);
             this.fill_projects(false, &d.workspace_id, window, cx);
             this.fill_members(false, &d.owner, window, cx);
-            this.due.update(cx, |state, cx| {
-                state.set_date(
+            this.fill_prefixes(&d.title_prefix, window, cx);
+            this.due.update(cx, |s, cx| {
+                s.set_date(
                     Date::Single(
                         d.due
                             .as_ref()
-                            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
+                            .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok()),
                     ),
                     window,
                     cx,
@@ -467,39 +661,120 @@ impl Workspace {
             });
             this.description
                 .update(cx, |s, cx| s.set_value(d.description.clone(), window, cx));
+            this.attachments = d.attachments.clone();
+            this.images.clear();
+            this.loading_images.clear();
+            this.load_images(window, cx);
+            let workspace = d.workspace_id.clone();
+            if !workspace.is_empty() {
+                let model = this.model.clone();
+                let profile = editor.profile.clone();
+                cx.defer(move |cx| {
+                    model.update(cx, |m, cx| {
+                        m.send_at(Job::LoadMembers(workspace), profile, cx)
+                    })
+                });
+            }
             cx.notify();
         })
         .detach();
+        cx.subscribe_in(&model, window, |this, _, ready: &MediaReady, window, cx| {
+            this.accept_attachment(ready, window, cx)
+        })
+        .detach();
+        cx.subscribe_in(
+            &model,
+            window,
+            |this, _, failure: &MediaFailure, window, cx| {
+                this.reject_attachment(failure, window, cx)
+            },
+        )
+        .detach();
+        cx.subscribe(&model, |this, _, remote: &RemoteContext, cx| {
+            if this.selected.as_ref() == Some(&remote.guid)
+                && this.edit_profile == remote.profile
+                && this.editor_session == remote.session
+            {
+                this.remote_target = Some(remote.target.clone());
+                cx.notify();
+            }
+        })
+        .detach();
         cx.observe_in(&model, window, |this, _, window, cx| {
-            let revision = this.model.read(cx).config_revision;
-            if revision != this.applied_config_revision {
-                this.applied_config_revision = revision;
-                if let Some(settings) = this
-                    .model
-                    .read(cx)
-                    .snapshot
-                    .as_ref()
-                    .map(|s| s.settings.clone())
+            let (revision, action, settings) = {
+                let m = this.model.read(cx);
+                (
+                    m.state_revision,
+                    m.last_action,
+                    m.snapshot.as_ref().map(|s| s.settings.clone()),
+                )
+            };
+            if this.seen_state_revision != revision {
+                this.seen_state_revision = revision;
+                if action == "installed"
+                    && let Some(s) = &settings
                 {
-                    set(&this.lark_path, settings.lark_path, window, cx);
-                    set(&this.tapd_path, settings.tapd_path, window, cx);
+                    set(&this.lark_path, s.lark_path.clone(), window, cx);
+                    set(&this.tapd_path, s.tapd_path.clone(), window, cx);
+                }
+                if matches!(action, "credentials_saved" | "credentials_cleared") {
+                    for input in [
+                        &this.app_id,
+                        &this.app_secret,
+                        &this.lark_token,
+                        &this.tapd_token,
+                    ] {
+                        set(input, String::new(), window, cx);
+                    }
+                }
+                if action == "target_accepted" {
+                    this.remote_target = None;
+                }
+                if action == "project_added" {
+                    this.new_workspace_open = false;
                 }
             }
             this.sync_directory(window, cx);
-            if this.selected.as_ref().is_some_and(|id| {
-                this.model
-                    .read(cx)
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|s| !s.records.iter().any(|r| &r.source.guid == id && r.in_scope))
-            }) {
-                this.selected = None;
-                this.edit_source = None;
+            if let Some(settings) = settings
+                && this.last_prefixes != settings.workspace_prefixes
+            {
+                this.last_prefixes = settings.workspace_prefixes;
+                let prefix = selected(&this.prefix, cx);
+                this.fill_prefixes(&prefix, window, cx);
             }
-            if !this.edit_profile.is_empty() && this.edit_profile != this.model.read(cx).profile {
+            if (!this.edit_profile.is_empty() && this.edit_profile != this.model.read(cx).profile)
+                || this.selected.as_ref().is_some_and(|id| {
+                    this.model.read(cx).snapshot.as_ref().is_some_and(|s| {
+                        !s.records.iter().any(|r| &r.source.guid == id && r.in_scope)
+                    })
+                })
+            {
                 this.selected = None;
                 this.edit_source = None;
                 this.edit_profile.clear();
+                this.attachments.clear();
+                this.images.clear();
+                this.pending_pastes.clear();
+                this.pending_files = 0;
+                this.pending_file_paths.clear();
+            }
+            if let Some(record) = this.selected.as_ref().and_then(|id| {
+                this.model
+                    .read(cx)
+                    .snapshot
+                    .as_ref()?
+                    .records
+                    .iter()
+                    .find(|r| &r.source.guid == id)
+            }) && let Some(saved) = &record.last_draft
+            {
+                for a in &mut this.attachments {
+                    if let Some(old) = saved.attachments.iter().find(|v| v.id == a.id) {
+                        a.remote_id = old.remote_id.clone();
+                        a.remote_url = old.remote_url.clone();
+                        a.uncertain = old.uncertain;
+                    }
+                }
             }
             let request = this.model.read(cx).pending_request;
             if request != this.pending_seen {
@@ -522,79 +797,35 @@ impl Workspace {
                 }
             })
             .detach();
-        let workspace = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(Vec::<selectors::Choice>::new()),
-                None,
-                window,
-                cx,
-            )
-            .searchable(true)
-        });
-        let settings_workspace = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(Vec::<selectors::Choice>::new()),
-                None,
-                window,
-                cx,
-            )
-            .searchable(true)
-        });
-        cx.subscribe_in(
-            &workspace,
-            window,
-            |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
-                this.project_changed(false, window, cx)
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &settings_workspace,
-            window,
-            |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
-                this.project_changed(true, window, cx)
-            },
-        )
-        .detach();
-        let due = cx.new(|cx| DatePickerState::new(window, cx).date_format("%Y-%m-%d"));
-        cx.subscribe(&due, |_, _, _: &DatePickerEvent, cx| cx.notify())
-            .detach();
         let mut this = Self {
             model,
-            last_directory: None,
-            applied_config_revision: 0,
-            manual_workspace_id: cx.new(|cx| InputState::new(window, cx)),
-            manual_workspace_name: cx.new(|cx| InputState::new(window, cx)),
             filter: Filter::Pending,
             selected: None,
             edit_source: None,
             edit_profile: String::new(),
+            source_open: false,
+            editor_session: editor_session(),
+            remote_target: None,
+            new_workspace_open: false,
             clear_confirmation: false,
+            last_directory: None,
+            last_prefixes: BTreeMap::new(),
+            seen_state_revision: 0,
+            pending_seen: 0,
             search,
             title: cx.new(|cx| InputState::new(window, cx)),
-            description: cx.new(|cx| TextareaState::new(window, cx)),
-            owner: cx.new(|cx| {
-                SelectState::new(
-                    SearchableVec::new(Vec::<selectors::Choice>::new()),
-                    None,
-                    window,
-                    cx,
-                )
-                .searchable(true)
-            }),
+            description,
             workspace,
-            settings_workspace,
-            settings_owner: cx.new(|cx| {
-                SelectState::new(
-                    SearchableVec::new(Vec::<selectors::Choice>::new()),
-                    None,
-                    window,
-                    cx,
-                )
-                .searchable(true)
-            }),
+            owner: choice_state(window, cx),
+            prefix: choice_state(window, cx),
             due,
-            poll: cx.new(|cx| InputState::new(window, cx)),
+            settings_workspace,
+            settings_owner: choice_state(window, cx),
+            prefix_workspace,
+            prefix_options: cx.new(|cx| TextareaState::new(window, cx)),
+            manual_workspace_id: cx.new(|cx| InputState::new(window, cx)),
+            manual_workspace_name: cx.new(|cx| InputState::new(window, cx)),
+            poll,
             lark_path: cx.new(|cx| InputState::new(window, cx)),
             tapd_path: cx.new(|cx| InputState::new(window, cx)),
             endpoint: cx.new(|cx| InputState::new(window, cx)),
@@ -604,7 +835,13 @@ impl Workspace {
             tapd_token: cx.new(|cx| InputState::new(window, cx).masked(true)),
             recover_id: cx.new(|cx| InputState::new(window, cx)),
             recover_kind: "story".into(),
-            pending_seen: 0,
+            attachments: Vec::new(),
+            images: HashMap::new(),
+            loading_images: BTreeSet::new(),
+            pending_pastes: BTreeSet::new(),
+            pending_files: 0,
+            pending_file_paths: BTreeSet::new(),
+            next_paste: 0,
         };
         this.sync_directory(window, cx);
         this
@@ -613,71 +850,107 @@ impl Workspace {
         text(self.model.read(cx).language(), zh, en)
     }
     fn send(&self, job: Job, cx: &mut Context<Self>) {
-        self.model.update(cx, |model, cx| model.send(job, cx));
+        self.model.update(cx, |m, cx| m.send(job, cx));
     }
     fn send_editor(&self, job: Job, cx: &mut Context<Self>) {
         self.model
             .update(cx, |m, cx| m.send_at(job, self.edit_profile.clone(), cx));
     }
+    fn preference(&self, p: Preference, cx: &mut Context<Self>) {
+        self.send(Job::SetPreference(p), cx);
+    }
+    fn form_error(&self, key: &'static str, message: String, cx: &mut Context<Self>) {
+        self.model.update(cx, |m, cx| {
+            m.errors.insert(key, message);
+            cx.notify();
+        });
+    }
+    fn inline_error(&self, key: &str, cx: &App) -> AnyElement {
+        div()
+            .when_some(self.model.read(cx).errors.get(key).cloned(), |d, e| {
+                d.mt_1().text_sm().text_color(cx.theme().danger).child(e)
+            })
+            .into_any_element()
+    }
     fn draft(&self, cx: &App) -> Draft {
         Draft {
             title: self.title.read(cx).value().to_string(),
+            title_prefix: selected(&self.prefix, cx),
+            attachments: self.attachments.clone(),
             description: self.description.read(cx).value().to_string(),
             workspace_id: selected(&self.workspace, cx),
             owner: selected(&self.owner, cx),
             due: match self.due.read(cx).date() {
-                Date::Single(date) => date.map(|d| d.format("%Y-%m-%d").to_string()),
+                Date::Single(d) => d.map(|d| d.format("%Y-%m-%d").to_string()),
                 _ => None,
             },
         }
     }
     fn select(&mut self, record: SyncRecord, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.read(cx).busy {
+        if self.model.read(cx).busy || !self.pending_pastes.is_empty() || self.pending_files > 0 {
             return;
         }
+        self.source_open = false;
+        self.editor_session = editor_session();
+        self.remote_target = None;
+        self.attachments.clear();
+        self.images.clear();
+        self.loading_images.clear();
         set(&self.title, String::new(), window, cx);
-        self.fill_projects(false, "", window, cx);
-        self.fill_members(false, "", window, cx);
-        self.due
-            .update(cx, |s, cx| s.set_date(Date::Single(None), window, cx));
-        self.description
-            .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        this_clear_description(&self.description, window, cx);
         self.selected = Some(record.source.guid.clone());
         self.edit_source = None;
         self.edit_profile = self.model.read(cx).profile.clone();
-        self.model.update(cx, |m, cx| {
-            m.preview = None;
-            cx.notify();
-        });
-        self.send(Job::OpenDraft(record.source.guid, false), cx);
+        self.send(
+            Job::OpenDraft(record.source.guid, false, self.editor_session),
+            cx,
+        );
+        self.send(Job::LoadProjects, cx);
+        if !selected(&self.workspace, cx).is_empty() {
+            self.send(Job::LoadMembers(selected(&self.workspace, cx)), cx);
+        }
         cx.notify();
+    }
+    fn reload_source(&mut self, guid: String, cx: &mut Context<Self>) {
+        self.editor_session = editor_session();
+        self.edit_source = None;
+        self.attachments.clear();
+        self.images.clear();
+        self.loading_images.clear();
+        self.pending_pastes.clear();
+        self.pending_files = 0;
+        self.pending_file_paths.clear();
+        self.remote_target = None;
+        self.send(Job::OpenDraft(guid, true, self.editor_session), cx);
     }
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.filter = Filter::Settings;
-        if let Some(snapshot) = &self.model.read(cx).snapshot {
-            let s = snapshot.settings.clone();
+        if let Some(s) = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .map(|s| s.settings.clone())
+        {
             self.fill_projects(true, &s.workspace_id, window, cx);
             self.fill_members(true, &s.owner, window, cx);
-            for (field, value) in [
+            self.fill_prefix_workspace(&s.workspace_id, window, cx);
+            self.load_prefix_form(window, cx);
+            for (input, value) in [
                 (&self.poll, s.poll_minutes.to_string()),
                 (&self.lark_path, s.lark_path),
                 (&self.tapd_path, s.tapd_path),
                 (&self.endpoint, s.tapd_endpoint),
             ] {
-                set(field, value, window, cx);
+                set(input, value, window, cx);
             }
         }
+        self.send(Job::LoadProjects, cx);
+        let id = selected(&self.settings_workspace, cx);
+        if !id.is_empty() {
+            self.send(Job::LoadMembers(id), cx);
+        }
         cx.notify();
-    }
-    fn settings(&self, cx: &App) -> Option<Settings> {
-        let mut s = self.model.read(cx).snapshot.as_ref()?.settings.clone();
-        s.workspace_id = selected(&self.settings_workspace, cx);
-        s.owner = selected(&self.settings_owner, cx);
-        s.poll_minutes = self.poll.read(cx).value().parse().unwrap_or(0);
-        s.lark_path = self.lark_path.read(cx).value().trim().into();
-        s.tapd_path = self.tapd_path.read(cx).value().trim().into();
-        s.tapd_endpoint = self.endpoint.read(cx).value().trim().into();
-        Some(s)
     }
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
@@ -755,6 +1028,7 @@ impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let busy = model.busy;
+        let checking = model.activities.contains("tasks");
         let notice = model.notice.clone();
         let error = model.error;
         let is_mock = model.mode == Mode::Mock;
@@ -797,6 +1071,23 @@ impl Render for Workspace {
                                         self.tr(cx, "最近检查", "Last check")
                                     )),
                             )
+                            .child(
+                                div()
+                                    .id("check-status")
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().size(px(7.)).rounded_full().bg(if checking {
+                                        cx.theme().primary
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    }))
+                                    .child(if checking {
+                                        self.tr(cx, "正在检查", "Checking")
+                                    } else {
+                                        self.tr(cx, "就绪", "Ready")
+                                    }),
+                            )
                             .when(is_mock, |d| {
                                 d.child(
                                     Button::new("demo-change")
@@ -814,13 +1105,12 @@ impl Render for Workspace {
                             })
                             .child(
                                 Button::new("refresh")
-                                    .label(if busy {
-                                        self.tr(cx, "处理中…", "Working…")
+                                    .label(if checking {
+                                        self.tr(cx, "检查中…", "Checking…")
                                     } else {
                                         self.tr(cx, "立即检查", "Check now")
                                     })
                                     .primary()
-                                    .disabled(busy)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.send(Job::Refresh, cx)),
                                     ),
@@ -886,6 +1176,16 @@ fn status_text(language: &str, status: SyncStatus) -> &'static str {
 }
 fn message_text<'a>(language: &str, key: &'a str) -> &'a str {
     match key {
+        "cached" => text(
+            language,
+            "保留当前内容，正在后台读取",
+            "Keeping current content while refreshing in the background",
+        ),
+        "target_accepted" => text(
+            language,
+            "已接受远端版本，可以继续编辑和更新",
+            "Remote version accepted; continue editing and update when ready",
+        ),
         "projects_loaded" => text(
             language,
             "项目列表已刷新并缓存",
@@ -922,11 +1222,6 @@ fn message_text<'a>(language: &str, key: &'a str) -> &'a str {
             "Connection diagnostics finished; see each CLI result",
         ),
         "editor_ready" => text(language, "已读取草稿", "Draft loaded"),
-        "mode_changed" => text(
-            language,
-            "模式已切换，配置与缓存已隔离加载",
-            "Mode changed. Isolated settings and cache loaded.",
-        ),
         "credentials_cleared" => text(
             language,
             "已清除应用保存的凭证，CLI 外部登录态未修改",
@@ -940,11 +1235,6 @@ fn message_text<'a>(language: &str, key: &'a str) -> &'a str {
             language,
             "凭证已加密保存，请检查连接后刷新任务",
             "Credentials saved securely. Check connection, then refresh tasks.",
-        ),
-        "preview_ready" => text(
-            language,
-            "预览已就绪，尚未写入 TAPD",
-            "Preview ready. Nothing written to TAPD yet.",
         ),
         "imported" => text(
             language,
@@ -973,3 +1263,18 @@ fn open_safe_url(raw: &str, cx: &mut App) {
 
 #[cfg(test)]
 mod tests;
+
+fn choice_state(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<ChoiceState> {
+    cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(Vec::<selectors::Choice>::new()),
+            None,
+            window,
+            cx,
+        )
+        .searchable(true)
+    })
+}
+fn this_clear_description(input: &Entity<TextareaState>, window: &mut Window, cx: &mut App) {
+    input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+}

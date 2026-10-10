@@ -78,7 +78,7 @@ impl Workspace {
             value,
             format!(
                 "{} ({value})",
-                self.tr(cx, "未缓存项目", "Uncached project")
+                self.tr(cx, "未缓存项目空间", "Uncached workspace")
             ),
             window,
             cx,
@@ -140,7 +140,21 @@ impl Workspace {
             .snapshot
             .as_ref()
             .map(|s| s.directory.clone());
-        if self.last_directory == directory {
+        let same = self
+            .last_directory
+            .as_ref()
+            .zip(directory.as_ref())
+            .is_some_and(|(a, b)| {
+                a.workspaces == b.workspaces
+                    && a.members.len() == b.members.len()
+                    && a.members.iter().all(|(id, c)| {
+                        b.members
+                            .get(id)
+                            .is_some_and(|other| other.items == c.items)
+                    })
+            });
+        if same {
+            self.last_directory = directory;
             return;
         }
         self.last_directory = directory;
@@ -164,6 +178,8 @@ impl Workspace {
             self.fill_projects(settings, &project, window, cx);
             self.fill_members(settings, &owner, window, cx);
         }
+        let id = selected(&self.prefix_workspace, cx);
+        self.fill_prefix_workspace(&id, window, cx);
     }
     pub(super) fn project_changed(
         &mut self,
@@ -180,16 +196,88 @@ impl Workspace {
             },
             cx,
         );
-        if !id.is_empty()
-            && self
-                .model
-                .read(cx)
-                .snapshot
-                .as_ref()
-                .is_some_and(|s| !s.directory.members.contains_key(&id))
-        {
+        if !settings {
+            self.fill_prefixes("", window, cx);
+        }
+        if !id.is_empty() {
             self.send(Job::LoadMembers(id), cx);
         }
+        cx.notify();
+    }
+}
+
+impl Workspace {
+    pub(super) fn fill_prefixes(&self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = selected(&self.workspace, cx);
+        let values = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.settings.workspace_prefixes.get(&workspace))
+            .cloned()
+            .unwrap_or_default();
+        replace(
+            &self.prefix,
+            values
+                .into_iter()
+                .map(|id| Choice {
+                    label: format!("【{id}】"),
+                    id,
+                })
+                .collect(),
+            value,
+            format!("【{value}】"),
+            window,
+            cx,
+        );
+    }
+    pub(super) fn fill_prefix_workspace(
+        &self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let options = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                s.directory
+                    .workspaces
+                    .iter()
+                    .map(|w| Choice {
+                        id: w.id.clone(),
+                        label: w.name.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        replace(
+            &self.prefix_workspace,
+            options,
+            value,
+            format!(
+                "{} ({value})",
+                self.tr(cx, "未缓存项目空间", "Uncached workspace")
+            ),
+            window,
+            cx,
+        );
+    }
+    pub(super) fn load_prefix_form(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = selected(&self.prefix_workspace, cx);
+        let text = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.settings.workspace_prefixes.get(&workspace))
+            .map(|v| v.join("\n"))
+            .unwrap_or_default();
+        self.prefix_options
+            .update(cx, |s, cx| s.set_value(text, window, cx));
         cx.notify();
     }
 }

@@ -373,12 +373,17 @@ fn status_uses_every_source_field_and_uncertainty_takes_priority() -> Result<()>
     let source = MockGateway::default().fetch_tasks()?.remove(0);
     let draft = Draft {
         title: source.title.clone(),
+        title_prefix: String::new(),
+        attachments: vec![],
         description: source.description.clone(),
         workspace_id: "demo".into(),
         owner: String::new(),
         due: source.due.clone(),
     };
     let mut record = SyncRecord {
+        media_body_pending: false,
+        title_prefix: String::new(),
+        last_draft: None,
         in_scope: true,
         source: source.clone(),
         baseline: Some(source.clone()),
@@ -808,5 +813,487 @@ async fn owner_removed_after_preview_is_blocked_before_write_journal() -> Result
     );
     assert!(!engine.snapshot().records[0].uncertain);
     assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+// 前缀按项目校验；非法输入必须在写入日志之前失败，旧格式保持可读。
+#[tokio::test]
+async fn prefix_configuration_is_atomic_and_commit_preserves_selection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("prefix.sqlite");
+    let gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let mut settings = serde_json::to_value(engine.snapshot().settings.clone())?;
+    settings["workspace_prefixes"] = serde_json::json!({"demo":["需求"],"demo-2":["其他"]});
+    engine
+        .save_settings(serde_json::from_value(settings.clone())?)
+        .await?;
+    for labels in [
+        serde_json::json!([" "]),
+        serde_json::json!(["需求", "需求"]),
+        serde_json::json!(["【需求】"]),
+        serde_json::json!(["a\nb"]),
+        serde_json::json!(["a".repeat(65)]),
+        serde_json::json!([" padded"]),
+    ] {
+        let mut invalid = settings.clone();
+        invalid["workspace_prefixes"]["demo"] = labels;
+        assert!(
+            engine
+                .save_settings(serde_json::from_value(invalid)?)
+                .await
+                .is_err()
+        );
+    }
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut value = serde_json::to_value(engine.prepare(&guid)?)?;
+    value["title_prefix"] = "其他".into();
+    let invalid: Draft = serde_json::from_value(value.clone())?;
+    engine.save_draft(&guid, &invalid).await?;
+    let before = engine.snapshot().clone();
+    assert!(
+        engine
+            .commit(&gateway, &guid, &invalid, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.snapshot(), &before);
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    value["title_prefix"] = "需求".into();
+    value["title"] = "【需求】【需求】人工标题".into();
+    let draft: Draft = serde_json::from_value(value)?;
+    engine.save_draft(&guid, &draft).await?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    assert_eq!(
+        engine.snapshot().records[0].target.as_ref().unwrap().title,
+        "【需求】人工标题"
+    );
+    gateway.inner.change_demo_task()?;
+    engine.refresh(&gateway).await?;
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    let draft = serde_json::to_value(engine.prepare(&guid)?)?;
+    assert_eq!(draft["title_prefix"], "需求");
+    assert_eq!(draft["title"], "设计同步流程 · 已更新");
+    assert_eq!(
+        serde_json::to_value(&engine.snapshot().settings)?["workspace_prefixes"],
+        settings["workspace_prefixes"]
+    );
+    Ok(())
+}
+
+// 重启后读到旧的重复后缀，也只显示一个更新标记；描述继续变化。
+#[test]
+fn mock_updates_normalize_existing_suffixes() -> Result<()> {
+    let gateway = MockGateway::default();
+    gateway.store.lock().unwrap().tasks[0].title = "任务 · 已更新 · 已更新".into();
+    gateway.change_demo_task()?;
+    let first = gateway.fetch_tasks()?.remove(0);
+    gateway.change_demo_task()?;
+    let second = gateway.fetch_tasks()?.remove(0);
+    assert_eq!(second.title, "任务 · 已更新");
+    assert_ne!(first.description, second.description);
+    Ok(())
+}
+
+#[test]
+fn old_drafts_default_prefix_and_attachments() -> Result<()> {
+    let draft: Draft = serde_json::from_value(
+        serde_json::json!({"title":"Old","description":"","workspace_id":"demo","owner":"","due":null}),
+    )?;
+    let value = serde_json::to_value(draft)?;
+    assert_eq!(value["title_prefix"], "");
+    assert_eq!(value["attachments"], serde_json::json!([]));
+    Ok(())
+}
+
+// 已成功导入的编辑与附件不因重启丢失，显式保存允许更新同一目标。
+#[tokio::test]
+async fn successful_draft_survives_restart_and_explicit_update() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("edited.sqlite");
+    let gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut draft = engine.prepare(&guid)?;
+    draft.title = "人工标题".into();
+    engine.save_draft(&guid, &draft).await?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    let target = engine.snapshot().records[0].target.clone();
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    assert_eq!(engine.prepare(&guid)?, draft);
+    draft.title = "第二次人工标题".into();
+    engine.save_draft(&guid, &draft).await?;
+    engine
+        .commit(&gateway, &guid, &draft, target.clone())
+        .await?;
+    assert_eq!(
+        engine.snapshot().records[0].target.as_ref().unwrap().id,
+        target.unwrap().id
+    );
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+// 每个上传步骤先写持久化日志；回执不能替换附件身份或改写本地内容。
+#[tokio::test]
+async fn attachment_upload_progress_is_durable_and_bound_to_target() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("attachments.sqlite");
+    let gateway = MockGateway::default();
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut draft = engine.prepare(&guid)?;
+    let mut attachment: DraftAttachment = serde_json::from_value(
+        serde_json::json!({"id":"abc", "name":"test.txt", "path":"/cache/abc", "size":3, "is_image":false}),
+    )?;
+    draft.attachments.push(attachment.clone());
+    engine.save_draft(&guid, &draft).await?;
+    assert!(
+        engine
+            .attachment_progress(&guid, &attachment)
+            .await
+            .is_err()
+    );
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    attachment.uncertain = true;
+    engine.attachment_progress(&guid, &attachment).await?;
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    assert!(engine.prepare(&guid)?.attachments[0].uncertain);
+    let mut forged = attachment.clone();
+    forged.path = "/outside".into();
+    assert!(engine.attachment_progress(&guid, &forged).await.is_err());
+    attachment.remote_id = Some("remote-1".into());
+    attachment.remote_url = Some("https://www.tapd.cn/attachment/remote-1".into());
+    attachment.uncertain = false;
+    engine.attachment_progress(&guid, &attachment).await?;
+    gateway.change_demo_task()?;
+    engine.refresh(&gateway).await?;
+    assert_eq!(engine.prepare(&guid)?.attachments, vec![attachment]);
+    Ok(())
+}
+
+// 缓存只依赖内容；同名文件不覆盖，扩展名不能伪装图片，读取时重新验哈希。
+#[test]
+fn media_cache_is_stable_bounded_and_verified() -> Result<()> {
+    use crate::media::*;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("cache");
+    let source = dir.path().join("notes.txt");
+    std::fs::write(&source, b"first")?;
+    let first = copy_attachment(&root, &source)?;
+    assert_eq!(first, copy_attachment(&root, &source)?);
+    assert!(!first.is_image);
+    assert_eq!(read_attachment(&root, &first)?, b"first");
+    std::fs::write(&source, b"second")?;
+    let second = copy_attachment(&root, &source)?;
+    assert_ne!(first.id, second.id);
+    assert_eq!(read_attachment(&root, &first)?, b"first");
+    let png = b"\x89PNG\r\n\x1a\nimage bytes";
+    let image = save_pasted_image(&root, png, "png")?;
+    assert!(image.is_image);
+    assert_eq!(image, save_pasted_image(&root, png, "png")?);
+    assert!(save_pasted_image(&root, b"not an image", "png").is_err());
+    assert!(save_pasted_image(&root, png, "jpeg").is_err());
+    assert!(save_pasted_image(&root, png, "../png").is_err());
+    assert!(save_pasted_image(&root, &vec![0; 20 * 1024 * 1024 + 1], "png").is_err());
+    std::fs::write(&source, vec![0; 20 * 1024 * 1024 + 1])?;
+    assert!(copy_attachment(&root, &source).is_err());
+    let mut forged = first.clone();
+    forged.path = source.to_string_lossy().into_owned();
+    assert!(read_attachment(&root, &forged).is_err());
+    forged = first.clone();
+    forged.id = "../notes".into();
+    assert!(verify_attachment(&root, &forged).is_err());
+    std::fs::write(&first.path, b"wrong")?;
+    assert!(verify_attachment(&root, &first).is_err());
+    std::fs::write(&source, b"first")?;
+    assert!(copy_attachment(&root, &source).is_err());
+    assert_eq!(std::fs::read(&first.path)?, b"wrong");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn media_rejects_symlinks_and_hardlinked_cache_entries() -> Result<()> {
+    use crate::media::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("cache");
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, b"owned")?;
+    let link = dir.path().join("link.txt");
+    symlink(&source, &link)?;
+    assert!(copy_attachment(&root, &link).is_err());
+    let attachment = copy_attachment(&root, &source)?;
+    assert_eq!(
+        std::fs::metadata(&attachment.path)?.permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::remove_file(&attachment.path)?;
+    symlink(&source, &attachment.path)?;
+    assert!(verify_attachment(&root, &attachment).is_err());
+    assert!(copy_attachment(&root, &source).is_err());
+    std::fs::remove_file(&attachment.path)?;
+    std::fs::hard_link(&source, &attachment.path)?;
+    assert!(verify_attachment(&root, &attachment).is_err());
+    let fake_root = dir.path().join("fake-cache");
+    symlink(&root, &fake_root)?;
+    assert!(copy_attachment(&fake_root, &source).is_err());
+    let other = dir.path().join("other-cache");
+    std::fs::create_dir(&other)?;
+    symlink(&root, other.join("media"))?;
+    assert!(copy_attachment(&other, &source).is_err());
+    Ok(())
+}
+
+// 固定包装不改写原始编辑值，也不会删除不相干的标题前缀。
+#[test]
+fn rendered_title_preserves_unrelated_text_and_empty_selection() -> Result<()> {
+    let mut draft: Draft = serde_json::from_value(
+        serde_json::json!({"title":"【其他】原文", "title_prefix":"需求", "description":"", "workspace_id":"demo", "owner":"", "due":null}),
+    )?;
+    assert_eq!(draft.rendered_title(), "【需求】【其他】原文");
+    assert_eq!(draft.title, "【其他】原文");
+    draft.title_prefix.clear();
+    assert_eq!(draft.rendered_title(), "【其他】原文");
+    Ok(())
+}
+
+// 所有支持的图片都依赖签名；普通文件的伪图片扩展名不能启用图片展示。
+#[test]
+fn media_image_detection_uses_content_not_names() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("cache");
+    for (bytes, extension) in [
+        (b"\xff\xd8\xffpayload".as_slice(), "jpeg"),
+        (b"GIF89apayload".as_slice(), "gif"),
+        (b"RIFF1234WEBPpayload".as_slice(), "webp"),
+    ] {
+        let attachment = save_pasted_image(&root, bytes, extension)?;
+        assert!(attachment.is_image);
+        assert_eq!(read_attachment(&root, &attachment)?, bytes);
+    }
+    let source = dir.path().join("fake.png");
+    std::fs::write(&source, "this is not a PNG")?;
+    assert!(!copy_attachment(&root, &source)?.is_image);
+    Ok(())
+}
+
+// 附件上限与去重是提交边界规则，不能只依赖界面限制。
+#[tokio::test]
+async fn invalid_attachment_lists_never_start_write_journal() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&dir.path().join("count.sqlite"), &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let attachment: DraftAttachment = serde_json::from_value(
+        serde_json::json!({"id":"a", "name":"test.txt", "path":"/cache/a", "size":3, "is_image":false}),
+    )?;
+    for count in [2, 11] {
+        let mut draft = engine.prepare(&guid)?;
+        draft.attachments = (0..count)
+            .map(|index| {
+                let mut item = attachment.clone();
+                if count == 11 {
+                    item.id = index.to_string();
+                }
+                item
+            })
+            .collect();
+        engine.save_draft(&guid, &draft).await?;
+        let before = engine.snapshot().clone();
+        assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
+        assert_eq!(engine.snapshot(), &before);
+        assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    }
+    Ok(())
+}
+
+// 过期编辑器不能清空已经落盘的上传日志或回执；本地身份更改也不能借用回执。
+#[tokio::test]
+async fn stale_editor_preserves_attachment_progress() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("receipts.sqlite");
+    let gateway = MockGateway::default();
+    let mut engine = configured(&path, &gateway).await?;
+    let source = engine.snapshot().records[0].source.clone();
+    let mut draft = engine.prepare(&source.guid)?;
+    let mut attachment: DraftAttachment = serde_json::from_value(
+        serde_json::json!({"id":"a", "name":"test.txt", "path":"/cache/a", "size":3, "is_image":false}),
+    )?;
+    draft.attachments.push(attachment.clone());
+    engine.save_draft(&source.guid, &draft).await?;
+    engine.commit(&gateway, &source.guid, &draft, None).await?;
+    attachment.uncertain = true;
+    engine
+        .attachment_progress(&source.guid, &attachment)
+        .await?;
+    engine
+        .save_draft_for_source(&source.guid, &draft, &source)
+        .await?;
+    assert!(engine.prepare(&source.guid)?.attachments[0].uncertain);
+    attachment.uncertain = false;
+    attachment.remote_id = Some("remote-1".into());
+    engine
+        .attachment_progress(&source.guid, &attachment)
+        .await?;
+    engine
+        .save_draft_for_source(&source.guid, &draft, &source)
+        .await?;
+    assert_eq!(
+        engine.prepare(&source.guid)?.attachments[0]
+            .remote_id
+            .as_deref(),
+        Some("remote-1")
+    );
+    draft.attachments[0].path = "/different".into();
+    assert!(
+        engine
+            .save_draft_for_source(&source.guid, &draft, &source)
+            .await
+            .is_err()
+    );
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    assert_eq!(
+        engine.prepare(&source.guid)?.attachments[0]
+            .remote_id
+            .as_deref(),
+        Some("remote-1")
+    );
+    Ok(())
+}
+
+// 待上传和结果不确定都需要显式显示；有效 ID 或 URL 任一回执即可表示已上传。
+#[tokio::test]
+async fn pending_attachments_are_visible_after_target_sync() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gateway = MockGateway::default();
+    let mut engine = configured(&dir.path().join("pending.sqlite"), &gateway).await?;
+    assert!(!engine.snapshot().records[0].has_pending_attachments());
+    let source = engine.snapshot().records[0].source.clone();
+    let mut draft = engine.prepare(&source.guid)?;
+    let mut attachment: DraftAttachment = serde_json::from_value(
+        serde_json::json!({"id":"a", "name":"test.txt", "path":"/cache/a", "size":3, "is_image":false}),
+    )?;
+    draft.attachments.push(attachment.clone());
+    engine.save_draft(&source.guid, &draft).await?;
+    engine.commit(&gateway, &source.guid, &draft, None).await?;
+    assert_eq!(engine.snapshot().records[0].status(), SyncStatus::Synced);
+    assert!(engine.snapshot().records[0].has_pending_attachments());
+    attachment.remote_id = Some(" ".into());
+    engine
+        .attachment_progress(&source.guid, &attachment)
+        .await?;
+    assert!(engine.snapshot().records[0].has_pending_attachments());
+    attachment.remote_id = Some("remote".into());
+    engine
+        .attachment_progress(&source.guid, &attachment)
+        .await?;
+    assert!(!engine.snapshot().records[0].has_pending_attachments());
+    attachment.uncertain = true;
+    engine
+        .attachment_progress(&source.guid, &attachment)
+        .await?;
+    assert!(engine.snapshot().records[0].has_pending_attachments());
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_body_pending_is_not_hidden_by_successful_upload_receipts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gateway = MockGateway::default();
+    let mut engine = configured(&dir.path().join("body.sqlite"), &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let draft = engine.prepare(&guid)?;
+    engine.save_draft(&guid, &draft).await?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    let mut value = serde_json::to_value(&engine.snapshot().records[0])?;
+    value["media_body_pending"] = true.into();
+    let record: SyncRecord = serde_json::from_value(value)?;
+    assert!(record.has_pending_attachments());
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_finalization_failure_before_write_survives_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("finalize.sqlite");
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let source = engine.snapshot().records[0].source.clone();
+    let mut draft = engine.prepare(&source.guid)?;
+    let mut attachment: DraftAttachment = serde_json::from_value(
+        serde_json::json!({"id":"image","name":"picture.png","path":"/cache/picture.png","size":100,"is_image":true}),
+    )?;
+    draft.attachments.push(attachment.clone());
+    engine.save_draft(&source.guid, &draft).await?;
+    engine.commit(&gateway, &source.guid, &draft, None).await?;
+    engine.set_media_body_pending(&source.guid, true).await?;
+    attachment.remote_url = Some("/tfl/pictures/image.png".into());
+    engine
+        .attachment_progress(&source.guid, &attachment)
+        .await?;
+    draft.attachments[0] = attachment;
+    engine.save_draft(&source.guid, &draft).await?;
+    let target = engine.snapshot().records[0].target.clone();
+    let mut changed = source.clone();
+    changed.title.push('!');
+    gateway.source_override = Some(changed);
+    assert!(
+        engine
+            .commit(&gateway, &source.guid, &draft, target)
+            .await
+            .is_err()
+    );
+    assert!(!engine.snapshot().records[0].uncertain);
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    let record = &engine.snapshot().records[0];
+    assert!(record.media_body_pending);
+    assert!(record.has_pending_attachments());
+    assert!(
+        record.last_draft.as_ref().unwrap().attachments[0]
+            .remote_url
+            .is_some()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepted_remote_target_retains_local_draft_and_mapping() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&dir.path().join("accept.sqlite"), &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut draft = engine.prepare(&guid)?;
+    engine.save_draft(&guid, &draft).await?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    let old = engine.snapshot().records[0].target.clone();
+    draft.title = "本地编辑".into();
+    engine.save_draft(&guid, &draft).await?;
+    gateway.remote_title = Some("远端编辑".into());
+    assert!(engine.commit(&gateway, &guid, &draft, old).await.is_err());
+    let fresh = engine.preview_target(&gateway, &guid)?.unwrap();
+    let id = fresh.id.clone();
+    engine.accept_target(&guid, &fresh).await?;
+    assert_eq!(engine.prepare(&guid)?.title, "本地编辑");
+    engine.commit(&gateway, &guid, &draft, Some(fresh)).await?;
+    assert_eq!(engine.snapshot().records[0].target.as_ref().unwrap().id, id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_mock_titles_do_not_keep_legacy_repeated_update_markers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gateway = MockGateway::default();
+    let engine = configured(&dir.path().join("legacy-marker.sqlite"), &gateway).await?;
+    let mut snapshot = engine.snapshot().clone();
+    snapshot.records[0].source.title = "任务 · 已更新 · 已更新 · 已更新".into();
+    let restored = MockGateway::from_snapshot(&snapshot);
+    assert_eq!(restored.fetch_tasks()?[0].title, "任务 · 已更新");
     Ok(())
 }

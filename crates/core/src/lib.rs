@@ -1,3 +1,6 @@
+pub mod media;
+pub use media::{copy_attachment, read_attachment, save_pasted_image, verify_attachment};
+
 use anyhow::{Result, anyhow, ensure};
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -77,10 +80,38 @@ impl SourceTask {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Draft {
     pub title: String,
+    #[serde(default)]
+    pub title_prefix: String,
+    #[serde(default)]
+    pub attachments: Vec<DraftAttachment>,
     pub description: String,
     pub workspace_id: String,
     pub owner: String,
     pub due: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DraftAttachment {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_image: bool,
+    #[serde(default)]
+    pub remote_id: Option<String>,
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub uncertain: bool,
+}
+impl Draft {
+    // 只折叠所选前缀，不吞掉标题中的其他用户文本。
+    pub fn rendered_title(&self) -> String {
+        if self.title_prefix.is_empty() {
+            return self.title.clone();
+        }
+        let prefix = format!("【{}】", self.title_prefix);
+        format!("{prefix}{}", self.title.trim_start_matches(prefix.as_str()))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TargetTask {
@@ -94,6 +125,13 @@ pub struct TargetTask {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncRecord {
+    /// 图片已上传不代表正文已回填；独立日志防止失败或重启后误报完成。
+    #[serde(default)]
+    pub media_body_pending: bool,
+    #[serde(default)]
+    pub title_prefix: String,
+    #[serde(default)]
+    pub last_draft: Option<Draft>,
     #[serde(default)]
     pub in_scope: bool,
     pub source: SourceTask,
@@ -112,6 +150,20 @@ pub enum SyncStatus {
     Uncertain,
 }
 impl SyncRecord {
+    /// 任务正文成功不代表附件成功；UI 单独显示待上传或需人工核对状态。
+    pub fn has_pending_attachments(&self) -> bool {
+        self.media_body_pending
+            || self.last_draft.as_ref().is_some_and(|draft| {
+                draft.attachments.iter().any(|attachment| {
+                    attachment.uncertain
+                        || ![&attachment.remote_id, &attachment.remote_url]
+                            .iter()
+                            .any(|value| {
+                                value.as_ref().is_some_and(|value| !value.trim().is_empty())
+                            })
+                })
+            })
+    }
     pub fn status(&self) -> SyncStatus {
         if self.uncertain {
             SyncStatus::Uncertain
@@ -126,6 +178,8 @@ impl SyncRecord {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
+    #[serde(default)]
+    pub workspace_prefixes: BTreeMap<String, Vec<String>>,
     pub language: String,
     pub theme: String,
     pub poll_enabled: bool,
@@ -142,6 +196,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            workspace_prefixes: BTreeMap::new(),
             language: "zh-CN".into(),
             theme: "system".into(),
             poll_enabled: false,
@@ -345,7 +400,10 @@ impl Engine {
                 record.in_scope = true;
             } else {
                 state.snapshot.records.push(SyncRecord {
+                    media_body_pending: false,
                     in_scope: true,
+                    title_prefix: String::new(),
+                    last_draft: None,
                     source,
                     baseline: None,
                     target: None,
@@ -451,6 +509,18 @@ impl Engine {
             !settings.poll_enabled || !settings.workspace_id.trim().is_empty(),
             "Configure a workspace before enabling polling"
         );
+        // 所有项目一起校验，失败不改变内存或磁盘中的旧配置。
+        for (workspace, prefixes) in &settings.workspace_prefixes {
+            ensure!(
+                !workspace.trim().is_empty() && workspace.trim() == workspace,
+                "Invalid prefix workspace"
+            );
+            let mut seen = HashSet::new();
+            for prefix in prefixes {
+                validate_prefix(prefix)?;
+                ensure!(seen.insert(prefix), "Duplicate title prefix");
+            }
+        }
         let mut state = self.state.clone();
         state.snapshot.settings = settings;
         self.persist(state).await
@@ -483,7 +553,29 @@ impl Engine {
             "Uncertain write: bind the existing remote task before editing"
         );
         let mut state = self.state.clone();
-        state.snapshot.records[index].draft = Some(draft.clone());
+        let mut draft = draft.clone();
+        // 旧编辑器只能改正文/选择，不能回滚已落盘的上传日志和回执。
+        if let Some(last) = &state.snapshot.records[index].last_draft {
+            for attachment in &mut draft.attachments {
+                if let Some(saved) = last
+                    .attachments
+                    .iter()
+                    .find(|saved| saved.id == attachment.id)
+                {
+                    ensure!(
+                        saved.path == attachment.path
+                            && saved.name == attachment.name
+                            && saved.size == attachment.size
+                            && saved.is_image == attachment.is_image,
+                        "Attachment identity changed since the last submission"
+                    );
+                    attachment.remote_id = saved.remote_id.clone();
+                    attachment.remote_url = saved.remote_url.clone();
+                    attachment.uncertain = saved.uncertain;
+                }
+            }
+        }
+        state.snapshot.records[index].draft = Some(draft);
         state
             .draft_sources
             .insert(guid.into(), state.snapshot.records[index].source.clone());
@@ -512,8 +604,21 @@ impl Engine {
             record.draft.is_none() || self.state.draft_sources.get(guid) == Some(&record.source),
             "Saved draft is stale; discard it and reload the latest source, or explicitly review and save for the latest source"
         );
+        // 未改变的来源继续保留上次成功提交的人工作品；来源变化时重建正文。
+        if record.draft.is_none()
+            && record.baseline.as_ref() == Some(&record.source)
+            && let Some(last) = &record.last_draft
+        {
+            return Ok(last.clone());
+        }
         Ok(record.draft.clone().unwrap_or_else(|| Draft {
             title: record.source.title.clone(),
+            title_prefix: record.title_prefix.clone(),
+            attachments: record
+                .last_draft
+                .as_ref()
+                .map(|d| d.attachments.clone())
+                .unwrap_or_default(),
             description: record.source.description.clone(),
             workspace_id: record
                 .target_workspace
@@ -525,6 +630,81 @@ impl Engine {
             ),
             due: record.source.due.clone(),
         }))
+    }
+    pub async fn set_media_body_pending(&mut self, guid: &str, pending: bool) -> Result<()> {
+        let index = self.index(guid)?;
+        let mut state = self.state.clone();
+        ensure!(
+            state.snapshot.records[index].target.is_some(),
+            "Persist target before recording image finalization"
+        );
+        state.snapshot.records[index].media_body_pending = pending;
+        self.persist(state).await
+    }
+    /// 调用方已展示并再次核对远端版本；此处只接受同一目标，绝不执行覆盖写入。
+    pub async fn accept_target(&mut self, guid: &str, target: &TargetTask) -> Result<()> {
+        let index = self.index(guid)?;
+        let record = &self.snapshot().records[index];
+        ensure!(
+            !record.uncertain,
+            "Recover uncertain write before accepting remote edits"
+        );
+        let old = record
+            .target
+            .as_ref()
+            .ok_or_else(|| anyhow!("No existing target"))?;
+        ensure!(
+            old.id == target.id && old.kind == target.kind,
+            "Cannot accept a different target identity"
+        );
+        validate_target(target)?;
+        let mut state = self.state.clone();
+        state.snapshot.records[index].target = Some(target.clone());
+        self.persist(state).await
+    }
+    /// 任务映射持久化后逐个记录附件上传状态；调用方必须先记不确定再发起上传。
+    pub async fn attachment_progress(
+        &mut self,
+        guid: &str,
+        attachment: &DraftAttachment,
+    ) -> Result<()> {
+        let index = self.index(guid)?;
+        let mut state = self.state.clone();
+        let record = &mut state.snapshot.records[index];
+        ensure!(
+            record.target.is_some() && !record.uncertain,
+            "Persist the target before uploading attachments"
+        );
+        let last = record
+            .last_draft
+            .as_mut()
+            .ok_or_else(|| anyhow!("Missing successful draft"))?;
+        let saved = last
+            .attachments
+            .iter_mut()
+            .find(|item| item.id == attachment.id)
+            .ok_or_else(|| anyhow!("Attachment is not part of the submitted draft"))?;
+        ensure!(
+            saved.name == attachment.name
+                && saved.path == attachment.path
+                && saved.size == attachment.size
+                && saved.is_image == attachment.is_image,
+            "Attachment identity changed during upload"
+        );
+        *saved = attachment.clone();
+        // 已打开的待提交草稿也同步回执，避免下次保存时无意重复上传。
+        if let Some(draft) = &mut record.draft {
+            for item in &mut draft.attachments {
+                if item.id == attachment.id {
+                    ensure!(
+                        item.path == attachment.path && item.size == attachment.size,
+                        "Draft attachment identity changed"
+                    );
+                    *item = attachment.clone();
+                }
+            }
+        }
+        self.persist(state).await
     }
     pub fn preview_target(&self, gateway: &impl Gateway, guid: &str) -> Result<Option<TargetTask>> {
         let record = &self.snapshot().records[self.index(guid)?];
@@ -559,11 +739,18 @@ impl Engine {
             !record.uncertain,
             "Uncertain write: do not retry; inspect TAPD and bind the existing remote task"
         );
-        ensure!(
-            record.status() != SyncStatus::Synced,
-            "Already imported; duplicate writes are blocked"
-        );
         validate_draft(draft)?;
+        // 不能跨项目复用选择；已删除的配置也不能经旧草稿绕过校验。
+        ensure!(
+            draft.title_prefix.is_empty()
+                || self
+                    .snapshot()
+                    .settings
+                    .workspace_prefixes
+                    .get(&draft.workspace_id)
+                    .is_some_and(|prefixes| prefixes.contains(&draft.title_prefix)),
+            "Select a configured title prefix for this project"
+        );
         gateway.validate_draft(draft)?;
         self.validate_destination(draft)?;
         ensure!(
@@ -592,10 +779,10 @@ impl Engine {
                     fresh.id == old.id && fresh.kind == old.kind,
                     "Target identity changed"
                 );
-                // 新预览可明确接受历史差异，但预览后发生的远端修改必须阻止。
+                // 只接受调用方明确核对的目标版本；不能静默覆盖此后出现的远端修改。
                 ensure!(
                     expected_target.as_ref() == Some(&fresh),
-                    "Target changed since preview; compare and confirm again"
+                    "TAPD changed since the accepted version; review its current contents before updating"
                 );
                 Some(fresh)
             }
@@ -639,6 +826,8 @@ impl Engine {
         let record = &mut state.snapshot.records[index];
         record.target = Some(target);
         record.target_workspace = Some(draft.workspace_id.clone());
+        record.title_prefix = draft.title_prefix.clone();
+        record.last_draft = Some(draft.clone());
         record.baseline = Some(record.source.clone());
         record.draft = None;
         record.uncertain = false;
@@ -670,7 +859,34 @@ fn validate_due(due: &Option<String>) -> Result<()> {
     }
     Ok(())
 }
+fn validate_prefix(prefix: &str) -> Result<()> {
+    ensure!(
+        !prefix.is_empty()
+            && prefix.trim() == prefix
+            && prefix.chars().count() <= 64
+            && !prefix
+                .chars()
+                .any(|c| c.is_control() || "【】[]".contains(c)),
+        "Title prefixes must be 1..64 trimmed characters without control characters or brackets"
+    );
+    Ok(())
+}
 fn validate_draft(draft: &Draft) -> Result<()> {
+    // 同一任务最多十个附件；重复内容 ID 会使上传日志和回执归属含糊，必须拒绝。
+    ensure!(
+        draft.attachments.len() <= 10,
+        "A draft may contain at most 10 attachments"
+    );
+    let mut attachment_ids = HashSet::new();
+    for attachment in &draft.attachments {
+        ensure!(
+            !attachment.id.is_empty() && attachment_ids.insert(&attachment.id),
+            "Attachment IDs must be nonempty and unique"
+        );
+    }
+    if !draft.title_prefix.is_empty() {
+        validate_prefix(&draft.title_prefix)?;
+    }
     ensure!(!draft.title.trim().is_empty(), "Title is required");
     ensure!(
         !draft.workspace_id.trim().is_empty(),
@@ -762,7 +978,13 @@ impl MockGateway {
         let tasks = snapshot
             .records
             .iter()
-            .map(|record| record.source.clone())
+            .map(|record| {
+                let mut source = record.source.clone();
+                if source.title.ends_with(" · 已更新") {
+                    source.title = Self::updated_title(&source.title);
+                }
+                source
+            })
             .collect();
         let targets = snapshot
             .records
@@ -782,6 +1004,9 @@ impl MockGateway {
             store: Arc::new(Mutex::new(MockStore { tasks, targets })),
         }
     }
+    fn updated_title(title: &str) -> String {
+        format!("{} · 已更新", title.trim_end_matches(" · 已更新"))
+    }
     // 演示按钮与端到端测试共用同一个真实状态变更，不引入测试专用控制开关。
     pub fn change_demo_task(&self) -> Result<()> {
         let mut store = self
@@ -792,7 +1017,8 @@ impl MockGateway {
             .tasks
             .first_mut()
             .ok_or_else(|| anyhow!("No demo tasks"))?;
-        task.title.push_str(" · 已更新");
+        // 折叠旧缓存累积的标记，描述仍递增以模拟新版本。
+        task.title = Self::updated_title(&task.title);
         task.description.push_str("\n新增验收要求。");
         Ok(())
     }
@@ -876,7 +1102,7 @@ fn mock_target(id: String, kind: String, draft: &Draft, source: &SourceTask) -> 
         ),
         id,
         kind,
-        title: draft.title.clone(),
+        title: draft.rendered_title(),
         description: format!("{}\n\n{}", draft.description, source_marker(&source.guid)),
         owner: draft.owner.clone(),
         due: draft.due.clone(),

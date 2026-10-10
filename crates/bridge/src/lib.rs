@@ -1,15 +1,19 @@
 mod credentials;
+mod description;
 pub mod installer;
+mod media;
 mod process;
 use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Local, TimeZone, Utc};
 pub use credentials::{
     Credentials, clear_credentials, credentials_namespace, load_credentials, save_credentials,
 };
+pub use description::render_description;
 use lark2tapd_core::{
     Draft, Gateway, Settings, SourceMetadata, SourcePerson, SourceTask, TapdMember, TapdWorkspace,
     TargetTask,
 };
+pub use media::{MAX_INLINE_IMAGE_BYTES, validate_attachment_for_upload};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -142,7 +146,8 @@ impl CliGateway {
         );
         ensure!(
             matches!(kind, "task" | "story")
-                || (kind == "user" && matches!(verb, "info" | "members" | "workspaces")),
+                || (kind == "user" && matches!(verb, "info" | "members" | "workspaces"))
+                || (kind == "attachment" && matches!(verb, "upload" | "upload-image" | "list")),
             "Invalid TAPD resource kind"
         );
         let mut args = vec![kind.into(), verb.into()];
@@ -344,15 +349,10 @@ impl CliGateway {
     ) -> Result<TargetTask> {
         self.validate_draft(draft)?;
         valid_source_id(&source.guid)?;
-        let mut description = escape_html(&draft.description).replace('\n', "<br>");
-        description.push_str(&format!("<p>[lark-task:{}]</p>", source.guid));
-        let source_url = safe_url(&source.url, true);
-        if !source_url.is_empty() {
-            description.push_str(&format!("<p>{}</p>", escape_html(&source_url)));
-        }
+        let description = render_description(draft, source)?;
         let mut params = vec![
             format!("workspaceid={}", draft.workspace_id),
-            format!("name={}", draft.title),
+            format!("name={}", draft.rendered_title()),
             format!("description={description}"),
             format!("owner={}", draft.owner),
             format!("due={}", draft.due.as_deref().unwrap_or("")),
@@ -378,8 +378,10 @@ impl CliGateway {
         let target = self.get_target(&draft.workspace_id, &id, result_kind)?;
         // 宁可保留待人工核对状态，也不把服务端忽略的更新（尤其清空日期）标记为成功。
         ensure!(
-            target.title == draft.title
-                && target.description == description
+            target.title == draft.rendered_title()
+                // 已安装 CLI 会给纯 HTML 加一层 <p>；仅容忍这一精确包装。
+                && (target.description == description
+                    || target.description == format!("<p>{description}</p>"))
                 && target.owner == draft.owner
                 && target.due == draft.due,
             "TAPD readback differs from requested fields; remote result is uncertain (including possible HTML normalization)"

@@ -69,7 +69,300 @@ fn draft() -> Draft {
         workspace_id: "42".into(),
         owner: "owner".into(),
         due: None,
+        title_prefix: String::new(),
+        attachments: Vec::new(),
     }
+}
+// 读回筛选不是忽略响应身份的许可；空、重复和跨项目结果都不能标成功。
+#[test]
+fn attachment_readback_rejects_missing_ambiguous_and_conflicting_rows() {
+    for rows in [
+        "[]",
+        "[{'Attachment':{'id':'77','type':'story','workspace_id':'42','entry_id':'8'}}]",
+        "[{'Attachment':{'id':'78','type':'story','workspace_id':'42','entry_id':'9'}}]",
+        "[{'Attachment':{'id':'77','type':'story','workspace_id':'43','entry_id':'9'}}]",
+        "[{'Attachment':{'id':'77','type':'task','workspace_id':'42','entry_id':'9'}}]",
+        "[{'Attachment':{'id':'77','type':'story','workspace_id':'42','entry_id':'9'}}]*2",
+    ] {
+        let (dir, g) = gateway(&format!(
+            r#"
+if a[1]=='upload':
+ with open(__file__+'.calls','a') as f: f.write('upload\n')
+ result={{'Attachment':{{'id':'77'}}}}
+else:
+ assert a[:2]==['attachment','list']
+ result={rows}
+print(json.dumps({{'status':1,'data':result}}))
+"#
+        ));
+        let file = dir.path().join("document.txt");
+        fs::write(&file, b"file content").unwrap();
+        let a = lark2tapd_core::copy_attachment(dir.path(), &file).unwrap();
+        assert!(
+            g.upload_draft_attachment(dir.path(), "42", &upload_target(), &a)
+                .is_err(),
+            "{rows}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("fake.calls")).unwrap(),
+            "upload\n"
+        );
+    }
+}
+// CLI 的 JS 数字可能丢精度；精确筛选的附件列表必须再次证明大 ID 归属。
+#[test]
+fn large_numeric_parent_receipt_requires_filtered_readback() {
+    let (dir, g) = gateway(
+        r#"
+p=dict(x.split('=',1) for x in a[2:])
+if a[1]=='upload':
+ assert p['entry-id']=='112233445566778899'
+ result={'Attachment':{'id':'77','type':'story','entry_id':112233445566778896,'workspace_id':42}}
+else:
+ assert a==['attachment','list','workspaceid=42','entry_id=112233445566778899','id=77','type=story','limit=2','page=1']
+ result=[{'Attachment':{'id':'77','type':'story','entry_id':112233445566778896,'workspace_id':'42'}}]
+print(json.dumps({'status':1,'data':result}))
+"#,
+    );
+    let file = dir.path().join("document.txt");
+    fs::write(&file, b"file content").unwrap();
+    let a = lark2tapd_core::copy_attachment(dir.path(), &file).unwrap();
+    let mut target = upload_target();
+    target.id = "112233445566778899".into();
+    let receipt = g
+        .upload_draft_attachment(dir.path(), "42", &target, &a)
+        .unwrap();
+    assert_eq!(receipt.remote_id.as_deref(), Some("77"));
+}
+// 本地限制在任何任务/附件写入前拒绝，错误不能泄露缓存路径。
+#[test]
+fn upload_preflight_rejects_changed_cache_webp_and_image_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let webp = lark2tapd_core::save_pasted_image(dir.path(), b"RIFF0000WEBPdata", "webp").unwrap();
+    assert!(validate_attachment_for_upload(&webp).is_err());
+    let mut bytes = vec![0; 5 * 1024 * 1024];
+    bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let large = lark2tapd_core::save_pasted_image(dir.path(), &bytes, "png").unwrap();
+    assert!(validate_attachment_for_upload(&large).is_err());
+    let a =
+        lark2tapd_core::save_pasted_image(dir.path(), b"\x89PNG\r\n\x1a\nvalid", "png").unwrap();
+    fs::write(&a.path, b"tampered").unwrap();
+    let error = validate_attachment_for_upload(&a).unwrap_err().to_string();
+    assert!(!error.contains(&a.path));
+}
+#[test]
+fn image_receipts_reject_traversal_and_untrusted_origins() {
+    for src in [
+        "/tfl/pictures/../x.png",
+        "/tfl/pictures/%2e%2e/x.png",
+        "/tfl/pictures/x.png?secret",
+        "/tfl/pictures//x.png",
+        "https://evil.example/x.png",
+        "https://tapd.cn.evil.example/x.png",
+        "javascript:x",
+    ] {
+        let (dir, g) = gateway(&format!(
+            "print(json.dumps({{'status':1,'data':{{'image_src':{src:?}}}}}))"
+        ));
+        let a = lark2tapd_core::save_pasted_image(dir.path(), b"\x89PNG\r\n\x1a\nvalid", "png")
+            .unwrap();
+        assert!(
+            g.upload_draft_attachment(dir.path(), "42", &upload_target(), &a)
+                .is_err(),
+            "{src}"
+        );
+    }
+}
+#[test]
+fn upload_stages_image_extension_from_verified_content() {
+    let (dir, g) = gateway(
+        r#"
+p=dict(x.split('=',1) for x in a[2:])
+assert p['file'].endswith('.png')
+print('{"status":1,"data":{"image_src":"/tfl/pictures/image.png"}}')
+"#,
+    );
+    let source = dir.path().join("misnamed.txt");
+    fs::write(&source, b"\x89PNG\r\n\x1a\nvalid").unwrap();
+    let a = lark2tapd_core::copy_attachment(dir.path(), &source).unwrap();
+    g.upload_draft_attachment(dir.path(), "42", &upload_target(), &a)
+        .unwrap();
+}
+// 上传测试仅运行临时假进程；校验实际 argv、文件字节和失败时不重试。
+#[test]
+fn attachment_upload_uses_verified_bytes_and_checks_receipts() {
+    for image in [false, true] {
+        let (dir, g) = gateway(
+            r#"
+assert a[0]=='attachment'
+p=dict(x.split('=',1) for x in a[2:])
+assert p['workspaceid']=='42'
+with open(p['file'],'rb') as f: data=f.read()
+if a[1]=='upload-image':
+ assert set(p)=={'workspaceid','file'} and data==b'\x89PNG\r\n\x1a\ncontent'
+ result={'image_src':'/tfl/pictures/202608/image.png','html_code':'<img src="/tfl/pictures/202608/image.png"/>'}
+else:
+ assert a[1]=='upload' and p['type']=='story' and p['entry-id']=='9'
+ assert data==b'file content'
+ result={'Attachment':{'id':'77','type':'story','entry_id':9,'workspace_id':42}}
+with open(__file__+'.calls','a') as f: f.write('upload\n')
+print(json.dumps({'status':1,'data':result}))
+"#,
+        );
+        let attachment = if image {
+            lark2tapd_core::save_pasted_image(dir.path(), b"\x89PNG\r\n\x1a\ncontent", "png")
+                .unwrap()
+        } else {
+            let file = dir.path().join("document.txt");
+            fs::write(&file, b"file content").unwrap();
+            lark2tapd_core::copy_attachment(dir.path(), &file).unwrap()
+        };
+        validate_attachment_for_upload(&attachment).unwrap();
+        let receipt = g
+            .upload_draft_attachment(dir.path(), "42", &upload_target(), &attachment)
+            .unwrap();
+        assert_eq!(
+            receipt.remote_id.as_deref(),
+            if image { None } else { Some("77") }
+        );
+        assert_eq!(
+            receipt.remote_url.as_deref(),
+            if image {
+                Some("/tfl/pictures/202608/image.png")
+            } else {
+                None
+            }
+        );
+        assert!(!receipt.uncertain);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("fake.calls")).unwrap(),
+            "upload\n"
+        );
+    }
+}
+fn upload_target() -> TargetTask {
+    TargetTask {
+        id: "9".into(),
+        kind: "story".into(),
+        title: "t".into(),
+        description: String::new(),
+        owner: String::new(),
+        due: None,
+        url: String::new(),
+    }
+}
+#[test]
+fn attachment_missing_or_conflicting_proof_is_uncertain_without_retry() {
+    for response in [
+        r#"{}"#,
+        r#"{"Attachment":{"id":"77","type":"story","entry_id":8,"workspace_id":42}}"#,
+        r#"{"Attachment":{"id":"77","type":"story","entry_id":9,"workspace_id":43}}"#,
+    ] {
+        let (dir, g) = gateway(&format!(
+            "with open(__file__+'.calls','a') as f: f.write('1')\nprint('{{\"status\":1,\"data\":{response}}}')"
+        ));
+        let file = dir.path().join("doc");
+        fs::write(&file, b"data").unwrap();
+        let a = lark2tapd_core::copy_attachment(dir.path(), &file).unwrap();
+        let error = g
+            .upload_draft_attachment(dir.path(), "42", &upload_target(), &a)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("uncertain"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("fake.calls")).unwrap(),
+            "1"
+        );
+    }
+}
+#[test]
+fn markdown_images_resolve_only_current_confirmed_attachment_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a =
+        lark2tapd_core::save_pasted_image(dir.path(), b"\x89PNG\r\n\x1a\ncontent", "png").unwrap();
+    let mut d = draft();
+    d.description = format!(
+        "![inline](attachment:{}) ![reference][img]\n\n[img]: attachment:{}",
+        a.id, a.id
+    );
+    d.attachments = vec![a.clone()];
+    assert!(!render_description(&d, &source()).unwrap().contains("<img"));
+    a.remote_url = Some("/tfl/pictures/202608/image.png".into());
+    d.attachments = vec![a.clone()];
+    let html = render_description(&d, &source()).unwrap();
+    assert_eq!(
+        html.matches("<img src=\"/tfl/pictures/202608/image.png\"")
+            .count(),
+        2,
+        "{html}"
+    );
+    d.attachments[0].uncertain = true;
+    assert!(!render_description(&d, &source()).unwrap().contains("<img"));
+    d.attachments.clear();
+    assert!(!render_description(&d, &source()).unwrap().contains("<img"));
+}
+// 只容忍已知 CLI 的单层段落包装，不能靠去标签掩盖数据丢失。
+#[test]
+fn readback_accepts_only_exact_generated_html_wrapper() {
+    for (transform, accepted) in [
+        ("'<p>'+p['description']+'</p>'", true),
+        ("'<p>changed</p>'", false),
+    ] {
+        let (_dir, g) = gateway(&format!(
+            r#"
+p=dict(x.split('=',1) for x in a[2:])
+if a[1]=='add':
+ with open(__file__+'.json','w') as f: json.dump(p,f)
+ print('{{"status":1,"data":{{"Task":{{"id":"9"}}}}}}')
+else:
+ with open(__file__+'.json') as f: p=json.load(f)
+ p['id']='9'
+ p['description']={transform}
+ print(json.dumps({{'status':1,'data':[{{'Task':p}}]}}))
+"#
+        ));
+        let mut d = draft();
+        d.description = "**strong**".into();
+        assert_eq!(g.create_target(&d, &source()).is_ok(), accepted);
+    }
+}
+// 不可信 Markdown 不能加载跟踪图、本地路径，也不能创建非 HTTP(S) 链接。
+#[test]
+fn description_blocks_external_images_and_unsafe_links() {
+    let mut d = draft();
+    d.description = "![tracking](https://evil.example/pixel) ![disk](file:///tmp/secret) ![ref][img]\n\n[img]: https://evil.example/second\n\n[x](file:///tmp/secret) [mail](mailto:x@y.com) [ok](https://example.com)\n\n<script>alert(1)</script>".into();
+    let html = render_description(&d, &source()).unwrap();
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        !html.contains("href=\"file:") && !html.contains("href=\"mailto:"),
+        "{html}"
+    );
+    assert!(html.contains("href=\"https://example.com\""));
+    assert!(!html.contains("<script>"));
+    assert!(html.contains("[lark-task:guid-1]"));
+}
+// 回归：描述必须保留 Markdown 结构，而不是把所有内容当作普通文本。
+#[test]
+fn write_renders_markdown_instead_of_literal_syntax() {
+    let (_dir, g) = gateway(
+        r#"
+p=dict(x.split('=',1) for x in a[2:])
+if a[1]=='add':
+ assert p['name']=='【需求】Title'
+ assert '<h1>Heading</h1>' in p['description']
+ assert '<strong>bold</strong>' in p['description']
+ with open(__file__+'.json','w') as f: json.dump(p,f)
+ print('{"status":1,"data":{"Task":{"id":"9"}}}')
+else:
+ with open(__file__+'.json') as f: p=json.load(f)
+ p['id']='9'
+ print(json.dumps({'status':1,'data':[{'Task':p}]}))
+"#,
+    );
+    let mut d = draft();
+    d.description = "# Heading\n\n**bold**".into();
+    d.title_prefix = "需求".into();
+    g.create_target(&d, &source()).unwrap();
 }
 #[test]
 fn related_union_paginates_filters_and_deduplicates_before_details() {
@@ -228,7 +521,7 @@ p=dict(x.split('=',1) for x in a[2:])
 assert p['workspaceid']=='42'
 if a[1] in ['add','update']:
  assert a[:2]==(['task','add'] if a[1]=='add' else ['story','update'])
- assert '&lt;script&gt;&amp;&quot;&#39;' in p['description']
+ assert '&lt;script&gt;&amp;' in p['description'] and '<script>' not in p['description']
  assert '[lark-task:guid-1]' in p['description']
  assert 'https://example.feishu.cn/task/1' in p['description']
  with open(__file__+'.json','w') as f: json.dump(p,f)
@@ -244,7 +537,7 @@ print(json.dumps({'status':1,'data':[{'Story':t}] if a[1]=='list' else {'Story':
     assert_eq!(created.title, "Title");
     assert_eq!(
         created.description,
-        "&lt;script&gt;&amp;&quot;&#39;<p>[lark-task:guid-1]</p><p>https://example.feishu.cn/task/1</p>"
+        "&lt;script&gt;&amp;&quot;'<p>[lark-task:guid-1]</p><p>https://example.feishu.cn/task/1</p>"
     );
     let updated = g.update_target(&created, &draft(), &source()).unwrap();
     assert_eq!(updated.kind, "story");

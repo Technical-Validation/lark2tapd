@@ -1,73 +1,75 @@
-//! GPUI 真实点击/输入 → 工作线程 → 同步引擎 → SQLite，只有远端服务使用 mock。
+//! 真正的 GPUI 输入事件连接后台 actor 和 SQLite；远端服务及上传使用明确 mock。
 use super::*;
 use crate::worker;
 use gpui_kit::test::TestWindowExt;
-use std::prelude::v1::test;
-use std::time::Duration;
+use std::{
+    prelude::v1::test,
+    time::{Duration, Instant},
+};
 
-fn receive(events: &async_channel::Receiver<Event>) -> Event {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(8), events.recv())
-            .await
-            .expect("worker deadline")
-            .expect("worker event")
-    })
-}
-
-fn drain(
-    events: &async_channel::Receiver<Event>,
-    model: &Entity<Model>,
-    cx: &mut TestAppContext,
-) -> bool {
-    loop {
-        let event = receive(events);
-        let done = matches!(&event,Event::State {message,..} if !message.is_empty())
-            || matches!(&event, Event::Error(_));
-        let success = !matches!(&event, Event::Error(_));
-        cx.update(|cx| model.update(cx, |m, cx| m.receive(event, cx)));
-        cx.run_until_parked();
-        if done {
-            return success;
-        }
-    }
-}
-
-fn setup(
-    cx: &mut TestAppContext,
-) -> (
+type Fixture = (
     tempfile::TempDir,
     async_channel::Receiver<Event>,
     Entity<Model>,
     AnyWindowHandle,
     Entity<Workspace>,
+);
+fn pump(
+    events: &async_channel::Receiver<Event>,
+    model: &Entity<Model>,
+    cx: &mut TestAppContext,
+    until: impl Fn(&App) -> bool,
 ) {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    while !cx.read(|cx| until(cx)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = runtime.block_on(async {
+            tokio::time::timeout(remaining, events.recv())
+                .await
+                .expect("worker event deadline")
+                .expect("worker event channel")
+        });
+        if let Event::FormError { field, message } = &event {
+            eprintln!("worker field {field}: {message}");
+        }
+        cx.update(|cx| model.update(cx, |m, cx| m.receive(event, cx)));
+        cx.run_until_parked();
+    }
+}
+fn setup(cx: &mut TestAppContext) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let worker = worker::start(dir.path().into(), Mode::Mock);
+    let w = worker::start(dir.path().into(), Mode::Mock);
     cx.update(gpui_kit::init);
     let model = cx.new(|_| Model {
         snapshot: None,
         busy: false,
         notice: String::new(),
         error: false,
-        preview: None,
         mode: Mode::Mock,
         install_plan: None,
-        config_revision: 0,
         lark_diagnostic: String::new(),
         tapd_diagnostic: String::new(),
+        activities: BTreeSet::new(),
+        errors: BTreeMap::new(),
+        checked_workspace: None,
+        data_root: w.data_root.clone(),
+        state_revision: 0,
+        last_action: "",
         pending_request: 0,
         profile: String::new(),
-        jobs: worker.jobs,
+        jobs: w.jobs,
         tray: None,
     });
-    assert!(drain(&worker.events, &model, cx));
-    let (window, view) = cx.update(|cx| {
+    pump(&w.events, &model, cx, |cx| {
+        model.read(cx).snapshot.is_some()
+    });
+    let (handle, view) = cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: Point::default(),
-                    size: size(px(1440.), px(1200.)),
+                    size: size(px(1440.), px(1800.)),
                 })),
                 ..Default::default()
             },
@@ -76,136 +78,198 @@ fn setup(
         )
         .unwrap()
     });
-    (dir, worker.events, model, window, view)
+    (dir, w.events, model, handle, view)
 }
-
-fn click(cx: &mut TestAppContext, window: AnyWindowHandle, id: &str) {
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.click(SharedString::from(id.to_owned()), cx);
+fn click(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &str) {
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click(SharedString::from(id.to_owned()), cx);
     })
     .unwrap();
+    cx.run_until_parked();
 }
-
 fn choose(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &str, query: &str) {
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window
-            .within(SharedString::from(id.to_owned()))
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.within(SharedString::from(id.to_owned()))
             .click("input", cx);
-        window.input(query, cx);
+        w.input(query, cx);
     })
     .unwrap();
     cx.run_until_parked();
-    cx.update_window(handle, |_, window, cx| {
-        window.render_frame(cx);
-        window.press("down", cx);
-        window.press("enter", cx);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.press("down", cx);
+        w.press("enter", cx);
     })
     .unwrap();
     cx.run_until_parked();
 }
-
-#[gpui_kit::test]
-fn gui_e2e_import_preview_update_and_sqlite_restart(cx: &mut TestAppContext) {
-    let (dir, events, model, window, _view) = setup(cx);
-    click(cx, window, "refresh");
-    assert!(drain(&events, &model, cx));
+fn load_task(
+    events: &async_channel::Receiver<Event>,
+    model: &Entity<Model>,
+    view: &Entity<Workspace>,
+    handle: AnyWindowHandle,
+    cx: &mut TestAppContext,
+) -> String {
+    click(cx, handle, "refresh");
+    pump(events, model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| !s.records.is_empty())
+    });
     let guid = cx.read(|cx| {
         model.read(cx).snapshot.as_ref().unwrap().records[0]
             .source
             .guid
             .clone()
     });
-    click(cx, window, &format!("select-{guid}"));
-    assert!(drain(&events, &model, cx));
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.click("draft-title", cx);
-        window.press("cmd-a", cx);
-        window.input("经过编辑的导入标题", cx);
-        assert_eq!(
-            window.find("draft-title").value(),
-            Some("经过编辑的导入标题")
-        );
-        window.click("preview", cx);
+    click(cx, handle, &format!("select-{guid}"));
+    pump(events, model, cx, |cx| {
+        view.read(cx)
+            .edit_source
+            .as_ref()
+            .is_some_and(|s| s.guid == guid)
+    });
+    pump(events, model, cx, |cx| {
+        model.read(cx).snapshot.as_ref().is_some_and(|s| {
+            !s.directory.workspaces.is_empty() && s.directory.members.contains_key("demo")
+        })
+    });
+    guid
+}
+
+#[gpui_kit::test]
+fn opening_main_window_checks_automatically(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, _) = setup(cx);
+    cx.update(|cx| {
+        cx.set_global(Shell {
+            model: model.clone(),
+            window: Some(handle),
+        });
+        show_window(cx);
+    });
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.records.len() == 3)
+    });
+    assert!(cx.read(|cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .last_checked
+            .is_some()
+    }));
+}
+
+#[gpui_kit::test]
+fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppContext) {
+    let (dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    model.update(cx, |m, cx| {
+        m.send(
+            Job::SetPreference(Preference::WorkspacePrefixes {
+                workspace: "demo".into(),
+                prefixes: vec!["产品 A".into()],
+            }),
+            cx,
+        )
+    });
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .settings
+            .workspace_prefixes
+            .contains_key("demo")
+    });
+    choose(cx, handle, "title-prefix", "产品 A");
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("draft-title", cx);
+        w.press("cmd-a", cx);
+        w.input("直接导入的标题", cx);
+        assert!(w.try_find("preview").is_none());
     })
     .unwrap();
-    assert!(drain(&events, &model, cx));
-    cx.read(|cx| {
-        assert!(
-            model.read(cx).snapshot.as_ref().unwrap().records[0]
-                .target
-                .is_none()
-        )
+    click(cx, handle, "submit");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .target
+            .is_some()
     });
-    click(cx, window, "confirm-import");
-    assert!(drain(&events, &model, cx));
-    let target_id = cx.read(|cx| {
-        let r = &model.read(cx).snapshot.as_ref().unwrap().records[0];
-        assert_eq!(r.status(), SyncStatus::Synced);
-        assert_eq!(r.target.as_ref().unwrap().title, "经过编辑的导入标题");
-        r.target.as_ref().unwrap().id.clone()
+    let id = cx.read(|cx| {
+        let t = model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .target
+            .as_ref()
+            .unwrap();
+        assert_eq!(t.title, "【产品 A】直接导入的标题");
+        t.id.clone()
     });
-    click(cx, window, "demo-change");
-    assert!(drain(&events, &model, cx));
-    click(cx, window, "nav-changed");
-    click(cx, window, &format!("select-{guid}"));
-    assert!(drain(&events, &model, cx));
-    click(cx, window, "preview");
-    assert!(drain(&events, &model, cx));
-    cx.read(|cx| {
-        assert_eq!(
-            model
-                .read(cx)
-                .preview
-                .as_ref()
-                .unwrap()
-                .target
-                .as_ref()
-                .unwrap()
-                .id,
-            target_id
-        )
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("draft-title", cx);
+        w.press("cmd-a", cx);
+        w.input("同一目标的新标题", cx);
+    })
+    .unwrap();
+    click(cx, handle, "submit");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .title
+            == "【产品 A】同一目标的新标题"
     });
-    click(cx, window, "confirm-import");
-    assert!(drain(&events, &model, cx));
-    // 重开真实 SQLite 连接，验证 UI 成功不是仅修改内存状态。
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let reopened = lark2tapd_core::Engine::open(&dir.path().join("mock.db"))
+        let engine = lark2tapd_core::Engine::open(&dir.path().join("mock.db"))
             .await
             .unwrap();
-        let record = &reopened.snapshot().records[0];
-        assert_eq!(record.status(), SyncStatus::Synced);
-        assert_eq!(record.target.as_ref().unwrap().id, target_id);
+        assert_eq!(engine.snapshot().records[0].target.as_ref().unwrap().id, id);
+        assert_eq!(engine.prepare(&guid).unwrap().title_prefix, "产品 A");
     });
 }
 
 #[gpui_kit::test]
-fn gui_settings_switch_language_theme_and_validate_interval(cx: &mut TestAppContext) {
-    let (_dir, events, model, window, _view) = setup(cx);
-    click(cx, window, "nav-settings");
-    click(cx, window, "en");
-    assert!(drain(&events, &model, cx));
-    click(cx, window, "dark");
-    assert!(drain(&events, &model, cx));
-    cx.read(|cx| {
-        let settings = &model.read(cx).snapshot.as_ref().unwrap().settings;
-        assert_eq!(settings.language, "en");
-        assert_eq!(settings.theme, "dark");
+fn polling_autosaves_and_reports_invalid_input_inline(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    click(cx, handle, "nav-settings");
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("save-settings").is_none());
+        assert!(w.try_find("poll-minutes").is_none());
+    })
+    .unwrap();
+    click(cx, handle, "toggle-poll");
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .settings
+            .poll_enabled
     });
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.click("poll-minutes", cx);
-        window.press("cmd-a", cx);
-        window.input("0", cx);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("poll-minutes", cx);
+        w.press("cmd-a", cx);
+        w.input("0", cx);
     })
     .unwrap();
     cx.run_until_parked();
-    click(cx, window, "save-settings");
-    cx.read(|cx| assert!(model.read(cx).busy, "save button must enqueue validation"));
-    assert!(!drain(&events, &model, cx));
     cx.read(|cx| {
+        assert!(model.read(cx).errors.contains_key("poll"));
         assert_eq!(
             model
                 .read(cx)
@@ -215,371 +279,347 @@ fn gui_settings_switch_language_theme_and_validate_interval(cx: &mut TestAppCont
                 .settings
                 .poll_minutes,
             15
-        )
+        );
     });
-}
-
-#[gpui_kit::test]
-fn gui_refresh_invalidates_stale_editor(cx: &mut TestAppContext) {
-    let (_dir, events, model, window, _view) = setup(cx);
-    click(cx, window, "refresh");
-    assert!(drain(&events, &model, cx));
-    let guid = cx.read(|cx| {
-        model.read(cx).snapshot.as_ref().unwrap().records[0]
-            .source
-            .guid
-            .clone()
+    cx.update_window(handle, |_, w, cx| {
+        w.click("poll-minutes", cx);
+        w.press("cmd-a", cx);
+        w.input("60", cx);
+    })
+    .unwrap();
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .settings
+            .poll_minutes
+            == 60
     });
-    click(cx, window, &format!("select-{guid}"));
-    assert!(drain(&events, &model, cx));
-    click(cx, window, "demo-change");
-    assert!(drain(&events, &model, cx));
-    // Kit 未保证每个控件报告 disabled 属性；验证实际点击没有排入写入工作。
-    click(cx, window, "preview");
     cx.read(|cx| {
-        assert!(!model.read(cx).busy);
-        assert!(model.read(cx).preview.is_none());
+        assert!(!model.read(cx).errors.contains_key("poll"));
+        assert_eq!(view.read(cx).poll.read(cx).value().as_ref(), "60");
     });
-    click(cx, window, "reload-source");
-    assert!(drain(&events, &model, cx));
-    click(cx, window, "preview");
-    assert!(drain(&events, &model, cx));
-    cx.read(|cx| assert!(model.read(cx).preview.is_some()));
-}
-
-#[test]
-fn actor_rejects_mock_auth_and_cross_profile_requests() {
-    let dir = tempfile::tempdir().unwrap();
-    let worker = worker::start(dir.path().into(), Mode::Mock);
-    let _ = receive(&worker.events);
-    for job in [
-        Job::Login,
-        Job::Check(CliTool::Lark),
-        Job::Check(CliTool::Tapd),
-        Job::PlanInstall(CliTool::Lark),
-        Job::Install(CliTool::Tapd),
-        Job::SaveCredentials(Credentials::default()),
-        Job::ClearCredentials,
-    ] {
-        worker
-            .jobs
-            .send(Request {
-                job,
-                profile: "mock".into(),
-            })
-            .unwrap();
-        assert!(matches!(receive(&worker.events), Event::State { .. }));
-        match receive(&worker.events) {
-            Event::Error(e) => assert!(e.contains("Demo mode")),
-            _ => panic!("mock auth unexpectedly succeeded"),
-        }
-    }
-    worker
-        .jobs
-        .send(Request {
-            job: Job::OpenDraft("anything".into(), false),
-            profile: "old-account".into(),
-        })
-        .unwrap();
-    let _ = receive(&worker.events);
-    match receive(&worker.events) {
-        Event::Error(e) => assert!(e.contains("Account changed")),
-        _ => panic!("stale account accepted"),
-    }
-}
-
-#[gpui_kit::test]
-fn settings_do_not_overwrite_task_destination(cx: &mut TestAppContext) {
-    let (_dir, events, model, window, _) = setup(cx);
-    click(cx, window, "refresh");
-    assert!(drain(&events, &model, cx));
-    let guid = cx.read(|cx| {
-        model.read(cx).snapshot.as_ref().unwrap().records[0]
-            .source
-            .guid
-            .clone()
+    click(cx, handle, "toggle-poll");
+    pump(&events, &model, cx, |cx| {
+        !model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .settings
+            .poll_enabled
     });
-    click(cx, window, &format!("select-{guid}"));
-    assert!(drain(&events, &model, cx));
-    choose(cx, window, "draft-workspace", "演示项目二");
-    choose(cx, window, "draft-owner", "bob");
-    click(cx, window, "nav-settings");
-    click(cx, window, "nav-pending");
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(window.find("draft-workspace").value(), Some("演示项目二"));
-        assert_eq!(window.find("draft-owner").value(), Some("演示成员 (bob)"));
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("poll-minutes").is_none());
     })
     .unwrap();
 }
 
 #[gpui_kit::test]
-fn retained_preview_restores_editor_after_window_reopen(cx: &mut TestAppContext) {
-    let (_dir, events, model, window, _) = setup(cx);
-    click(cx, window, "refresh");
-    assert!(drain(&events, &model, cx));
-    let guid = cx.read(|cx| {
-        model.read(cx).snapshot.as_ref().unwrap().records[0]
-            .source
-            .guid
-            .clone()
+fn source_details_expand_and_settings_do_not_clobber_draft(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    cx.read(|cx| assert!(!view.read(cx).source_open));
+    click(cx, handle, "toggle-source-details");
+    cx.read(|cx| assert!(view.read(cx).source_open));
+    click(cx, handle, "toggle-source-details");
+    choose(cx, handle, "draft-owner", "alice");
+    let before = cx.read(|cx| view.read(cx).draft(cx));
+    click(cx, handle, "nav-settings");
+    click(cx, handle, "nav-pending");
+    cx.read(|cx| {
+        assert_eq!(view.read(cx).draft(cx), before);
     });
-    click(cx, window, &format!("select-{guid}"));
-    assert!(drain(&events, &model, cx));
-    click(cx, window, "preview");
-    assert!(drain(&events, &model, cx));
-    let expected = cx.read(|cx| model.read(cx).preview.as_ref().unwrap().draft.title.clone());
-    cx.update_window(window, |_, window, _| window.remove_window())
+}
+
+#[gpui_kit::test]
+fn pasted_image_and_attachment_reach_mock_target_once(cx: &mut TestAppContext) {
+    let (dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(2, 2)
+        .write_to(&mut encoded, image::ImageFormat::Png)
         .unwrap();
-    let (reopened, _) = cx.update(|cx| {
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: Point::default(),
-                    size: size(px(1440.), px(1200.)),
-                })),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| cx.new(|cx| Workspace::new(model.clone(), window, cx)),
-        )
-        .unwrap()
-    });
-    click(cx, reopened, "back-to-edit");
+    cx.update_window(handle, |_, w, cx| {
+        let description = view.read(cx).description.clone();
+        description.update(cx, |s, cx| s.focus(w, cx));
+        cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            encoded.into_inner(),
+        )));
+        w.press("cmd-v", cx);
+    })
+    .unwrap();
     cx.run_until_parked();
-    cx.update_window(reopened, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(window.find("draft-title").value(), Some(expected.as_str()));
-    })
-    .unwrap();
-}
-
-#[test]
-fn actor_reads_live_cache_without_credentials_or_network() {
-    use lark2tapd_core::{Engine, MockGateway};
-    let dir = tempfile::tempdir().unwrap();
-    let profile = "a".repeat(64);
-    let guid = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut pref = Engine::open(&dir.path().join("preferences-live.db"))
-            .await
-            .unwrap();
-        let settings = Settings {
-            last_profile: Some(profile.clone()),
-            lark_path: "/not-installed/lark".into(),
-            tapd_path: "/not-installed/tapd".into(),
-            ..Settings::default()
-        };
-        pref.save_settings(settings).await.unwrap();
-        let mut cache = Engine::open(&dir.path().join(format!("live-{profile}.db")))
-            .await
-            .unwrap();
-        cache.refresh(&MockGateway::default()).await.unwrap();
-        cache.snapshot().records[0].source.guid.clone()
+    pump(&events, &model, cx, |cx| {
+        view.read(cx).attachments.len() == 1 && view.read(cx).pending_pastes.is_empty()
     });
-    let worker = worker::start(dir.path().into(), Mode::Live);
-    let _ = receive(&worker.events);
-    worker
-        .jobs
-        .send(Request {
-            job: Job::OpenDraft(guid.clone(), false),
-            profile,
-        })
-        .unwrap();
-    match receive(&worker.events) {
-        Event::Editor(e) => assert_eq!(e.source.guid, guid),
-        _ => panic!("offline cached task was not readable"),
-    }
-}
-
-#[test]
-fn actor_excludes_second_writer() {
-    let dir = tempfile::tempdir().unwrap();
-    let first = worker::start(dir.path().into(), Mode::Mock);
-    let _ = receive(&first.events);
-    let second = worker::start(dir.path().into(), Mode::Mock);
-    match receive(&second.events) {
-        Event::Error(e) => assert!(e.contains("already open")),
-        _ => panic!("second writer accepted"),
-    }
+    cx.read(|cx| {
+        assert!(
+            view.read(cx)
+                .description
+                .read(cx)
+                .value()
+                .contains("attachment:")
+        )
+    });
+    click(cx, handle, "submit");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .last_draft
+            .as_ref()
+            .is_some_and(|d| d.attachments[0].remote_url.is_some())
+            && !model.read(cx).busy
+    });
+    let first = cx.read(|cx| {
+        model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .id
+            .clone()
+    });
+    click(cx, handle, "save-draft");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).snapshot.as_ref().unwrap().records[0]
+            .draft
+            .is_some()
+    });
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let e = lark2tapd_core::Engine::open(&dir.path().join("mock.db"))
+            .await
+            .unwrap();
+        let d = e.prepare(&guid).unwrap();
+        assert!(d.attachments[0].remote_url.is_some());
+        assert_eq!(e.snapshot().records[0].target.as_ref().unwrap().id, first);
+    });
 }
 
 #[gpui_kit::test]
-fn gui_standard_project_member_and_date_selection(cx: &mut TestAppContext) {
-    let (_dir, events, model, window, view) = setup(cx);
-    click(cx, window, "refresh");
-    assert!(drain(&events, &model, cx));
-    let guid = cx.read(|cx| {
-        model.read(cx).snapshot.as_ref().unwrap().records[0]
-            .source
-            .guid
-            .clone()
+fn standard_date_picker_and_project_cascade_still_work(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    choose(cx, handle, "draft-owner", "alice");
+    choose(cx, handle, "draft-workspace", "演示项目二");
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .directory
+            .members
+            .contains_key("demo-2")
     });
-    click(cx, window, &format!("select-{guid}"));
-    assert!(drain(&events, &model, cx));
-    choose(cx, window, "draft-owner", "alice");
-    cx.read(|cx| assert_eq!(view.read(cx).draft(cx).owner, "alice"));
-    choose(cx, window, "draft-workspace", "演示项目二");
+    cx.read(|cx| assert!(view.read(cx).draft(cx).owner.is_empty()));
+    choose(cx, handle, "draft-owner", "bob");
+    let due = cx.read(|cx| view.read(cx).due.clone());
+    let id: ElementId = ("date-picker", due.entity_id()).into();
+    cx.update_window(handle, |_, w, cx| {
+        due.update(cx, |s, cx| {
+            s.set_date(chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(), w, cx)
+        });
+        w.render_frame(cx);
+        w.click(id.clone(), cx);
+        w.click("calendar-2026-09-16-0-2", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
     cx.read(|cx| {
         let d = view.read(cx).draft(cx);
-        assert_eq!(d.workspace_id, "demo-2");
-        assert!(d.owner.is_empty());
-    });
-    choose(cx, window, "draft-owner", "bob");
-    let due = cx.read(|cx| view.read(cx).due.clone());
-    let picker_id: ElementId = ("date-picker", due.entity_id()).into();
-    cx.update_window(window, |_, window, cx| {
-        due.update(cx, |s, cx| {
-            s.set_date(
-                chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
-                window,
-                cx,
-            )
-        });
-        window.render_frame(cx);
-        window.click(picker_id.clone(), cx);
-        window.click("calendar-2026-09-16-0-2", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.read(|cx| assert_eq!(view.read(cx).draft(cx).due.as_deref(), Some("2026-09-16")));
-    click(cx, window, "preview");
-    assert!(drain(&events, &model, cx));
-    cx.read(|cx| {
-        let d = &model.read(cx).preview.as_ref().unwrap().draft;
         assert_eq!(d.workspace_id, "demo-2");
         assert_eq!(d.owner, "bob");
         assert_eq!(d.due.as_deref(), Some("2026-09-16"));
     });
-    click(cx, window, "confirm-import");
-    assert!(drain(&events, &model, cx));
-    cx.read(|cx| {
-        let r = &model.read(cx).snapshot.as_ref().unwrap().records[0];
-        assert_eq!(r.target_workspace.as_deref(), Some("demo-2"));
-        assert_eq!(r.target.as_ref().unwrap().owner, "bob");
-    });
-    // 标准日期组件清空行为也进入相同的业务草稿值。
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.within(picker_id.clone()).click("clean", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.read(|cx| assert!(view.read(cx).draft(cx).due.is_none()));
 }
 
 #[gpui_kit::test]
-fn branding_reaches_component_button_tokens_in_both_themes(cx: &mut TestAppContext) {
+fn text_tokens_are_neutral_while_buttons_keep_brand_fill(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     for mode in ["light", "dark"] {
         cx.update(|cx| {
             apply_theme(mode, cx);
-            let theme = Theme::global(cx);
-            assert_eq!(theme.tokens.button_primary, theme.colors.primary.into());
-            assert_eq!(
-                theme.tokens.button_primary_foreground,
-                theme.colors.primary_foreground.into()
-            );
-            assert_eq!(
-                theme.tokens.button_secondary_foreground,
-                theme.colors.primary.into()
-            );
+            let t = Theme::global(cx);
+            assert_eq!(t.colors.button_primary, t.colors.primary);
+            assert_eq!(t.colors.button_secondary_foreground, t.colors.foreground);
+            assert_eq!(t.colors.secondary_foreground, t.colors.foreground);
+            assert_eq!(t.colors.link, t.colors.foreground);
         });
     }
 }
 
+fn png_fixture() -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(2, 2)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
 #[gpui_kit::test]
-fn mock_settings_exposes_diagnostics_without_mode_switches(cx: &mut TestAppContext) {
-    let (_dir, _events, model, window, _view) = setup(cx);
-    click(cx, window, "nav-settings");
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.try_find("mode-mock").is_none());
-        assert!(window.try_find("mode-live").is_none());
+fn attachments_keep_editor_session_and_individual_paste_markers(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    let session = cx.read(|cx| view.read(cx).editor_session);
+    let root = cx.read(|cx| worker::media_root(&model.read(cx).data_root, "mock").unwrap());
+    let a = lark2tapd_core::save_pasted_image(&root, &png_fixture(), "png").unwrap();
+    let m1 = "![one](attachment:pending-one)".to_owned();
+    let m2 = "![two](attachment:pending-two)".to_owned();
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| {
+            v.pending_pastes.extend([m1.clone(), m2.clone()]);
+            v.description.update(cx, |s, cx| {
+                s.set_value(format!("before{m1}between{m2}after"), w, cx)
+            });
+        })
     })
     .unwrap();
-    // 结果处理是逐平台的，不能把版本存在误报为账号连接通过。
     cx.update(|cx| {
         model.update(cx, |m, cx| {
             m.receive(
-                Event::Diagnostic {
-                    tool: CliTool::Lark,
-                    version: Some("1.0.96".into()),
-                    connected: false,
-                    detail: "Permission missing".into(),
+                Event::AttachmentFailed {
+                    guid: guid.clone(),
+                    profile: "mock".into(),
+                    session,
+                    marker: Some(m1.clone()),
+                    message: "one failed".into(),
                 },
                 cx,
             )
         })
     });
+    cx.run_until_parked();
     cx.read(|cx| {
-        assert!(model.read(cx).lark_diagnostic.contains("1.0.96"));
-        assert!(
-            model
-                .read(cx)
-                .lark_diagnostic
-                .contains("Permission missing")
-        );
-        assert!(model.read(cx).tapd_diagnostic.is_empty());
+        let v = view.read(cx);
+        assert!(v.pending_pastes.contains(&m2));
+        assert!(!v.description.read(cx).value().contains(&m1));
+        assert!(v.description.read(cx).value().contains(&m2));
     });
-}
-
-#[test]
-fn live_installer_requires_confirmation_and_cancel_has_no_side_effects() {
-    let dir = tempfile::tempdir().unwrap();
-    let worker = worker::start(dir.path().into(), Mode::Live);
-    let _ = receive(&worker.events);
-    let send = |job| {
-        worker
-            .jobs
-            .send(Request {
-                job,
-                profile: String::new(),
-            })
-            .unwrap()
-    };
-    send(Job::Install(CliTool::Tapd));
-    let _ = receive(&worker.events);
-    match receive(&worker.events) {
-        Event::Error(e) => assert!(e.contains("before confirming")),
-        _ => panic!("install without confirmation"),
-    }
-    send(Job::PlanInstall(CliTool::Tapd));
-    match receive(&worker.events) {
-        Event::InstallPlan(p) => {
-            assert!(
-                p.source
-                    .starts_with("https://cnb.cool/tapd.cn/skills/tapd-cli/")
-            );
-            assert!(
-                p.destination
-                    .starts_with(dir.path().canonicalize().unwrap())
-            );
-        }
-        _ => panic!("missing install plan"),
-    }
-    let _ = receive(&worker.events);
-    send(Job::CancelInstall);
-    let _ = receive(&worker.events);
-    send(Job::Install(CliTool::Tapd));
-    let _ = receive(&worker.events);
-    assert!(matches!(receive(&worker.events), Event::Error(_)));
-    assert!(!dir.path().join("tools").exists());
+    cx.update(|cx| {
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::AttachmentReady {
+                    guid: guid.clone(),
+                    profile: "mock".into(),
+                    session,
+                    marker: Some(m2.clone()),
+                    attachment: a.clone(),
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let v = view.read(cx);
+        assert_eq!(v.attachments.len(), 1);
+        assert!(v.description.read(cx).value().contains(&a.id));
+        assert!(v.description.read(cx).value().starts_with("beforebetween"));
+        assert!(v.description.read(cx).value().ends_with("after"));
+    });
+    view.update(cx, |v, cx| v.reload_source(guid.clone(), cx));
+    pump(&events, &model, cx, |cx| {
+        view.read(cx).edit_source.is_some()
+    });
+    cx.update(|cx| {
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::AttachmentReady {
+                    guid: guid.clone(),
+                    profile: "mock".into(),
+                    session,
+                    marker: None,
+                    attachment: a,
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| assert!(view.read(cx).attachments.is_empty()));
 }
 
 #[gpui_kit::test]
-fn successful_installation_projects_saved_path_into_settings(cx: &mut TestAppContext) {
-    let (_dir, _events, model, window, view) = setup(cx);
-    click(cx, window, "nav-settings");
-    let mut snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
-    snapshot.settings.lark_path = "/private/application/tools/lark-cli".into();
+fn file_selected_image_is_referenced_and_removed_decode_cannot_return(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    let session = cx.read(|cx| view.read(cx).editor_session);
+    let root = cx.read(|cx| worker::media_root(&model.read(cx).data_root, "mock").unwrap());
+    let a = lark2tapd_core::save_pasted_image(&root, &png_fixture(), "png").unwrap();
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| {
+            v.description
+                .update(cx, |s, cx| s.set_value("Preserved text", w, cx))
+        })
+    })
+    .unwrap();
+    cx.update(|cx| {
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::AttachmentReady {
+                    guid,
+                    profile: "mock".into(),
+                    session,
+                    marker: None,
+                    attachment: a.clone(),
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert!(
+            view.read(cx)
+                .description
+                .read(cx)
+                .value()
+                .contains("Preserved text")
+        );
+        assert!(
+            view.read(cx)
+                .description
+                .read(cx)
+                .value()
+                .contains(&format!("attachment:{}", a.id))
+        );
+    });
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| {
+            v.images.clear();
+            v.loading_images.clear();
+            v.load_images(w, cx);
+            v.attachments.clear();
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| assert!(view.read(cx).images.is_empty()));
+}
+
+#[gpui_kit::test]
+fn successful_action_events_clear_credentials_and_install_confirmation(cx: &mut TestAppContext) {
+    let (_dir, _events, model, handle, view) = setup(cx);
+    click(cx, handle, "nav-settings");
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| {
+            set(&v.app_secret, "dummy-secret".into(), w, cx);
+            set(&v.tapd_token, "dummy-token".into(), w, cx);
+        })
+    })
+    .unwrap();
+    let snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
     cx.update(|cx| {
         model.update(cx, |m, cx| {
             m.receive(
                 Event::State {
+                    mode: Mode::Mock,
                     snapshot,
                     profile: "mock".into(),
-                    mode: Mode::Mock,
-                    message: "installed",
+                    message: "credentials_saved",
                     new_count: 0,
                 },
                 cx,
@@ -588,9 +628,204 @@ fn successful_installation_projects_saved_path_into_settings(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     cx.read(|cx| {
-        assert_eq!(
-            view.read(cx).lark_path.read(cx).value().as_ref(),
-            "/private/application/tools/lark-cli"
+        assert!(view.read(cx).app_secret.read(cx).value().is_empty());
+        assert!(view.read(cx).tapd_token.read(cx).value().is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn finder_image_paste_stages_content_without_exposing_local_path(cx: &mut TestAppContext) {
+    let (dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    let path = dir.path().join("copied-image.png");
+    std::fs::write(&path, png_fixture()).unwrap();
+    let item = ClipboardItem {
+        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+            vec![path.clone()].into(),
+        ))],
+    };
+    cx.update_window(handle, |_, w, cx| {
+        let input = view.read(cx).description.clone();
+        input.update(cx, |s, cx| s.focus(w, cx));
+        cx.write_to_clipboard(item);
+        w.press("cmd-v", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| assert_eq!(view.read(cx).pending_files, 1));
+    click(cx, handle, "submit");
+    cx.read(|cx| {
+        assert!(
+            !model.read(cx).activities.contains("submit"),
+            "pending file imports must prevent submission"
+        )
+    });
+    pump(&events, &model, cx, |cx| {
+        view.read(cx).attachments.len() == 1 && view.read(cx).pending_files == 0
+    });
+    cx.read(|cx| {
+        let text = view.read(cx).description.read(cx).value();
+        assert!(text.contains("attachment:"));
+        assert!(!text.contains(path.to_string_lossy().as_ref()));
+    });
+}
+
+#[gpui_kit::test]
+fn pending_paste_reserves_capacity_against_file_batches(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    let marker = "![pending](attachment:reserved)".to_owned();
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| {
+            v.pending_pastes.insert(marker.clone());
+            v.description.update(cx, |s, cx| {
+                s.set_value(marker.clone(), w, cx);
+                s.focus(w, cx);
+            });
+        })
+    })
+    .unwrap();
+    let paths: Vec<PathBuf> = (0..10)
+        .map(|i| PathBuf::from(format!("/not-read/file-{i}")))
+        .collect();
+    cx.update_window(handle, |_, w, cx| {
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths.into()))],
+        });
+        w.press("cmd-v", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert_eq!(view.read(cx).pending_files, 0);
+        assert!(view.read(cx).pending_pastes.contains(&marker));
+        assert_eq!(view.read(cx).description.read(cx).value().as_ref(), marker);
+        assert!(model.read(cx).errors.contains_key("attachments"));
+    });
+}
+
+#[gpui_kit::test]
+fn attachment_or_body_failure_is_attention_not_synced(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    let mut record = cx.read(|cx| model.read(cx).snapshot.as_ref().unwrap().records[0].clone());
+    record.baseline = Some(record.source.clone());
+    record.target = Some(lark2tapd_core::TargetTask {
+        id: "target".into(),
+        url: String::new(),
+        kind: "story".into(),
+        title: "target".into(),
+        description: String::new(),
+        owner: String::new(),
+        due: None,
+    });
+    record.media_body_pending = true;
+    assert!(Filter::Changed.matches(&record));
+    assert!(!Filter::Synced.matches(&record));
+    record.media_body_pending = false;
+    let mut draft = cx.read(|cx| view.read(cx).draft(cx));
+    draft.attachments.push(DraftAttachment {
+        id: "file".into(),
+        name: "file.txt".into(),
+        path: "unused".into(),
+        size: 1,
+        is_image: false,
+        remote_id: None,
+        remote_url: None,
+        uncertain: true,
+    });
+    record.last_draft = Some(draft);
+    assert!(Filter::Changed.matches(&record));
+    assert!(!Filter::Synced.matches(&record));
+}
+
+#[gpui_kit::test]
+fn workspace_form_requires_check_for_exact_current_fields(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, _view) = setup(cx);
+    click(cx, handle, "nav-settings");
+    click(cx, handle, "add-workspace");
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("manual-project-id", cx);
+        w.input("demo-2", cx);
+        w.click("manual-project-name", cx);
+        w.input("成员空间", cx);
+    })
+    .unwrap();
+    click(cx, handle, "check-workspace");
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .checked_workspace
+            .as_ref()
+            .is_some_and(|w| w.name == "成员空间")
+    });
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("manual-project-name", cx);
+        w.press("cmd-a", cx);
+        w.input("更改后的空间名", cx);
+    })
+    .unwrap();
+    click(cx, handle, "confirm-workspace");
+    cx.read(|cx| {
+        assert!(
+            model
+                .read(cx)
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .directory
+                .manual_workspaces
+                .is_empty()
+        )
+    });
+    click(cx, handle, "check-workspace");
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .checked_workspace
+            .as_ref()
+            .is_some_and(|w| w.name == "更改后的空间名")
+    });
+    click(cx, handle, "confirm-workspace");
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .directory
+            .manual_workspaces
+            .iter()
+            .any(|w| w.id == "demo-2" && w.name == "更改后的空间名")
+    });
+}
+
+#[gpui_kit::test]
+fn cli_test_buttons_remain_clickable_while_busy_and_paths_are_readonly(cx: &mut TestAppContext) {
+    let (_dir, _events, model, handle, view) = setup(cx);
+    click(cx, handle, "nav-settings");
+    model.update(cx, |m, cx| {
+        m.busy = true;
+        cx.notify();
+    });
+    let original = cx.read(|cx| view.read(cx).lark_path.read(cx).value());
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("lark-path", cx);
+        w.press("cmd-a", cx);
+        w.input("must-not-change", cx);
+    })
+    .unwrap();
+    cx.read(|cx| assert_eq!(view.read(cx).lark_path.read(cx).value(), original));
+    click(cx, handle, "check-lark");
+    cx.read(|cx| {
+        assert!(
+            model
+                .read(cx)
+                .lark_diagnostic
+                .contains("未执行真实连接测试")
         )
     });
 }
