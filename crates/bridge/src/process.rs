@@ -1,0 +1,235 @@
+use anyhow::{Result, bail};
+use std::{
+    io::{Read, Write},
+    os::{fd::AsRawFd, unix::process::CommandExt},
+    path::Path,
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+
+// 管道必须非阻塞；逃离进程组的后代即使保留句柄，也不能让 join 永久等待。
+fn nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn before_deadline(deadline: Instant) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+fn drain(
+    mut pipe: impl Read,
+    overflow: Arc<AtomicBool>,
+    deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut buf = [0; 8192];
+    loop {
+        before_deadline(deadline)?;
+        let n = match pipe.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            return Ok(data);
+        }
+        if data.len() + n > OUTPUT_LIMIT {
+            overflow.store(true, Ordering::Relaxed);
+        } else {
+            data.extend_from_slice(&buf[..n]);
+        }
+    }
+}
+
+pub(crate) fn run(
+    path: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<_> = std::env::split_paths(&inherited).collect();
+    if let Some(parent) = path.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    paths.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(Into::into));
+    let path_env = std::env::join_paths(paths)
+        .map_err(|_| anyhow::anyhow!("Invalid executable search path"))?;
+    let mut cmd = Command::new(path);
+    // GUI 启动保留必要运行环境，但不继承其他账户令牌或 NODE_OPTIONS 等注入入口。
+    cmd.env_clear();
+    for key in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "XDG_CONFIG_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.args(args)
+        .env("PATH", path_env)
+        .envs(env.iter().cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn().map_err(|_| {
+        anyhow::anyhow!("Cannot launch CLI; install it and configure an absolute executable path")
+    })?;
+    let pid = child.id() as i32;
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    if nonblocking(&stdout)
+        .and_then(|_| nonblocking(&stderr))
+        .and_then(|_| nonblocking(&stdin))
+        .is_err()
+    {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("Cannot configure bounded CLI pipes");
+    }
+    let out_flag = overflow.clone();
+    let err_flag = overflow.clone();
+    let out = thread::spawn(move || drain(stdout, out_flag, deadline));
+    let err = thread::spawn(move || drain(stderr, err_flag, deadline));
+    let input = zeroize::Zeroizing::new(input.to_vec());
+    let writer = thread::spawn(move || -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < input.len() {
+            before_deadline(deadline)?;
+            match stdin.write(&input[offset..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    });
+    let result = loop {
+        if overflow.load(Ordering::Relaxed) {
+            break Err(anyhow::anyhow!("CLI output exceeded safety limit"));
+        }
+        if Instant::now() >= deadline {
+            break Err(anyhow::anyhow!(
+                "CLI timed out; remote result may be uncertain"
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break Err(anyhow::anyhow!("Cannot wait for CLI")),
+        }
+    };
+    // 即使主进程退出也关闭同组后代；逃离该组的后代由管道线程统一截止时间限制。
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let write_result = writer.join();
+    let output = out.join();
+    let errors = err.join();
+    let status = result?;
+    if overflow.load(Ordering::Relaxed) {
+        bail!("CLI output exceeded safety limit");
+    }
+    if !status.success() {
+        bail!("CLI command failed; check authentication and configuration");
+    }
+    if !matches!(write_result, Ok(Ok(()))) || !matches!(errors, Ok(Ok(_))) {
+        bail!("CLI I/O failed");
+    }
+    output
+        .map_err(|_| anyhow::anyhow!("CLI reader failed"))?
+        .map_err(|_| anyhow::anyhow!("CLI I/O failed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+    fn script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fake");
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, p)
+    }
+    #[test]
+    fn passes_stdin_and_env_without_shell_interpolation() {
+        let (_d, p) = script("printf '%s|' \"$TOKEN\"; cat; printf '%s' \"$1\"");
+        let out = run(
+            &p,
+            &["$(echo unsafe)".into()],
+            &[("TOKEN".into(), "secret".into())],
+            b"json",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(out, b"secret|json$(echo unsafe)");
+    }
+    #[test]
+    fn timeout_kills_descendants_and_reaps() {
+        let (_d, p) = script("sleep 30 & wait");
+        let now = Instant::now();
+        assert!(run(&p, &[], &[], b"", Duration::from_millis(80)).is_err());
+        assert!(now.elapsed() < Duration::from_secs(2));
+    }
+    #[test]
+    fn detached_descendant_cannot_hold_pipes_past_deadline() {
+        // 孙进程创建新会话后逃离进程组，但只活两秒，不在测试机留下长期进程。
+        let (_d, p) = script(
+            "python3 - <<'PY'\nimport os,time\nr,w=os.pipe()\nif os.fork()==0:\n os.setsid()\n os.write(w,b'ready')\n time.sleep(2)\nelse:\n os.read(r,5)\nPY",
+        );
+        let now = Instant::now();
+        let result = run(&p, &[], &[], b"", Duration::from_millis(700));
+        assert!(now.elapsed() < Duration::from_millis(1500));
+        assert!(result.is_err());
+    }
+    #[test]
+    fn error_never_contains_output_or_arguments() {
+        let (_d, p) = script("echo secret; echo secret >&2; exit 4");
+        let e = run(&p, &["secret".into()], &[], b"", Duration::from_secs(2)).unwrap_err();
+        assert!(!format!("{e:?}").contains("secret"));
+    }
+    #[test]
+    fn output_limit_rejects_instead_of_truncating_json() {
+        let (_d, p) = script("yes X");
+        assert!(run(&p, &[], &[], b"", Duration::from_secs(2)).is_err());
+    }
+}
