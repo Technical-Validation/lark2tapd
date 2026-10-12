@@ -109,7 +109,7 @@ impl Draft {
         if self.title_prefix.is_empty() {
             return self.title.clone();
         }
-        let prefix = format!("【{}】", self.title_prefix);
+        let prefix = &self.title_prefix;
         format!("{prefix}{}", self.title.trim_start_matches(prefix.as_str()))
     }
 }
@@ -260,11 +260,57 @@ struct StoredState {
     key: String,
     payload: String,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct State {
+    // 缺失版本只代表旧库；新建状态从原样前缀版本开始。
+    #[serde(default)]
+    prefix_format_version: u32,
     snapshot: Snapshot,
     #[serde(default)]
     draft_sources: BTreeMap<String, SourceTask>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            prefix_format_version: 1,
+            snapshot: Snapshot::default(),
+            draft_sources: BTreeMap::new(),
+        }
+    }
+}
+impl State {
+    fn migrate_prefixes(&mut self) -> Result<bool> {
+        ensure!(
+            self.prefix_format_version <= 1,
+            "Unsupported prefix format version"
+        );
+        if self.prefix_format_version == 1 {
+            return Ok(false);
+        }
+        // 只转换选择值，不修改已同步标题或源文；保持旧包装和精确去重语义。
+        let wrap = |prefix: &mut String| {
+            if !prefix.is_empty() {
+                *prefix = format!("【{prefix}】");
+            }
+        };
+        for prefixes in self.snapshot.settings.workspace_prefixes.values_mut() {
+            for prefix in prefixes {
+                wrap(prefix);
+            }
+        }
+        for record in &mut self.snapshot.records {
+            wrap(&mut record.title_prefix);
+            for draft in [&mut record.draft, &mut record.last_draft]
+                .into_iter()
+                .flatten()
+            {
+                wrap(&mut draft.title_prefix);
+            }
+        }
+        self.prefix_format_version = 1;
+        Ok(true)
+    }
 }
 
 /// 一个数据库仅由一个后台 actor 持有；调用方按账户及 mock/live 隔离路径。
@@ -293,11 +339,16 @@ impl Engine {
             .first()
             .exec(&mut db)
             .await?;
-        let state = match row {
+        let mut state: State = match row {
             Some(row) => serde_json::from_str(&row.payload)?,
             None => State::default(),
         };
-        Ok(Self { db, state })
+        let migrated = state.migrate_prefixes()?;
+        let mut engine = Self { db, state };
+        if migrated {
+            engine.persist(engine.state.clone()).await?;
+        }
+        Ok(engine)
     }
     pub fn snapshot(&self) -> &Snapshot {
         &self.state.snapshot
@@ -861,13 +912,10 @@ fn validate_due(due: &Option<String>) -> Result<()> {
 }
 fn validate_prefix(prefix: &str) -> Result<()> {
     ensure!(
-        !prefix.is_empty()
-            && prefix.trim() == prefix
-            && prefix.chars().count() <= 64
-            && !prefix
-                .chars()
-                .any(|c| c.is_control() || "【】[]".contains(c)),
-        "Title prefixes must be 1..64 trimmed characters without control characters or brackets"
+        !prefix.trim().is_empty()
+            && prefix.chars().count() <= 66
+            && !prefix.chars().any(char::is_control),
+        "Title prefixes must be 1..66 characters, contain non-whitespace text, and have no control characters"
     );
     Ok(())
 }
@@ -1108,5 +1156,7 @@ fn mock_target(id: String, kind: String, draft: &Draft, source: &SourceTask) -> 
         due: draft.due.clone(),
     }
 }
+#[cfg(test)]
+mod prefix_tests;
 #[cfg(test)]
 mod tests;

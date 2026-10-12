@@ -80,14 +80,9 @@ pub enum Preference {
     Theme(String),
     Polling(bool),
     PollMinutes(u32),
-    DefaultDestination {
-        workspace: String,
-        owner: String,
-    },
-    WorkspacePrefixes {
-        workspace: String,
-        prefixes: Vec<String>,
-    },
+    DefaultDestination { workspace: String, owner: String },
+    AddWorkspacePrefix { workspace: String, prefix: String },
+    RemoveWorkspacePrefix { workspace: String, prefix: String },
 }
 
 pub enum Event {
@@ -406,7 +401,9 @@ fn field(job: &Job) -> &'static str {
         Job::Check(CliTool::Tapd) => "tapd",
         Job::SetPreference(Preference::PollMinutes(_) | Preference::Polling(_)) => "poll",
         Job::SetPreference(Preference::DefaultDestination { .. }) => "destination",
-        Job::SetPreference(Preference::WorkspacePrefixes { .. }) => "prefixes",
+        Job::SetPreference(
+            Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. },
+        ) => "prefixes",
         Job::CheckWorkspace(_) | Job::AddWorkspace(_) => "new-workspace",
         Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login => "credentials",
         Job::LocalFile { .. } | Job::PastedImage { .. } => "attachments",
@@ -429,11 +426,18 @@ fn patch(settings: &mut Settings, preference: Preference) -> Result<()> {
             settings.workspace_id = workspace;
             settings.owner = owner;
         }
-        Preference::WorkspacePrefixes {
-            workspace,
-            prefixes,
-        } => {
-            settings.workspace_prefixes.insert(workspace, prefixes);
+        // 单项操作基于 actor 最新状态，不能用 UI 的旧快照覆盖并发排队的修改。
+        Preference::AddWorkspacePrefix { workspace, prefix } => {
+            settings
+                .workspace_prefixes
+                .entry(workspace)
+                .or_default()
+                .push(prefix);
+        }
+        Preference::RemoveWorkspacePrefix { workspace, prefix } => {
+            if let Some(prefixes) = settings.workspace_prefixes.get_mut(&workspace) {
+                prefixes.retain(|value| value != &prefix);
+            }
         }
     }
     Ok(())
@@ -816,7 +820,7 @@ pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
                                     anyhow::ensure!(directory.workspaces.iter().any(|w| &w.id == workspace), "Select a verified project");
                                     anyhow::ensure!(owner.is_empty() || directory.members.get(workspace).is_some_and(|c| c.items.iter().any(|m| &m.account == owner)), "Select a current project member");
                                 }
-                                if matches!(p, Preference::WorkspacePrefixes { .. }) {
+                                if matches!(p, Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. }) {
                                     anyhow::ensure!(profile == namespace, "Account changed; refresh project options");
                                 }
                                 let mut next = settings.clone();

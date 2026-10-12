@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/core", "crates/bridge", "crates/desktop"]
+exclude = ["vendor/zorite-editor"]
 resolver = "2"
 
 [workspace.package]
@@ -20,3 +21,6 @@ debug = 0
 
 [profile.test]
 debug = 0
+
+[patch.crates-io]
+zorite-editor = { path = "vendor/zorite-editor" }

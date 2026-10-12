@@ -222,12 +222,12 @@ impl Workspace {
             values
                 .into_iter()
                 .map(|id| Choice {
-                    label: format!("【{id}】"),
+                    label: id.clone(),
                     id,
                 })
                 .collect(),
             value,
-            format!("【{value}】"),
+            value.to_owned(),
             window,
             cx,
         );
@@ -266,18 +266,11 @@ impl Workspace {
             cx,
         );
     }
-    pub(super) fn load_prefix_form(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = selected(&self.prefix_workspace, cx);
-        let text = self
-            .model
-            .read(cx)
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.settings.workspace_prefixes.get(&workspace))
-            .map(|v| v.join("\n"))
-            .unwrap_or_default();
+    pub(super) fn load_prefix_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 切换项目或确认保存后重新开始；已有前缀只从持久化列表展示。
+        self.new_prefix_open = false;
         self.prefix_options
-            .update(cx, |s, cx| s.set_value(text, window, cx));
+            .update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
     }
 }

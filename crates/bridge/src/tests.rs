@@ -361,7 +361,7 @@ else:
     );
     let mut d = draft();
     d.description = "# Heading\n\n**bold**".into();
-    d.title_prefix = "需求".into();
+    d.title_prefix = "【需求】".into();
     g.create_target(&d, &source()).unwrap();
 }
 #[test]

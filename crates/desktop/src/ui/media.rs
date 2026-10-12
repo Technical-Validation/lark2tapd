@@ -3,7 +3,7 @@ use super::*;
 use anyhow::{Result, ensure};
 use std::io::Cursor;
 
-fn normalized_png(bytes: &[u8]) -> Result<Vec<u8>> {
+fn bounded_image(bytes: &[u8]) -> Result<image::DynamicImage> {
     ensure!(bytes.len() <= 20 * 1024 * 1024, "Image exceeds 20 MiB");
     let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let (w, h) = reader.into_dimensions()?;
@@ -17,10 +17,22 @@ fn normalized_png(bytes: &[u8]) -> Result<Vec<u8>> {
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(64 * 1024 * 1024);
     reader.limits(limits);
-    let decoded = reader.decode()?;
+    Ok(reader.decode()?)
+}
+
+fn normalized_png(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut output = Cursor::new(Vec::new());
-    decoded.write_to(&mut output, image::ImageFormat::Png)?;
+    bounded_image(bytes)?.write_to(&mut output, image::ImageFormat::Png)?;
     Ok(output.into_inner())
+}
+
+// GPUI 的渲染缓冲使用 BGRA；所有解码仍先经过相同的大小与内存限制。
+fn rendered_image(bytes: &[u8]) -> Result<Arc<RenderImage>> {
+    let mut pixels = bounded_image(bytes)?.into_rgba8();
+    for pixel in pixels.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Ok(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
 fn image_reference(attachment: &DraftAttachment) -> String {
@@ -45,7 +57,7 @@ impl Workspace {
                 images
                     .get(uri.as_ref())
                     .cloned()
-                    .map(ImageSource::Image)
+                    .map(ImageSource::Render)
                     .unwrap_or_else(|| ImageSource::Image(blocked.clone()))
             })
             .on_link_click(|_, _, _, _| {})
@@ -93,6 +105,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.can_edit_description(cx) {
+            return true;
+        }
         // Finder 复制图片提供文件条目而不是图像条目；不能回退成泄露本机路径的文本。
         if let Some(paths) = item.entries().iter().find_map(|e| {
             if let ClipboardEntry::ExternalPaths(p) = e {
@@ -143,8 +158,9 @@ impl Workspace {
             self.next_paste
         );
         self.pending_pastes.insert(marker.clone());
-        self.description
-            .update(cx, |s, cx| s.replace(marker.clone(), window, cx));
+        self.description.update(cx, |s, cx| {
+            s.replace_text_in_range(None, &marker, window, cx)
+        });
         let conversion = cx.background_executor().spawn(async move {
             let png = normalized_png(&bytes)?;
             ensure!(
@@ -175,11 +191,17 @@ impl Workspace {
                         cx,
                     ),
                     Err(error) => {
-                        this.pending_pastes.remove(&marker);
-                        let text = this.description.read(cx).value().replace(&marker, "");
-                        this.description
-                            .update(cx, |s, cx| s.set_value(text, window, cx));
-                        this.form_error("attachments", error.to_string(), cx);
+                        this.reject_attachment(
+                            &MediaFailure {
+                                guid,
+                                profile,
+                                session,
+                                marker: Some(marker),
+                                message: error.to_string(),
+                            },
+                            window,
+                            cx,
+                        );
                     }
                 }
             });
@@ -199,21 +221,30 @@ impl Workspace {
         {
             return;
         }
+        if self.description.read(cx).is_composing() {
+            self.deferred_media
+                .push(DeferredMedia::Ready(ready.clone()));
+            return;
+        }
         if ready.marker.is_none() {
             self.finish_file();
         }
         if let Some(marker) = &ready.marker {
             self.pending_pastes.remove(marker);
-            if !self.description.read(cx).value().contains(marker) {
+            if !self.description.read(cx).text().contains(marker) {
+                // 用户已删除图片：不重新插入，也清理历史里的失效占位符。
+                self.description.update(cx, |s, cx| {
+                    s.resolve_placeholder(marker, "", cx);
+                });
                 return;
             }
         }
         if !self.attachments.iter().any(|a| a.id == ready.attachment.id) {
             if self.attachments.len() >= 10 {
                 if let Some(marker) = &ready.marker {
-                    let text = self.description.read(cx).value().replace(marker, "");
-                    self.description
-                        .update(cx, |s, cx| s.set_value(text, window, cx));
+                    self.description.update(cx, |s, cx| {
+                        s.resolve_placeholder(marker, "", cx);
+                    });
                 }
                 self.form_error(
                     "attachments",
@@ -230,21 +261,13 @@ impl Workspace {
             self.attachments.push(ready.attachment.clone());
         }
         if let Some(marker) = &ready.marker {
-            let text = self
-                .description
-                .read(cx)
-                .value()
-                .replace(marker, &image_reference(&ready.attachment));
-            self.description
-                .update(cx, |s, cx| s.set_value(text, window, cx));
+            self.description.update(cx, |s, cx| {
+                s.resolve_placeholder(marker, &image_reference(&ready.attachment), cx);
+            });
         } else if ready.attachment.is_image {
-            let text = format!(
-                "{}\n\n{}",
-                self.description.read(cx).value(),
-                image_reference(&ready.attachment)
-            );
+            let text = format!("\n\n{}", image_reference(&ready.attachment));
             self.description
-                .update(cx, |s, cx| s.set_value(text, window, cx));
+                .update(cx, |s, cx| s.append_text(&text, cx));
         }
         self.load_images(window, cx);
         cx.notify();
@@ -252,7 +275,7 @@ impl Workspace {
     pub(super) fn reject_attachment(
         &mut self,
         failure: &MediaFailure,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.selected.as_ref() != Some(&failure.guid)
@@ -261,14 +284,19 @@ impl Workspace {
         {
             return;
         }
+        if self.description.read(cx).is_composing() {
+            self.deferred_media
+                .push(DeferredMedia::Failed(failure.clone()));
+            return;
+        }
         if failure.marker.is_none() {
             self.finish_file();
         }
         if let Some(marker) = &failure.marker {
             self.pending_pastes.remove(marker);
-            let text = self.description.read(cx).value().replace(marker, "");
-            self.description
-                .update(cx, |s, cx| s.set_value(text, window, cx));
+            self.description.update(cx, |s, cx| {
+                s.resolve_placeholder(marker, "", cx);
+            });
         }
         self.form_error("attachments", failure.message.clone(), cx);
         cx.notify();
@@ -331,8 +359,7 @@ impl Workspace {
             let attachment_id = attachment.id.clone();
             let read = cx.background_executor().spawn(async move {
                 let bytes = lark2tapd_core::read_attachment(&root, &attachment)?;
-                let png = normalized_png(&bytes)?;
-                Ok::<_, anyhow::Error>(Arc::new(Image::from_bytes(ImageFormat::Png, png)))
+                rendered_image(&bytes)
             });
             cx.spawn_in(window, async move |this, cx| {
                 let result = read.await;
@@ -350,6 +377,7 @@ impl Workspace {
                     match result {
                         Ok(image) => {
                             this.images.insert(key, image);
+                            this.refresh_editor_images(cx);
                         }
                         Err(e) => this.form_error("attachments", e.to_string(), cx),
                     }
@@ -370,6 +398,19 @@ mod tests {
         assert!(normalized_png(b"not an image").is_err());
         assert!(normalized_png(&vec![0; 20 * 1024 * 1024 + 1]).is_err());
     }
+    #[test]
+    fn native_render_image_uses_bgra_without_losing_alpha() {
+        let mut bytes = Cursor::new(Vec::new());
+        let rgba = image::RgbaImage::from_pixel(1, 1, image::Rgba([240, 30, 10, 128]));
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image = rendered_image(bytes.get_ref()).unwrap();
+        assert_eq!(image.as_bytes(0).unwrap(), &[10, 30, 240, 128]);
+        assert_eq!(image.size(0), size(DevicePixels(1), DevicePixels(1)));
+        assert!(rendered_image(b"not an image").is_err());
+    }
+
     #[test]
     fn valid_image_is_converted_to_bounded_png() {
         let mut bytes = Cursor::new(Vec::new());

@@ -2695,6 +2695,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-bidi"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12ca465817de1670c6c1a830c0f4a0a665434e4d02c30a7ffc6362e0194f9cc9"
+dependencies = [
+ "gpui-pre",
+ "unicode-bidi",
+]
+
+[[package]]
 name = "gpui-component"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4123,6 +4133,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tray-icon",
+ "zorite-editor",
 ]
 
 [[package]]
@@ -10085,6 +10096,22 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zorite-editor"
+version = "0.11.1"
+dependencies = [
+ "gpui-bidi",
+ "gpui-pre",
+ "unicode-segmentation",
+ "zorite-markdown",
+]
+
+[[package]]
+name = "zorite-markdown"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fc00a493a02a84992578fb430aecb8ef8ab6b687f09bb2c48c81c272adeb4b1"
 
 [[package]]
 name = "zune-core"

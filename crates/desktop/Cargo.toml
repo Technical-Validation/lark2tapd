@@ -15,6 +15,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-kit = "=0.7.1"
+zorite-editor = "=0.11.1"
 tray-icon = "0.21.3"
 mac-notification-sys = "0.6"
 

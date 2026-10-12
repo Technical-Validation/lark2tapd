@@ -824,17 +824,15 @@ async fn prefix_configuration_is_atomic_and_commit_preserves_selection() -> Resu
     let gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&path, &gateway).await?;
     let mut settings = serde_json::to_value(engine.snapshot().settings.clone())?;
-    settings["workspace_prefixes"] = serde_json::json!({"demo":["需求"],"demo-2":["其他"]});
+    settings["workspace_prefixes"] = serde_json::json!({"demo":["【需求】"],"demo-2":["其他"]});
     engine
         .save_settings(serde_json::from_value(settings.clone())?)
         .await?;
     for labels in [
         serde_json::json!([" "]),
         serde_json::json!(["需求", "需求"]),
-        serde_json::json!(["【需求】"]),
         serde_json::json!(["a\nb"]),
-        serde_json::json!(["a".repeat(65)]),
-        serde_json::json!([" padded"]),
+        serde_json::json!(["a".repeat(67)]),
     ] {
         let mut invalid = settings.clone();
         invalid["workspace_prefixes"]["demo"] = labels;
@@ -859,7 +857,7 @@ async fn prefix_configuration_is_atomic_and_commit_preserves_selection() -> Resu
     );
     assert_eq!(engine.snapshot(), &before);
     assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
-    value["title_prefix"] = "需求".into();
+    value["title_prefix"] = "【需求】".into();
     value["title"] = "【需求】【需求】人工标题".into();
     let draft: Draft = serde_json::from_value(value)?;
     engine.save_draft(&guid, &draft).await?;
@@ -873,7 +871,7 @@ async fn prefix_configuration_is_atomic_and_commit_preserves_selection() -> Resu
     drop(engine);
     let engine = Engine::open(&path).await?;
     let draft = serde_json::to_value(engine.prepare(&guid)?)?;
-    assert_eq!(draft["title_prefix"], "需求");
+    assert_eq!(draft["title_prefix"], "【需求】");
     assert_eq!(draft["title"], "设计同步流程 · 已更新");
     assert_eq!(
         serde_json::to_value(&engine.snapshot().settings)?["workspace_prefixes"],
@@ -1049,11 +1047,11 @@ fn media_rejects_symlinks_and_hardlinked_cache_entries() -> Result<()> {
     Ok(())
 }
 
-// 固定包装不改写原始编辑值，也不会删除不相干的标题前缀。
+// 原样前缀不改写原始编辑值，也不会删除不相干的标题前缀。
 #[test]
 fn rendered_title_preserves_unrelated_text_and_empty_selection() -> Result<()> {
     let mut draft: Draft = serde_json::from_value(
-        serde_json::json!({"title":"【其他】原文", "title_prefix":"需求", "description":"", "workspace_id":"demo", "owner":"", "due":null}),
+        serde_json::json!({"title":"【其他】原文", "title_prefix":"【需求】", "description":"", "workspace_id":"demo", "owner":"", "due":null}),
     )?;
     assert_eq!(draft.rendered_title(), "【需求】【其他】原文");
     assert_eq!(draft.title, "【其他】原文");

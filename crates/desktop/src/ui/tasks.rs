@@ -1,5 +1,6 @@
 //! 列表只显示摘要；编辑、Markdown 和附件都留在单一任务详情中。
 use super::*;
+use gpui_kit::component::input::{InputGroup, InputGroupAddon, InputGroupInput};
 
 impl Workspace {
     pub(super) fn task_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -20,32 +21,21 @@ impl Workspace {
                     .collect()
             })
             .unwrap_or_default();
-        let title = match self.filter {
-            Filter::Pending => self.tr(cx, "未同步任务", "Unimported tasks"),
-            Filter::Changed => self.tr(cx, "待处理任务", "Needs attention"),
-            Filter::Synced => self.tr(cx, "已同步任务", "Synced tasks"),
-            _ => self.tr(cx, "全部任务", "All tasks"),
-        };
         div()
             .flex()
             .flex_col()
-            .w(px(332.))
+            .w(px(380.))
             .flex_shrink_0()
             .h_full()
             .border_r_1()
             .border_color(cx.theme().border)
+            .child(self.sidebar(cx))
             .child(
-                div()
-                    .p_5()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(div().text_xl().font_semibold().child(title))
-                    .child(
-                        Input::new(&self.search)
-                            .id("task-search")
-                            .aria_label(self.tr(cx, "搜索任务", "Search tasks")),
-                    ),
+                div().px_4().pb_4().flex().flex_col().gap_3().child(
+                    Input::new(&self.search)
+                        .id("task-search")
+                        .aria_label(self.tr(cx, "搜索任务", "Search tasks")),
+                ),
             )
             .child(
                 div()
@@ -67,34 +57,76 @@ impl Workspace {
                         let id = record.source.guid.clone();
                         let selected = self.selected.as_ref() == Some(&id);
                         let summary = task_summary(&record.source);
-                        div()
-                            .id(SharedString::from(format!("task-{id}")))
-                            .rounded_md()
+                        // 原生 Button 包住整张卡片，鼠标和键盘共享同一个选择行为。
+                        Button::new(SharedString::from(format!("select-{id}")))
+                            .accessibility_label(record.source.title.clone())
+                            .ghost()
+                            .w_full()
+                            .h_auto()
                             .p_3()
                             .mb_2()
+                            .text_color(cx.theme().foreground)
                             .border_1()
                             .border_color(if selected {
                                 cx.theme().primary
                             } else {
-                                transparent_black()
+                                cx.theme().border
                             })
-                            .when(selected, |d| d.bg(cx.theme().accent))
+                            .when(selected, |b| b.bg(cx.theme().accent))
                             .child(
-                                Button::new(SharedString::from(format!("select-{id}")))
-                                    .label(record.source.title.clone())
-                                    .ghost()
-                                    .w_full()
-                                    .text_color(cx.theme().foreground)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select(record.clone(), window, cx)
-                                    })),
-                            )
-                            .children(summary.into_iter().map(|value| {
                                 div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(value)
+                                    .w_full()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_left()
+                                            .line_clamp(2)
+                                            .font_semibold()
+                                            .child(record.source.title.clone()),
+                                    )
+                                    .children(summary.into_iter().enumerate().map(
+                                        |(index, value)| {
+                                            let value = if value.is_empty() {
+                                                match index {
+                                                    0 => self
+                                                        .tr(cx, "暂无描述", "No description")
+                                                        .to_owned(),
+                                                    1 => self
+                                                        .tr(
+                                                            cx,
+                                                            "处理人未提供",
+                                                            "Assignee not provided",
+                                                        )
+                                                        .to_owned(),
+                                                    _ => self
+                                                        .tr(
+                                                            cx,
+                                                            "创建时间未提供",
+                                                            "Created time not provided",
+                                                        )
+                                                        .to_owned(),
+                                                }
+                                            } else {
+                                                value
+                                            };
+                                            div()
+                                                .w_full()
+                                                .text_left()
+                                                .line_clamp(2)
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(value)
+                                        },
+                                    )),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select(record.clone(), window, cx)
                             }))
                     })),
             )
@@ -139,26 +171,24 @@ impl Workspace {
         let uncertain = record.uncertain;
         let stale = self.edit_source.as_ref() != Some(&record.source);
         let guid = record.source.guid.clone();
-        let owner = cx.entity().downgrade();
         let partial = record.has_pending_attachments();
-        div().id("detail-scroll").flex_1().min_w_0().h_full().overflow_y_scroll().p_6().flex().flex_col().gap_4()
+        div().id("detail-scroll").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.description_scroll).p_6().flex().flex_col().gap_4()
             .child(div().flex().justify_between().child(div().text_xl().font_semibold().child(self.tr(cx,"任务详情","Task details"))).child(div().text_sm().text_color(cx.theme().muted_foreground).child(if partial{self.tr(cx,"附件待处理","Attachments pending")}else{status_text(model.language(),record.status())})))
-            .child(div().flex().gap_2().child(Button::new("open-source").label(self.tr(cx,"在飞书中打开","Open in Lark")).ghost().disabled(record.source.url.is_empty()).on_click({let url=record.source.url.clone();move |_,_,cx|open_safe_url(&url,cx)}))
+            .child(div().flex().gap_2().child(Button::new("open-source").child(img(lark_icon(cx.theme().is_dark())).size(px(20.))).accessibility_label(self.tr(cx,"在飞书中打开","Open in Lark")).tooltip(self.tr(cx,"在飞书中打开","Open in Lark")).ghost().disabled(record.source.url.is_empty()).on_click({let url=record.source.url.clone();move |_,_,cx|open_safe_url(&url,cx)}))
                 .when_some(record.target.as_ref(),|d,t|d.child(Button::new("open-target").label(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).ghost().disabled(t.url.is_empty()).on_click({let url=t.url.clone();move |_,_,cx|open_safe_url(&url,cx)}))))
             .child(Collapsible::new().open(self.source_open).motion_id("source-details")
                 .child(Button::new("toggle-source-details").label(if self.source_open{self.tr(cx,"收起飞书任务详情","Hide Lark task details")}else{self.tr(cx,"展开飞书任务详情","Show Lark task details")}).ghost().on_click(cx.listener(|this,_,_,cx|{this.source_open = !this.source_open;cx.notify();})))
                 .content(self.source_details(&record.source,cx)))
             .when(stale,|d|d.child(div().flex().flex_col().gap_2().child(self.tr(cx,"来源已变化或草稿尚未加载。","Source changed or the draft is not loaded."))
                 .child(Button::new("reload-source").label(self.tr(cx,"丢弃草稿并重新读取","Discard draft and reload")).disabled(busy||uncertain).on_click(cx.listener({let guid=guid.clone();move |this,_,_,cx|this.reload_source(guid.clone(),cx)})))))
-            .child(field(self.tr(cx,"TAPD 标题","TAPD title"),div().flex().gap_2().child(Select::new(&self.prefix).id("title-prefix").placeholder(self.tr(cx,"无前缀","No prefix")).cleanable(true).w(px(160.)).disabled(busy||uncertain||stale)).child(Input::new(&self.title).id("draft-title").aria_label(self.tr(cx,"标题","Title")).disabled(busy||uncertain||stale))))
-            .child(field(self.tr(cx,"内容 · Markdown","Description · Markdown"),Textarea::new(&self.description).accessibility_id("draft-description").aria_label(self.tr(cx,"Markdown 内容","Markdown description")).h(px(180.)).disabled(busy||uncertain||stale).on_paste(move |item,window,cx|owner.update(cx,|this,cx|this.paste_image(item,window,cx)).unwrap_or(false))))
-            .child(div().id("markdown-content").p_3().rounded_md().border_1().border_color(cx.theme().border).child(self.markdown("rendered-description",self.description.read(cx).value().to_string())))
+            .child(field(self.tr(cx,"TAPD 标题","TAPD title"),InputGroup::new("tapd-title-group").input(InputGroupInput::new(&self.title).id("draft-title").aria_label(self.tr(cx,"标题","Title")).disabled(busy||uncertain||stale)).addon(InputGroupAddon::new("title-prefix-addon").child(Select::new(&self.prefix).id("title-prefix").appearance(false).placeholder(self.tr(cx,"无前缀","No prefix")).cleanable(true).w(px(160.)).disabled(busy||uncertain||stale)))))
+            .child(field(self.tr(cx,"内容 · Markdown","Description · Markdown"),self.description_editor(busy||uncertain||stale,cx)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.tr(cx,"支持粘贴图片。仅显示本任务的本地图片，外部图片不自动加载。","Paste images here. Only this task’s local images are displayed; external images are not loaded automatically.")))
             .child(Button::new("add-attachments").label(self.tr(cx,"添加附件","Add attachments")).disabled(busy||uncertain||stale).on_click(cx.listener(|this,_,window,cx|this.add_files(window,cx))))
             .children(self.attachments.iter().map(|a|{
                 let uploaded=a.remote_id.as_ref().is_some_and(|v|!v.is_empty())||a.remote_url.as_ref().is_some_and(|v|!v.is_empty());let id=a.id.clone();
                 div().flex().items_center().gap_2().child(div().flex_1().min_w_0().child(a.name.clone())).child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} KB · {}",a.size.div_ceil(1024),if a.uncertain{self.tr(cx,"需核对上传","Verify upload")}else if uploaded{self.tr(cx,"已上传","Uploaded")}else{self.tr(cx,"本地附件","Local attachment")})))
-                    .child(Button::new(SharedString::from(format!("remove-{id}"))).label(self.tr(cx,"移除","Remove")).ghost().disabled(busy||uploaded||a.uncertain).on_click(cx.listener(move |this,_,_,cx|{this.attachments.retain(|v|v.id!=id);this.images.remove(&format!("attachment:{id}"));cx.notify();})))
+                    .child(Button::new(SharedString::from(format!("remove-{id}"))).label(self.tr(cx,"移除","Remove")).ghost().disabled(busy||uploaded||a.uncertain).on_click(cx.listener(move |this,_,_,cx|{this.attachments.retain(|v|v.id!=id);this.images.remove(&format!("attachment:{id}"));this.refresh_editor_images(cx);cx.notify();})))
             }))
             .when(self.pending_files>0||!self.pending_pastes.is_empty(),|d|d.child(div().text_sm().child(self.tr(cx,"正在读取附件…","Reading attachments…"))))
             .child(self.inline_error("attachments",cx))
@@ -238,6 +268,18 @@ impl Workspace {
             })
     }
 }
+// 编译进程序，运行时不请求远端图标或依赖工作目录。
+fn lark_icon(dark: bool) -> Arc<Image> {
+    static ICONS: std::sync::OnceLock<[Arc<Image>; 2]> = std::sync::OnceLock::new();
+    let icons = ICONS.get_or_init(|| {
+        ["#000", "#fff"].map(|color| {
+            let svg = include_str!("../../assets/lark.svg").replace("#000", color);
+            Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
+        })
+    });
+    icons[usize::from(dark)].clone()
+}
+
 fn nonblank(value: &str) -> Option<String> {
     if value.trim().is_empty() {
         None
@@ -264,12 +306,45 @@ fn task_summary(source: &SourceTask) -> Vec<String> {
         .filter_map(|p| nonblank(&p.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut values = Vec::new();
-    if !names.is_empty() {
-        values.push(names);
+    // 摘要按字符截断，不会切断 UTF-8；折叠 Markdown 常见标记与换行。
+    let plain = source
+        .description
+        .split_whitespace()
+        .map(|word| word.trim_matches(['#', '*', '_', '`', '>']))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = plain.chars();
+    let mut description: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        description.push('…');
     }
-    if let Some(time) = local_time(source.metadata.created_at.as_deref()) {
-        values.push(time);
+    vec![
+        description,
+        names,
+        local_time(source.metadata.created_at.as_deref()).unwrap_or_default(),
+    ]
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use std::prelude::v1::test;
+    #[test]
+    fn summary_includes_a_bounded_unicode_description() {
+        let source = SourceTask {
+            guid: "summary".into(),
+            title: "Title".into(),
+            description: format!("# **你好**\n\n{}", "界".repeat(200)),
+            url: String::new(),
+            due: None,
+            completed: false,
+            metadata: Default::default(),
+        };
+        let summary = task_summary(&source);
+        assert!(summary[0].starts_with("你好 界"));
+        assert!(summary[0].ends_with('…'));
+        assert!(summary[0].chars().count() <= 121);
+        assert!(!summary[0].contains('\n'));
     }
-    values
 }

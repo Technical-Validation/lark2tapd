@@ -1,6 +1,8 @@
 //! 真正的 GPUI 输入事件连接后台 actor 和 SQLite；远端服务及上传使用明确 mock。
 use super::*;
 use crate::worker;
+#[path = "prefix_settings_tests.rs"]
+mod prefix_settings;
 use gpui_kit::test::TestWindowExt;
 use std::{
     prelude::v1::test,
@@ -175,9 +177,9 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
     let guid = load_task(&events, &model, &view, handle, cx);
     model.update(cx, |m, cx| {
         m.send(
-            Job::SetPreference(Preference::WorkspacePrefixes {
+            Job::SetPreference(Preference::AddWorkspacePrefix {
                 workspace: "demo".into(),
-                prefixes: vec!["产品 A".into()],
+                prefix: "产品 A".into(),
             }),
             cx,
         )
@@ -212,7 +214,7 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
             .target
             .as_ref()
             .unwrap();
-        assert_eq!(t.title, "【产品 A】直接导入的标题");
+        assert_eq!(t.title, "产品 A直接导入的标题");
         t.id.clone()
     });
     cx.update_window(handle, |_, w, cx| {
@@ -229,7 +231,7 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
             .as_ref()
             .unwrap()
             .title
-            == "【产品 A】同一目标的新标题"
+            == "产品 A同一目标的新标题"
     });
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let engine = lark2tapd_core::Engine::open(&dir.path().join("mock.db"))
@@ -244,6 +246,14 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
 fn polling_autosaves_and_reports_invalid_input_inline(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, view) = setup(cx);
     click(cx, handle, "nav-settings");
+    cx.update_window(handle, |_, w, cx| {
+        w.scroll(
+            "lark-cli-help",
+            ScrollDelta::Pixels(point(px(0.), px(-1100.))),
+            cx,
+        );
+    })
+    .unwrap();
     cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.try_find("save-settings").is_none());
@@ -329,7 +339,7 @@ fn source_details_expand_and_settings_do_not_clobber_draft(cx: &mut TestAppConte
     choose(cx, handle, "draft-owner", "alice");
     let before = cx.read(|cx| view.read(cx).draft(cx));
     click(cx, handle, "nav-settings");
-    click(cx, handle, "nav-pending");
+    click(cx, handle, "back-to-tasks");
     cx.read(|cx| {
         assert_eq!(view.read(cx).draft(cx), before);
     });
@@ -468,11 +478,11 @@ fn attachments_keep_editor_session_and_individual_paste_markers(cx: &mut TestApp
     let a = lark2tapd_core::save_pasted_image(&root, &png_fixture(), "png").unwrap();
     let m1 = "![one](attachment:pending-one)".to_owned();
     let m2 = "![two](attachment:pending-two)".to_owned();
-    cx.update_window(handle, |_, w, cx| {
+    cx.update_window(handle, |_, _w, cx| {
         view.update(cx, |v, cx| {
             v.pending_pastes.extend([m1.clone(), m2.clone()]);
             v.description.update(cx, |s, cx| {
-                s.set_value(format!("before{m1}between{m2}after"), w, cx)
+                s.set_text(format!("before{m1}between{m2}after"), cx)
             });
         })
     })
@@ -549,10 +559,10 @@ fn file_selected_image_is_referenced_and_removed_decode_cannot_return(cx: &mut T
     let session = cx.read(|cx| view.read(cx).editor_session);
     let root = cx.read(|cx| worker::media_root(&model.read(cx).data_root, "mock").unwrap());
     let a = lark2tapd_core::save_pasted_image(&root, &png_fixture(), "png").unwrap();
-    cx.update_window(handle, |_, w, cx| {
+    cx.update_window(handle, |_, _w, cx| {
         view.update(cx, |v, cx| {
             v.description
-                .update(cx, |s, cx| s.set_value("Preserved text", w, cx))
+                .update(cx, |s, cx| s.set_text("Preserved text", cx))
         })
     })
     .unwrap();
@@ -679,7 +689,7 @@ fn pending_paste_reserves_capacity_against_file_batches(cx: &mut TestAppContext)
         view.update(cx, |v, cx| {
             v.pending_pastes.insert(marker.clone());
             v.description.update(cx, |s, cx| {
-                s.set_value(marker.clone(), w, cx);
+                s.set_text(marker.clone(), cx);
                 s.focus(w, cx);
             });
         })
@@ -743,6 +753,14 @@ fn attachment_or_body_failure_is_attention_not_synced(cx: &mut TestAppContext) {
 fn workspace_form_requires_check_for_exact_current_fields(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, _view) = setup(cx);
     click(cx, handle, "nav-settings");
+    cx.update_window(handle, |_, w, cx| {
+        w.scroll(
+            "lark-cli-help",
+            ScrollDelta::Pixels(point(px(0.), px(-1100.))),
+            cx,
+        );
+    })
+    .unwrap();
     click(cx, handle, "add-workspace");
     cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);
@@ -829,3 +847,74 @@ fn cli_test_buttons_remain_clickable_while_busy_and_paths_are_readonly(cx: &mut 
         )
     });
 }
+
+#[gpui_kit::test]
+fn segmented_status_switches_scope_and_settings_returns_to_tasks(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    for (index, expected) in [
+        (1usize, Filter::Changed),
+        (2, Filter::Synced),
+        (0, Filter::Pending),
+    ] {
+        cx.update_window(handle, |_, w, cx| {
+            w.render_frame(cx);
+            w.within("task-status").click(index, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| assert!(view.read(cx).filter == expected));
+    }
+    let mut record = cx.read(|cx| model.read(cx).snapshot.as_ref().unwrap().records[0].clone());
+    record.uncertain = true;
+    assert!(Filter::Changed.matches(&record));
+    assert!(!Filter::Pending.matches(&record));
+    record.in_scope = false;
+    for filter in [Filter::Pending, Filter::Changed, Filter::Synced] {
+        assert!(!filter.matches(&record));
+    }
+    click(cx, handle, "nav-settings");
+    click(cx, handle, "back-to-tasks");
+    cx.read(|cx| assert!(view.read(cx).filter == Filter::Pending));
+}
+
+#[gpui_kit::test]
+fn task_card_summary_area_and_keyboard_activate_same_task(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.selected = None;
+            cx.notify();
+        })
+    });
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        // 点击卡片左侧下方摘要区域，而不是标题文本。
+        let id = SharedString::from(format!("select-{guid}"));
+        let bounds = w.find(id.clone()).bounds();
+        w.click_at(id, point(px(12.), bounds.size.height - px(12.)), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| assert_eq!(view.read(cx).selected.as_ref(), Some(&guid)));
+    pump(&events, &model, cx, |cx| !model.read(cx).busy);
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.selected = None;
+            cx.notify();
+        })
+    });
+    cx.update_window(handle, |_, w, cx| {
+        view.update(cx, |v, cx| v.search.update(cx, |s, cx| s.focus(w, cx)));
+        w.render_frame(cx);
+        w.press("tab", cx);
+        w.press("space", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| assert_eq!(view.read(cx).selected.as_ref(), Some(&guid)));
+}
+
+#[path = "editor_tests.rs"]
+mod native_editor;

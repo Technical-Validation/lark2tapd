@@ -1,4 +1,7 @@
+mod editor;
 mod media;
+use editor::DeferredMedia;
+use zorite_editor::EditorState;
 mod selectors;
 mod settings;
 use gpui_kit::component::{
@@ -26,7 +29,7 @@ use gpui_kit::base::Disableable;
 use gpui_kit::component::{
     ActiveTheme, StyledExt, Theme, ThemeMode,
     button::{Button, ButtonVariants},
-    input::{Input, InputState, Textarea, TextareaState},
+    input::{Input, InputState},
 };
 use gpui_kit::{prelude::*, *};
 use lark2tapd_bridge::Credentials;
@@ -105,7 +108,9 @@ impl Model {
         let field = match &job {
             Job::SetPreference(Preference::PollMinutes(_)) => Some("poll"),
             Job::SetPreference(Preference::DefaultDestination { .. }) => Some("destination"),
-            Job::SetPreference(Preference::WorkspacePrefixes { .. }) => Some("prefixes"),
+            Job::SetPreference(
+                Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. },
+            ) => Some("prefixes"),
             Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
             Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
             Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login => Some("credentials"),
@@ -504,7 +509,6 @@ enum Filter {
     Pending,
     Changed,
     Synced,
-    All,
     Settings,
 }
 impl Filter {
@@ -519,7 +523,6 @@ impl Filter {
                     || matches!(r.status(), SyncStatus::Changed | SyncStatus::Uncertain)
             }
             Self::Synced => r.status() == SyncStatus::Synced && !r.has_pending_attachments(),
-            Self::All => true,
             Self::Settings => false,
         }
     }
@@ -542,7 +545,10 @@ pub struct Workspace {
     pending_seen: u64,
     search: Entity<InputState>,
     title: Entity<InputState>,
-    description: Entity<TextareaState>,
+    description: Entity<EditorState>,
+    editor_appearance: Option<(bool, String)>,
+    description_scroll: ScrollHandle,
+    deferred_media: Vec<DeferredMedia>,
     workspace: Entity<ChoiceState>,
     owner: Entity<ChoiceState>,
     prefix: Entity<ChoiceState>,
@@ -550,13 +556,13 @@ pub struct Workspace {
     settings_workspace: Entity<ChoiceState>,
     settings_owner: Entity<ChoiceState>,
     prefix_workspace: Entity<ChoiceState>,
-    prefix_options: Entity<TextareaState>,
+    prefix_options: Entity<InputState>,
+    new_prefix_open: bool,
     manual_workspace_id: Entity<InputState>,
     manual_workspace_name: Entity<InputState>,
     poll: Entity<InputState>,
     lark_path: Entity<InputState>,
     tapd_path: Entity<InputState>,
-    endpoint: Entity<InputState>,
     app_id: Entity<InputState>,
     app_secret: Entity<InputState>,
     lark_token: Entity<InputState>,
@@ -564,7 +570,7 @@ pub struct Workspace {
     recover_id: Entity<InputState>,
     recover_kind: String,
     attachments: Vec<DraftAttachment>,
-    images: HashMap<String, Arc<Image>>,
+    images: HashMap<String, Arc<RenderImage>>,
     loading_images: BTreeSet<String>,
     pending_pastes: BTreeSet<String>,
     pending_files: usize,
@@ -579,12 +585,8 @@ impl Workspace {
             |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
         )
         .detach();
-        let description = cx.new(|cx| TextareaState::new(window, cx));
-        cx.subscribe(
-            &description,
-            |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
-        )
-        .detach();
+        let description_scroll = ScrollHandle::new();
+        let description = editor::create_description(description_scroll.clone(), window, cx);
         let poll = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe(
             &poll,
@@ -660,9 +662,11 @@ impl Workspace {
                 )
             });
             this.description
-                .update(cx, |s, cx| s.set_value(d.description.clone(), window, cx));
+                .update(cx, |s, cx| s.set_text(d.description.clone(), cx));
+            this.deferred_media.clear();
             this.attachments = d.attachments.clone();
             this.images.clear();
+            this.refresh_editor_images(cx);
             this.loading_images.clear();
             this.load_images(window, cx);
             let workspace = d.workspace_id.clone();
@@ -741,6 +745,7 @@ impl Workspace {
                 this.last_prefixes = settings.workspace_prefixes;
                 let prefix = selected(&this.prefix, cx);
                 this.fill_prefixes(&prefix, window, cx);
+                this.load_prefix_form(window, cx);
             }
             if (!this.edit_profile.is_empty() && this.edit_profile != this.model.read(cx).profile)
                 || this.selected.as_ref().is_some_and(|id| {
@@ -754,7 +759,9 @@ impl Workspace {
                 this.edit_profile.clear();
                 this.attachments.clear();
                 this.images.clear();
+                this.refresh_editor_images(cx);
                 this.pending_pastes.clear();
+                this.deferred_media.clear();
                 this.pending_files = 0;
                 this.pending_file_paths.clear();
             }
@@ -815,6 +822,9 @@ impl Workspace {
             search,
             title: cx.new(|cx| InputState::new(window, cx)),
             description,
+            editor_appearance: None,
+            description_scroll,
+            deferred_media: Vec::new(),
             workspace,
             owner: choice_state(window, cx),
             prefix: choice_state(window, cx),
@@ -822,13 +832,13 @@ impl Workspace {
             settings_workspace,
             settings_owner: choice_state(window, cx),
             prefix_workspace,
-            prefix_options: cx.new(|cx| TextareaState::new(window, cx)),
+            prefix_options: cx.new(|cx| InputState::new(window, cx)),
+            new_prefix_open: false,
             manual_workspace_id: cx.new(|cx| InputState::new(window, cx)),
             manual_workspace_name: cx.new(|cx| InputState::new(window, cx)),
             poll,
             lark_path: cx.new(|cx| InputState::new(window, cx)),
             tapd_path: cx.new(|cx| InputState::new(window, cx)),
-            endpoint: cx.new(|cx| InputState::new(window, cx)),
             app_id: cx.new(|cx| InputState::new(window, cx)),
             app_secret: cx.new(|cx| InputState::new(window, cx).masked(true)),
             lark_token: cx.new(|cx| InputState::new(window, cx).masked(true)),
@@ -895,9 +905,11 @@ impl Workspace {
         self.remote_target = None;
         self.attachments.clear();
         self.images.clear();
+        self.refresh_editor_images(cx);
         self.loading_images.clear();
         set(&self.title, String::new(), window, cx);
-        this_clear_description(&self.description, window, cx);
+        self.description.update(cx, |s, cx| s.set_text("", cx));
+        self.deferred_media.clear();
         self.selected = Some(record.source.guid.clone());
         self.edit_source = None;
         self.edit_profile = self.model.read(cx).profile.clone();
@@ -916,8 +928,10 @@ impl Workspace {
         self.edit_source = None;
         self.attachments.clear();
         self.images.clear();
+        self.refresh_editor_images(cx);
         self.loading_images.clear();
         self.pending_pastes.clear();
+        self.deferred_media.clear();
         self.pending_files = 0;
         self.pending_file_paths.clear();
         self.remote_target = None;
@@ -940,7 +954,6 @@ impl Workspace {
                 (&self.poll, s.poll_minutes.to_string()),
                 (&self.lark_path, s.lark_path),
                 (&self.tapd_path, s.tapd_path),
-                (&self.endpoint, s.tapd_endpoint),
             ] {
                 set(input, value, window, cx);
             }
@@ -952,7 +965,9 @@ impl Workspace {
         }
         cx.notify();
     }
+    // 产品入口与状态分段属于列表栏，不再占用第三个导航栏。
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::tab::{Tab, TabBar};
         let model = self.model.read(cx);
         let records = model
             .snapshot
@@ -960,53 +975,34 @@ impl Workspace {
             .map(|s| s.records.as_slice())
             .unwrap_or(&[]);
         let entries = [
-            (Filter::Pending, "nav-pending", "未同步", "Unimported"),
-            (Filter::Changed, "nav-changed", "待处理", "Needs attention"),
-            (Filter::Synced, "nav-synced", "已同步", "Synced"),
-            (Filter::All, "nav-all", "全部任务", "All tasks"),
+            (Filter::Pending, "未同步", "Unimported"),
+            (Filter::Changed, "待处理", "Attention"),
+            (Filter::Synced, "已同步", "Synced"),
         ];
         div()
             .flex()
             .flex_col()
-            .w(px(184.))
-            .flex_shrink_0()
-            .h_full()
+            .gap_3()
             .p_4()
-            .gap_2()
-            .bg(cx.theme().muted)
             .child(
                 div()
-                    .pt_3()
-                    .pb_6()
-                    .text_lg()
-                    .font_semibold()
-                    .child("Lark → TAPD"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_lg().font_semibold().child("Lark → TAPD"))
+                    .child(
+                        Button::new("nav-settings")
+                            .label(self.tr(cx, "配置", "Settings"))
+                            .ghost()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                            ),
+                    ),
             )
-            .child(
-                div()
-                    .mb_4()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.tr(cx, "飞书任务，一处跟进", "Your tasks, connected")),
-            )
-            .children(entries.into_iter().map(|(filter, id, zh, en)| {
-                let count = records.iter().filter(|r| filter.matches(r)).count();
-                Button::new(id)
-                    .label(format!("{}  {count}", self.tr(cx, zh, en)))
-                    .ghost()
-                    .w_full()
-                    .when(self.filter == filter, |b| b.primary())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.filter = filter;
-                        cx.notify();
-                    }))
-            }))
-            .child(div().flex_1())
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .mb_2()
                     .child(if model.mode == Mode::Mock {
                         self.tr(cx, "演示模式 · 不会写入远端", "Demo · no remote writes")
                     } else {
@@ -1014,18 +1010,31 @@ impl Workspace {
                     }),
             )
             .child(
-                Button::new("nav-settings")
-                    .label(self.tr(cx, "配置中心", "Settings"))
-                    .ghost()
+                TabBar::new("task-status")
+                    .segmented()
                     .w_full()
-                    .when(self.filter == Filter::Settings, |b| b.primary())
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+                    .selected_index(entries.iter().position(|e| e.0 == self.filter).unwrap_or(0))
+                    .children(entries.into_iter().map(|(filter, zh, en)| {
+                        let count = records.iter().filter(|r| filter.matches(r)).count();
+                        Tab::new()
+                            .flex_1()
+                            .label(format!("{} {count}", self.tr(cx, zh, en)))
+                    }))
+                    .on_click(cx.listener(|this, index, _, cx| {
+                        if let Some(filter) =
+                            [Filter::Pending, Filter::Changed, Filter::Synced].get(*index)
+                        {
+                            this.filter = *filter;
+                            cx.notify();
+                        }
+                    })),
             )
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_description(window, cx);
         let model = self.model.read(cx);
         let busy = model.busy;
         let checking = model.activities.contains("tasks");
@@ -1044,7 +1053,6 @@ impl Render for Workspace {
             .font_family(cx.theme().font_family.clone())
             .text_sm()
             .flex()
-            .child(self.sidebar(cx))
             .child(
                 div()
                     .flex_1()
@@ -1061,6 +1069,17 @@ impl Render for Workspace {
                             .items_center()
                             .border_b_1()
                             .border_color(cx.theme().border)
+                            .when(self.filter == Filter::Settings, |d| {
+                                d.child(
+                                    Button::new("back-to-tasks")
+                                        .label(self.tr(cx, "返回任务", "Back to tasks"))
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.filter = Filter::Pending;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -1274,7 +1293,4 @@ fn choice_state(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<Choi
         )
         .searchable(true)
     })
-}
-fn this_clear_description(input: &Entity<TextareaState>, window: &mut Window, cx: &mut App) {
-    input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
 }

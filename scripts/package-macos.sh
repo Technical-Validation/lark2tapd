@@ -13,6 +13,11 @@ fi
 app="$PWD/dist/Lark2Tapd.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "target/$profile/lark2tapd" "$app/Contents/MacOS/lark2tapd"
+# 本地补丁和嵌入图标仍保留上游许可，二进制包也携带归属声明。
+mkdir -p "$app/Contents/Resources/licenses"
+cp THIRD_PARTY_NOTICES.md "$app/Contents/Resources/licenses/"
+cp vendor/zorite-editor/LICENSE "$app/Contents/Resources/licenses/zorite-MIT.txt"
+cp crates/desktop/assets/IconPark-LICENSE "$app/Contents/Resources/licenses/IconPark-Apache-2.0.txt"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
