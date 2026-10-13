@@ -192,8 +192,8 @@ impl Workspace {
                     .tooltip({let label = if partial { self.tr(cx,"附件待处理","Attachments pending") } else { status_text(model.language(),record.status()) }; move |window,cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window,cx) }))
                 .when_some(record.target.as_ref(),|d,t|d.child(Button::new("open-target").label(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).ghost().disabled(t.url.is_empty()).on_click({let url=t.url.clone();move |_,_,cx|open_safe_url(&url,cx)})))
                 .child(Button::new("open-source").child(img(lark_icon(cx.theme().is_dark())).size(px(20.))).accessibility_label(self.tr(cx,"在飞书中打开","Open in Lark")).tooltip(self.tr(cx,"在飞书中打开","Open in Lark")).ghost().disabled(record.source.url.is_empty()).on_click({let url=record.source.url.clone();move |_,_,cx|open_safe_url(&url,cx)})))
-            .child(Collapsible::new().open(self.source_open).motion_id("source-details")
-                .child(Button::new("toggle-source-details").label(if self.source_open{self.tr(cx,"收起飞书任务详情","Hide Lark task details")}else{self.tr(cx,"展开飞书任务详情","Show Lark task details")}).ghost().on_click(cx.listener(|this,_,_,cx|{this.source_open = !this.source_open;cx.notify();})))
+            .child(Collapsible::new().w_full().min_w_0().rounded_md().overflow_hidden().bg(cx.theme().muted).open(self.source_open).motion_id("source-details")
+                .child(Button::new("toggle-source-details").w_full().label(if self.source_open{self.tr(cx,"收起飞书任务详情","Hide Lark task details")}else{self.tr(cx,"展开飞书任务详情","Show Lark task details")}).ghost().on_click(cx.listener(|this,_,_,cx|{this.source_open = !this.source_open;cx.notify();})))
                 .content(self.source_details(&record.source,cx)))
             .when(stale,|d|d.child(div().flex().flex_col().gap_2().child(self.tr(cx,"来源已变化或草稿尚未加载。","Source changed or the draft is not loaded."))
                 .child(Button::new("reload-source").label(self.tr(cx,"丢弃草稿并重新读取","Discard draft and reload")).disabled(busy||uncertain).on_click(cx.listener({let guid=guid.clone();move |this,_,_,cx|this.reload_source(guid.clone(),cx)})))))
@@ -241,6 +241,11 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         div()
+            .debug_selector(|| "source-detail-panel".into())
+            .w_full()
+            .min_w_0()
+            .rounded_md()
+            .overflow_hidden()
             .p_3()
             .bg(cx.theme().muted)
             .flex()
@@ -284,9 +289,10 @@ impl Workspace {
             })
     }
 }
-// 与状态分段共享实心圆勾；是否完成沿用 Filter 的正文及附件判定。
+// 实心圆勾只用于详情状态；是否完成沿用 Filter 的正文及附件判定。
 pub(super) fn synced_icon(cx: &App) -> impl IntoElement {
     div()
+        .debug_selector(|| "synced-icon".into())
         .size(px(16.))
         .flex_shrink_0()
         .rounded_full()

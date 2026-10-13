@@ -1,9 +1,11 @@
 //! 真正的 GPUI 输入事件连接后台 actor 和 SQLite；远端服务及上传使用明确 mock。
 use super::*;
 use crate::worker;
+#[path = "layout_tests.rs"]
+mod layout;
 #[path = "prefix_settings_tests.rs"]
 mod prefix_settings;
-use gpui_kit::component::WindowExt;
+use gpui_kit::component::{Theme, WindowExt};
 use gpui_kit::test::TestWindowExt;
 use std::{
     prelude::v1::test,

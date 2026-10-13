@@ -1,5 +1,8 @@
+mod appearance;
+use appearance::apply_theme;
 mod editor;
 mod feedback;
+mod last_check;
 mod media;
 use editor::DeferredMedia;
 use zorite_editor::EditorState;
@@ -28,7 +31,7 @@ use crate::{
 };
 use gpui_kit::base::Disableable;
 use gpui_kit::component::{
-    ActiveTheme, StyledExt, Theme, ThemeMode,
+    ActiveTheme, StyledExt, ThemeMode,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
 };
@@ -583,37 +586,6 @@ fn show_settings(cx: &mut App) {
     }
 }
 
-fn apply_theme(mode: &str, cx: &mut App) {
-    match mode {
-        "light" => Theme::change(ThemeMode::Light, None, cx),
-        "dark" => Theme::change(ThemeMode::Dark, None, cx),
-        _ => Theme::sync_system_appearance(None, cx),
-    }
-    Theme::update(cx, |theme| {
-        // 马尔斯绿的深浅变体保证小字号按钮文字对比度，焦点环保留品牌原色。
-        let dark = theme.mode == ThemeMode::Dark;
-        theme.colors.primary = rgb(if dark { 0x59c3bc } else { 0x006764 }).into();
-        theme.colors.primary_foreground = rgb(if dark { 0x171b1b } else { 0xffffff }).into();
-        theme.colors.ring = rgb(0x008c8c).into();
-        // Kit 的按钮采用独立令牌，不能只改 primary；同时覆盖交互状态和次级操作。
-        theme.colors.button_primary = theme.colors.primary;
-        theme.colors.button_primary_foreground = theme.colors.primary_foreground;
-        theme.colors.button_primary_hover = rgb(if dark { 0x71d1ca } else { 0x007873 }).into();
-        theme.colors.button_primary_active = rgb(if dark { 0x46aaa4 } else { 0x00534f }).into();
-        theme.colors.button_secondary = rgb(if dark { 0x103d39 } else { 0xedf7f5 }).into();
-        theme.colors.button_secondary_foreground = theme.colors.foreground;
-        theme.colors.button_secondary_hover = rgb(if dark { 0x194d47 } else { 0xd6efea }).into();
-        theme.colors.button_secondary_active = rgb(if dark { 0x235e57 } else { 0xbfe5de }).into();
-        theme.colors.secondary_foreground = theme.colors.foreground;
-        theme.colors.accent_foreground = theme.colors.foreground;
-        theme.colors.link = theme.colors.foreground;
-        theme.colors.link_hover = theme.colors.foreground;
-        theme.colors.link_active = theme.colors.foreground;
-        theme.font_size = px(14.);
-        theme.radius = px(7.);
-    });
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filter {
     Pending,
@@ -638,6 +610,7 @@ impl Filter {
 
 pub struct Workspace {
     model: Entity<Model>,
+    last_check: Entity<last_check::LastCheck>,
     filter: Filter,
     is_settings: bool,
     settings_loaded: bool,
@@ -918,6 +891,7 @@ impl Workspace {
             })
             .detach();
         let mut this = Self {
+            last_check: cx.new(|cx| last_check::LastCheck::new(model.clone(), cx)),
             model,
             filter: Filter::Pending,
             is_settings: false,
@@ -1097,51 +1071,26 @@ impl Workspace {
             (Filter::Changed, "待处理", "Attention"),
             (Filter::Synced, "已同步", "Synced"),
         ];
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_lg().font_semibold().child("Lark → TAPD")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if model.mode == Mode::Mock {
-                        self.tr(cx, "演示模式 · 不会写入远端", "Demo · no remote writes")
-                    } else {
-                        self.tr(cx, "真实连接 · 手动确认写入", "Live · confirm every write")
-                    }),
-            )
-            .child(
-                TabBar::new("task-status")
-                    .segmented()
-                    .w_full()
-                    .selected_index(entries.iter().position(|e| e.0 == self.filter).unwrap_or(0))
-                    .children(entries.into_iter().map(|(filter, zh, en)| {
-                        let count = records.iter().filter(|r| filter.matches(r)).count();
-                        Tab::new()
-                            .flex_1()
-                            .label(format!("{} {count}", self.tr(cx, zh, en)))
-                            .when(filter == Filter::Synced, |tab| {
-                                tab.child(tasks::synced_icon(cx))
-                            })
-                    }))
-                    .on_click(cx.listener(|this, index, _, cx| {
-                        if let Some(filter) =
-                            [Filter::Pending, Filter::Changed, Filter::Synced].get(*index)
-                        {
-                            this.filter = *filter;
-                            cx.notify();
-                        }
-                    })),
-            )
+        div().flex().flex_col().gap_3().p_4().child(
+            TabBar::new("task-status")
+                .segmented()
+                .w_full()
+                .selected_index(entries.iter().position(|e| e.0 == self.filter).unwrap_or(0))
+                .children(entries.into_iter().map(|(filter, zh, en)| {
+                    let count = records.iter().filter(|r| filter.matches(r)).count();
+                    Tab::new()
+                        .flex_1()
+                        .label(format!("{} {count}", self.tr(cx, zh, en)))
+                }))
+                .on_click(cx.listener(|this, index, _, cx| {
+                    if let Some(filter) =
+                        [Filter::Pending, Filter::Changed, Filter::Synced].get(*index)
+                    {
+                        this.filter = *filter;
+                        cx.notify();
+                    }
+                })),
+        )
     }
 }
 
@@ -1171,11 +1120,6 @@ impl Render for Workspace {
         let busy = model.busy;
         let checking = model.activities.contains("tasks");
         let is_mock = model.mode == Mode::Mock;
-        let checked = model
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.last_checked.clone())
-            .unwrap_or_else(|| self.tr(cx, "尚未检查", "Not checked yet").into());
         div()
             .size_full()
             .bg(cx.theme().background)
@@ -1200,15 +1144,40 @@ impl Render for Workspace {
                             .border_b_1()
                             .border_color(cx.theme().border)
                             .child(
+                                // 应用标识与运行模式属于全局栏，侧栏只保留筛选和搜索。
                                 div()
                                     .flex_1()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "{}: {checked}",
-                                        self.tr(cx, "最近检查", "Last check")
-                                    )),
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "app-identity".into())
+                                            .text_lg()
+                                            .font_semibold()
+                                            .child("Lark → TAPD"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .truncate()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if is_mock {
+                                                self.tr(
+                                                    cx,
+                                                    "演示模式 · 不会写入远端",
+                                                    "Demo · no remote writes",
+                                                )
+                                            } else {
+                                                self.tr(
+                                                    cx,
+                                                    "真实连接 · 手动确认写入",
+                                                    "Live · confirm every write",
+                                                )
+                                            }),
+                                    ),
                             )
+                            .child(self.last_check.clone())
                             .child(
                                 div()
                                     .id("check-status")
