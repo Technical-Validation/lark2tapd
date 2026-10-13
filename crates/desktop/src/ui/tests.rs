@@ -1,6 +1,8 @@
 //! 真正的 GPUI 输入事件连接后台 actor 和 SQLite；远端服务及上传使用明确 mock。
 use super::*;
 use crate::worker;
+#[path = "connection_tests.rs"]
+mod connections;
 #[path = "layout_tests.rs"]
 mod layout;
 #[path = "prefix_settings_tests.rs"]
@@ -49,6 +51,9 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
     let model = cx.new(|_| Model {
         snapshot: None,
         busy: false,
+        connections_loaded: false,
+        lark_connection: ServiceConnection::default(),
+        tapd_connection: ServiceConnection::default(),
         notice: String::new(),
         error: false,
         pending_error: None,
@@ -654,7 +659,7 @@ fn file_selected_image_is_referenced_and_removed_decode_cannot_return(cx: &mut T
 }
 
 #[gpui_kit::test]
-fn successful_action_events_clear_credentials_and_install_confirmation(cx: &mut TestAppContext) {
+fn saving_lark_clears_only_its_credential_inputs(cx: &mut TestAppContext) {
     let (_dir, _events, model, handle, _view) = setup(cx);
     let (handle, view) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
@@ -664,25 +669,18 @@ fn successful_action_events_clear_credentials_and_install_confirmation(cx: &mut 
         })
     })
     .unwrap();
-    let snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
     cx.update(|cx| {
         model.update(cx, |m, cx| {
-            m.receive(
-                Event::State {
-                    mode: Mode::Mock,
-                    snapshot,
-                    profile: "mock".into(),
-                    message: "credentials_saved",
-                    new_count: 0,
-                },
-                cx,
-            )
+            m.receive(Event::CredentialsSaved(CliTool::Lark), cx)
         })
     });
     cx.run_until_parked();
     cx.read(|cx| {
         assert!(view.read(cx).app_secret.read(cx).value().is_empty());
-        assert!(view.read(cx).tapd_token.read(cx).value().is_empty());
+        assert_eq!(
+            view.read(cx).tapd_token.read(cx).value().as_ref(),
+            "dummy-token"
+        );
     });
 }
 

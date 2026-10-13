@@ -1,7 +1,11 @@
 mod appearance;
 use appearance::apply_theme;
+mod connections;
+use connections::{CredentialChange, ServiceConnection};
 mod editor;
 mod feedback;
+mod focus_scroll;
+mod help;
 mod last_check;
 mod media;
 use editor::DeferredMedia;
@@ -77,6 +81,9 @@ fn editor_session() -> u64 {
 pub struct Model {
     pub snapshot: Option<Snapshot>,
     pub busy: bool,
+    connections_loaded: bool,
+    lark_connection: ServiceConnection,
+    tapd_connection: ServiceConnection,
     pub notice: String,
     pub error: bool,
     pending_error: Option<String>,
@@ -99,6 +106,7 @@ impl EventEmitter<Editor> for Model {}
 impl EventEmitter<MediaReady> for Model {}
 impl EventEmitter<MediaFailure> for Model {}
 impl EventEmitter<RemoteContext> for Model {}
+impl EventEmitter<CredentialChange> for Model {}
 impl Model {
     fn send(&mut self, job: Job, cx: &mut Context<Self>) {
         self.send_at(job, self.profile.clone(), cx);
@@ -124,12 +132,23 @@ impl Model {
             ) => Some("prefixes"),
             Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
             Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
-            Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login => Some("credentials"),
+            Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => {
+                Some(connections::field_key(*tool))
+            }
+            Job::LoadConnectionStatus => Some("connection-status"),
             Job::LocalFile { .. } | Job::PastedImage { .. } => Some("attachments"),
             _ => None,
         };
         if let Some(field) = field {
             self.errors.remove(field);
+        }
+        // 提交即锁定该服务，避免后台 Activity 到达前的重复保存/清除。
+        if let Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) = &job {
+            if self.activities.contains(connections::field_key(*tool)) {
+                return;
+            }
+            self.activities.insert(connections::field_key(*tool).into());
+            self.connection_mut(*tool).verified = false;
         }
         if matches!(&job, Job::Submit(..)) {
             if self.activities.contains("submit") {
@@ -171,6 +190,33 @@ impl Model {
                 }
             );
         match event {
+            Event::ConnectionStatus {
+                lark_saved,
+                tapd_saved,
+            } => {
+                self.connections_loaded = true;
+                self.lark_connection.saved = lark_saved;
+                self.tapd_connection.saved = tapd_saved;
+            }
+            Event::CredentialsSaved(tool) => {
+                self.connection_mut(tool).saved = true;
+                self.connection_mut(tool).verified = false;
+                cx.emit(CredentialChange {
+                    tool,
+                    cleared: false,
+                });
+            }
+            Event::CredentialsCleared(tool) => {
+                *self.connection_mut(tool) = ServiceConnection::default();
+                match tool {
+                    CliTool::Lark => self.lark_diagnostic.clear(),
+                    CliTool::Tapd => self.tapd_diagnostic.clear(),
+                }
+                cx.emit(CredentialChange {
+                    tool,
+                    cleared: true,
+                });
+            }
             Event::State {
                 mode,
                 snapshot,
@@ -216,10 +262,7 @@ impl Model {
                 if new_count > 0 && !first && mode == Mode::Live {
                     native::notify_new(&snapshot.settings.language, new_count);
                 }
-                if matches!(
-                    message,
-                    "installed" | "credentials_saved" | "credentials_cleared" | "authorized"
-                ) {
+                if matches!(message, "installed") {
                     self.lark_diagnostic.clear();
                     self.tapd_diagnostic.clear();
                 }
@@ -308,15 +351,26 @@ impl Model {
                 connected,
                 detail,
             } => {
-                let version = version.unwrap_or_else(|| {
-                    text(self.language(), "CLI 不可用", "CLI unavailable").into()
-                });
+                self.connection_mut(tool).verified = connected;
                 let status = if connected {
                     text(self.language(), "连接通过", "Connected")
                 } else {
                     text(self.language(), "连接未通过", "Connection failed")
                 };
-                let result = format!("{version} · {status} {detail}");
+                // 未探测版本不是 CLI 不可用；清除凭证只重置验证状态，不伪造失败。
+                let result = if !connected && version.is_none() && detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "{}{status}{}",
+                        version.map(|v| format!("{v} · ")).unwrap_or_default(),
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {detail}")
+                        }
+                    )
+                };
                 match tool {
                     CliTool::Lark => self.lark_diagnostic = result,
                     CliTool::Tapd => self.tapd_diagnostic = result,
@@ -360,7 +414,17 @@ struct Shell {
 }
 impl Global for Shell {}
 
-actions!(lark2tapd, [Quit, Refresh, OpenPending, OpenSettings]);
+actions!(
+    lark2tapd,
+    [
+        Quit,
+        Refresh,
+        OpenPending,
+        OpenSettings,
+        CloseWindow,
+        CancelConfirmation
+    ]
+);
 
 pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
     let (native_tx, native_rx) = async_channel::unbounded();
@@ -368,6 +432,9 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
     let model = cx.new(|_| Model {
         snapshot: None,
         busy: false,
+        connections_loaded: false,
+        lark_connection: ServiceConnection::default(),
+        tapd_connection: ServiceConnection::default(),
         notice: String::new(),
         error: false,
         pending_error: None,
@@ -413,6 +480,8 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
 fn configure_actions(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("escape", CancelConfirmation, Some("Settings")),
         KeyBinding::new("cmd-r", Refresh, None),
         KeyBinding::new("cmd-1", OpenPending, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
@@ -463,6 +532,7 @@ fn set_app_menu(language: &str, cx: &mut App) {
                 OpenPending,
             ),
             MenuItem::separator(),
+            MenuItem::action(text(language, "关闭窗口", "Close window"), CloseWindow),
             MenuItem::action(text(language, "退出", "Quit"), Quit),
         ],
     }]);
@@ -610,10 +680,13 @@ impl Filter {
 
 pub struct Workspace {
     model: Entity<Model>,
+    focus_handle: FocusHandle,
     last_check: Entity<last_check::LastCheck>,
     filter: Filter,
     is_settings: bool,
     settings_loaded: bool,
+    settings_scroll: ScrollHandle,
+    settings_directory_loaded: bool,
     selected: Option<String>,
     edit_source: Option<SourceTask>,
     edit_profile: String,
@@ -621,7 +694,9 @@ pub struct Workspace {
     remote_target: Option<lark2tapd_core::TargetTask>,
     source_open: bool,
     new_workspace_open: bool,
-    clear_confirmation: bool,
+    clear_confirmation: Option<CliTool>,
+    lark_form_open: bool,
+    tapd_form_open: bool,
     last_directory: Option<DirectoryCache>,
     last_prefixes: BTreeMap<String, Vec<String>>,
     seen_state_revision: u64,
@@ -662,6 +737,9 @@ pub struct Workspace {
 }
 impl Workspace {
     fn new(model: Entity<Model>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 空白处也有键盘事件路径；子控件仍可接管焦点和 Escape。
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search / 搜索任务"));
         cx.subscribe(
             &search,
@@ -787,6 +865,17 @@ impl Workspace {
             }
         })
         .detach();
+        cx.subscribe_in(
+            &model,
+            window,
+            |this, _, change: &CredentialChange, window, cx| {
+                this.clear_connection_inputs(change.tool, window, cx);
+                this.set_connection_form(change.tool, change.cleared);
+                this.clear_confirmation = None;
+                cx.notify();
+            },
+        )
+        .detach();
         cx.observe_in(&model, window, |this, _, window, cx| {
             let (revision, action, settings) = {
                 let m = this.model.read(cx);
@@ -804,16 +893,6 @@ impl Workspace {
                     set(&this.lark_path, s.lark_path.clone(), window, cx);
                     set(&this.tapd_path, s.tapd_path.clone(), window, cx);
                 }
-                if matches!(action, "credentials_saved" | "credentials_cleared") {
-                    for input in [
-                        &this.app_id,
-                        &this.app_secret,
-                        &this.lark_token,
-                        &this.tapd_token,
-                    ] {
-                        set(input, String::new(), window, cx);
-                    }
-                }
                 if action == "target_accepted" {
                     this.remote_target = None;
                 }
@@ -823,6 +902,18 @@ impl Workspace {
             }
             if this.is_settings && !this.settings_loaded && settings.is_some() {
                 this.load_settings(window, cx);
+            }
+            if this.is_settings {
+                if !this.model.read(cx).tapd_configured() {
+                    this.settings_directory_loaded = false;
+                } else if !this.settings_directory_loaded {
+                    this.settings_directory_loaded = true;
+                    this.send(Job::LoadProjects, cx);
+                    let id = selected(&this.settings_workspace, cx);
+                    if !id.is_empty() {
+                        this.send(Job::LoadMembers(id), cx);
+                    }
+                }
             }
             this.sync_directory(window, cx);
             if let Some(settings) = settings
@@ -891,11 +982,14 @@ impl Workspace {
             })
             .detach();
         let mut this = Self {
+            focus_handle,
             last_check: cx.new(|cx| last_check::LastCheck::new(model.clone(), cx)),
             model,
             filter: Filter::Pending,
             is_settings: false,
             settings_loaded: false,
+            settings_scroll: ScrollHandle::new(),
+            settings_directory_loaded: false,
             selected: None,
             edit_source: None,
             edit_profile: String::new(),
@@ -903,7 +997,9 @@ impl Workspace {
             editor_session: editor_session(),
             remote_target: None,
             new_workspace_open: false,
-            clear_confirmation: false,
+            clear_confirmation: None,
+            lark_form_open: false,
+            tapd_form_open: false,
             last_directory: None,
             last_prefixes: BTreeMap::new(),
             seen_state_revision: 0,
@@ -1050,11 +1146,7 @@ impl Workspace {
                 set(input, value, window, cx);
             }
         }
-        self.send(Job::LoadProjects, cx);
-        let id = selected(&self.settings_workspace, cx);
-        if !id.is_empty() {
-            self.send(Job::LoadMembers(id), cx);
-        }
+        self.send(Job::LoadConnectionStatus, cx);
         cx.notify();
     }
     // 产品入口与状态分段属于列表栏，不再占用第三个导航栏。
@@ -1107,6 +1199,13 @@ impl Render for Workspace {
                     .into_any_element()
             };
             return div()
+                .key_context("Settings")
+                .on_action(cx.listener(|this, _: &CancelConfirmation, _, cx| {
+                    this.clear_confirmation = None;
+                    cx.notify();
+                }))
+                .track_focus(&self.focus_handle)
+                .on_action(|_: &CloseWindow, window, _| window.remove_window())
                 .size_full()
                 .bg(cx.theme().background)
                 .text_color(cx.theme().foreground)
@@ -1121,6 +1220,8 @@ impl Render for Workspace {
         let checking = model.activities.contains("tasks");
         let is_mock = model.mode == Mode::Mock;
         div()
+            .track_focus(&self.focus_handle)
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)

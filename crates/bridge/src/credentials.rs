@@ -1,3 +1,4 @@
+use crate::installer::CliTool;
 use anyhow::Result;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -29,9 +30,7 @@ pub fn load_credentials() -> Result<Credentials> {
     }
 }
 #[cfg(target_os = "macos")]
-pub fn save_credentials(input: &Credentials) -> Result<()> {
-    let mut saved = load_credentials()?;
-    merge_nonempty(&mut saved, input)?;
+fn store_credentials(saved: &Credentials) -> Result<()> {
     let bytes = zeroize::Zeroizing::new(
         serde_json::to_vec(&saved).map_err(|_| anyhow::anyhow!("Cannot encode credentials"))?,
     );
@@ -47,45 +46,69 @@ pub fn load_credentials() -> Result<Credentials> {
     anyhow::bail!("macOS Keychain is required")
 }
 #[cfg(not(target_os = "macos"))]
-pub fn save_credentials(_: &Credentials) -> Result<()> {
+fn store_credentials(_: &Credentials) -> Result<()> {
     anyhow::bail!("macOS Keychain is required")
 }
-fn merge_nonempty(saved: &mut Credentials, input: &Credentials) -> Result<()> {
-    // 换应用必须显式清除旧凭据，不能把新 App ID 与旧密钥或令牌拼接。
+pub fn save_credentials(tool: CliTool, input: &Credentials) -> Result<()> {
+    let mut saved = load_credentials()?;
+    merge_nonempty(&mut saved, tool, input)?;
+    store_credentials(&saved)
+}
+fn merge_nonempty(saved: &mut Credentials, tool: CliTool, input: &Credentials) -> Result<()> {
+    if tool == CliTool::Tapd {
+        replace_nonempty(&mut saved.tapd_token, &input.tapd_token);
+        return Ok(());
+    }
+    // 换应用必须清除旧凭据；不能将新应用与旧密钥拼接。
     anyhow::ensure!(
-        saved.lark_app_id.is_empty()
-            || input.lark_app_id.is_empty()
-            || saved.lark_app_id == input.lark_app_id,
+        input.lark_app_id.is_empty()
+            || saved.lark_app_id == input.lark_app_id
+            || (saved.lark_app_id.is_empty()
+                && saved.lark_app_secret.is_empty()
+                && saved.lark_user_token.is_empty()),
         "Clear saved credentials before changing Lark App ID"
+    );
+    anyhow::ensure!(
+        input.lark_app_id.is_empty() == input.lark_app_secret.is_empty(),
+        "Enter Lark App ID and App Secret together"
     );
     for (dst, src) in [
         (&mut saved.lark_app_id, &input.lark_app_id),
         (&mut saved.lark_app_secret, &input.lark_app_secret),
         (&mut saved.lark_user_token, &input.lark_user_token),
-        (&mut saved.tapd_token, &input.tapd_token),
     ] {
-        if !src.is_empty() {
-            dst.zeroize();
-            dst.clone_from(src);
-        }
+        replace_nonempty(dst, src);
     }
     Ok(())
 }
-// 不存在的项视为已清除；不读取或回显 Keychain 内容。
-#[cfg(target_os = "macos")]
-pub fn clear_credentials() -> Result<()> {
-    match security_framework::passwords::delete_generic_password(
-        "io.lark2tapd.desktop",
-        "credentials-v1",
-    ) {
-        Ok(()) => Ok(()),
-        Err(e) if e.code() == -25300 => Ok(()),
-        Err(_) => anyhow::bail!("Cannot clear credentials from macOS Keychain"),
+fn replace_nonempty(dst: &mut String, src: &str) {
+    if !src.is_empty() {
+        dst.zeroize();
+        dst.push_str(src);
     }
 }
-#[cfg(not(target_os = "macos"))]
-pub fn clear_credentials() -> Result<()> {
-    anyhow::bail!("macOS Keychain is required")
+pub fn clear_credentials(tool: CliTool) -> Result<()> {
+    let mut saved = load_credentials()?;
+    clear_service(&mut saved, tool);
+    store_credentials(&saved)
+}
+fn clear_service(saved: &mut Credentials, tool: CliTool) {
+    match tool {
+        CliTool::Lark => {
+            saved.lark_app_id.zeroize();
+            saved.lark_app_secret.zeroize();
+            saved.lark_user_token.zeroize();
+        }
+        CliTool::Tapd => saved.tapd_token.zeroize(),
+    }
+}
+pub fn credential_presence(saved: &Credentials) -> (bool, bool) {
+    (
+        !saved.lark_app_id.is_empty()
+            || !saved.lark_app_secret.is_empty()
+            || !saved.lark_user_token.is_empty(),
+        !saved.tapd_token.is_empty(),
+    )
 }
 pub fn credentials_namespace(c: &Credentials) -> String {
     namespace_parts(&[
@@ -108,13 +131,65 @@ pub(crate) fn namespace_parts(parts: &[&str]) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn clearing_one_service_preserves_the_other_and_presence_counts_any_field() {
+        let mut saved = Credentials::default();
+        saved.lark_user_token = "manual-token".into();
+        saved.tapd_token = "tapd-token".into();
+        assert_eq!(credential_presence(&saved), (true, true));
+        clear_service(&mut saved, CliTool::Lark);
+        assert_eq!(credential_presence(&saved), (false, true));
+        assert_eq!(saved.tapd_token, "tapd-token");
+        saved.lark_app_secret = "secret-only".into();
+        clear_service(&mut saved, CliTool::Tapd);
+        assert_eq!(credential_presence(&saved), (true, false));
+        assert_eq!(saved.lark_app_secret, "secret-only");
+    }
+    #[test]
+    fn lark_form_cannot_change_tapd_and_partial_pairs_are_rejected() {
+        let mut saved = Credentials::default();
+        saved.tapd_token = "keep-tapd".into();
+        let mut input = Credentials::default();
+        input.lark_app_id = "app".into();
+        input.tapd_token = "unrelated".into();
+        assert!(merge_nonempty(&mut saved, CliTool::Lark, &input).is_err());
+        assert!(saved.lark_app_id.is_empty());
+        input.lark_app_secret = "secret".into();
+        merge_nonempty(&mut saved, CliTool::Lark, &input).unwrap();
+        assert_eq!(saved.tapd_token, "keep-tapd");
+        assert_eq!(saved.lark_app_id, "app");
+        assert_eq!(saved.lark_app_secret, "secret");
+        input.lark_app_id.clear();
+        assert!(merge_nonempty(&mut saved, CliTool::Lark, &input).is_err());
+    }
+    #[test]
+    fn rejects_pairing_new_app_id_with_a_previously_orphaned_secret() {
+        let mut saved = Credentials::default();
+        saved.lark_app_secret = "old-secret".into();
+        let mut input = Credentials::default();
+        input.lark_app_id = "new-app".into();
+        assert!(merge_nonempty(&mut saved, CliTool::Lark, &input).is_err());
+        assert!(saved.lark_app_id.is_empty());
+    }
+    #[test]
+    fn tapd_form_cannot_change_lark_credentials() {
+        let mut saved = Credentials::default();
+        saved.lark_app_id = "old-app".into();
+        saved.lark_app_secret = "old-secret".into();
+        let mut input = Credentials::default();
+        input.lark_app_secret = "unrelated".into();
+        input.tapd_token = "new-token".into();
+        merge_nonempty(&mut saved, CliTool::Tapd, &input).unwrap();
+        assert_eq!(saved.lark_app_secret, "old-secret");
+        assert_eq!(saved.tapd_token, "new-token");
+    }
+    #[test]
     fn empty_inputs_preserve_saved_secrets() {
         let mut saved = Credentials::default();
         saved.lark_app_secret = "keep".into();
         saved.tapd_token = "old".into();
         let mut input = Credentials::default();
         input.tapd_token = "new".into();
-        merge_nonempty(&mut saved, &input).unwrap();
+        merge_nonempty(&mut saved, CliTool::Tapd, &input).unwrap();
         assert_eq!(saved.lark_app_secret, "keep");
         assert_eq!(saved.tapd_token, "new");
     }
@@ -125,7 +200,7 @@ mod tests {
         saved.lark_app_secret = "old-secret".into();
         let mut input = Credentials::default();
         input.lark_app_id = "new-app".into();
-        assert!(merge_nonempty(&mut saved, &input).is_err());
+        assert!(merge_nonempty(&mut saved, CliTool::Lark, &input).is_err());
         assert_eq!(saved.lark_app_id, "old-app");
         assert_eq!(saved.lark_app_secret, "old-secret");
     }

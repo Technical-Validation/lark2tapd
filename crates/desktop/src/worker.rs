@@ -52,11 +52,14 @@ pub enum Job {
         guid: String,
         target: TargetTask,
     },
-    ClearCredentials,
+    ClearCredentials(CliTool),
+    LoadConnectionStatus,
     SaveDraft(String, Draft, SourceTask),
     Submit(String, Draft, SourceTask),
-    SaveCredentials(Credentials),
-    Login,
+    SaveAndConnect {
+        tool: CliTool,
+        credentials: Credentials,
+    },
     Check(CliTool),
     ChangeDemo,
     Recover {
@@ -86,6 +89,12 @@ pub enum Preference {
 }
 
 pub enum Event {
+    ConnectionStatus {
+        lark_saved: bool,
+        tapd_saved: bool,
+    },
+    CredentialsSaved(CliTool),
+    CredentialsCleared(CliTool),
     State {
         mode: Mode,
         snapshot: Snapshot,
@@ -405,7 +414,8 @@ fn field(job: &Job) -> &'static str {
             Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. },
         ) => "prefixes",
         Job::CheckWorkspace(_) | Job::AddWorkspace(_) => "new-workspace",
-        Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login => "credentials",
+        Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => connection_key(*tool),
+        Job::LoadConnectionStatus => "connection-status",
         Job::LocalFile { .. } | Job::PastedImage { .. } => "attachments",
         _ => "submit",
     }
@@ -597,7 +607,81 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
     });
 }
 
+fn connection_key(tool: CliTool) -> &'static str {
+    match tool {
+        CliTool::Lark => "lark-connection",
+        CliTool::Tapd => "tapd-connection",
+    }
+}
+// 只替换系统边界，测试仍运行真实 actor、数据库和代数失效逻辑。
+trait ConnectionBackend: Send + Sync {
+    fn load(&self) -> Result<Credentials>;
+    fn save(&self, tool: CliTool, credentials: &Credentials) -> Result<()>;
+    fn clear(&self, tool: CliTool) -> Result<()>;
+    fn connect(
+        &self,
+        tool: CliTool,
+        settings: &Settings,
+        credentials: Credentials,
+    ) -> Result<Option<String>>;
+}
+struct SystemConnectionBackend;
+impl ConnectionBackend for SystemConnectionBackend {
+    fn load(&self) -> Result<Credentials> {
+        load_credentials()
+    }
+    fn save(&self, tool: CliTool, credentials: &Credentials) -> Result<()> {
+        save_credentials(tool, credentials)
+    }
+    fn clear(&self, tool: CliTool) -> Result<()> {
+        lark2tapd_bridge::clear_credentials(tool)
+    }
+    fn connect(
+        &self,
+        tool: CliTool,
+        settings: &Settings,
+        credentials: Credentials,
+    ) -> Result<Option<String>> {
+        let cli = CliGateway::new(settings.clone(), credentials)?;
+        match tool {
+            CliTool::Lark => {
+                cli.login_lark()?;
+                cli.check_lark()?;
+            }
+            CliTool::Tapd => {
+                cli.check_tapd()?;
+            }
+        }
+        Ok(None)
+    }
+}
+fn emit_connection_status(
+    mode: Mode,
+    backend: &dyn ConnectionBackend,
+    output: &async_channel::Sender<Event>,
+) -> Result<()> {
+    let (lark_saved, tapd_saved) =
+        if mode == Mode::Mock {
+            (false, false)
+        } else {
+            lark2tapd_bridge::credential_presence(&backend.load().map_err(|_| {
+                anyhow::anyhow!("Cannot read credential status; check Keychain access")
+            })?)
+        };
+    output.try_send(Event::ConnectionStatus {
+        lark_saved,
+        tapd_saved,
+    })?;
+    Ok(())
+}
 pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
+    start_with_backend(root, mode, Arc::new(SystemConnectionBackend))
+}
+fn start_with_backend(
+    root: PathBuf,
+    mode: Mode,
+    backend: Arc<dyn ConnectionBackend>,
+) -> WorkerHandle {
     let (sender, input) = mpsc::channel();
     let jobs = WorkerSender(Arc::new(sender));
     let weak = Arc::downgrade(&jobs.0);
@@ -662,6 +746,9 @@ pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
                         new_count: 0,
                     })
                     .await?;
+                if let Err(error) = emit_connection_status(mode, backend.as_ref(), &output) {
+                    output.send(Event::FormError { field: "connection-status", message: error.to_string() }).await?;
+                }
                 loop {
                     let wait = if opened && settings.poll_enabled {
                         next_check.saturating_duration_since(Instant::now())
@@ -679,6 +766,12 @@ pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    let activity = match &envelope {
+                        Envelope::Request(Request { job: Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool), .. }) => Some(connection_key(*tool)),
+                        Envelope::Request(Request { job: Job::LoadConnectionStatus, .. }) => Some("connection-status"),
+                        _ => None,
+                    };
+                    if let Some(key) = activity { output.send(Event::Activity { key: key.into(), active: true }).await?; }
                     let is_request=matches!(&envelope,Envelope::Request(_));
                     let before = engine.snapshot().clone();
                     let previous_profile = namespace.clone();
@@ -802,9 +895,8 @@ pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
                         if mode == Mode::Mock
                             && matches!(
                                 job,
-                                Job::SaveCredentials(_)
-                                    | Job::ClearCredentials
-                                    | Job::Login
+                                Job::SaveAndConnect { .. }
+                                    | Job::ClearCredentials(_)
                                     | Job::PlanInstall(_)
                                     | Job::Install(_)
                             )
@@ -863,24 +955,54 @@ pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
                                 checked.clear();
                                 message="installed";
                             }
-                            Job::SaveCredentials(_) | Job::ClearCredentials | Job::Login => {
+                            Job::LoadConnectionStatus => {
+                                emit_connection_status(mode, backend.as_ref(), &output)?;
+                            }
+                            Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => {
+                                let saving = matches!(&job, Job::SaveAndConnect { .. });
                                 match job {
-                                    Job::SaveCredentials(c) => {save_credentials(&c)?;message="credentials_saved";},
-                                    Job::ClearCredentials => {lark2tapd_bridge::clear_credentials()?;message="credentials_cleared";},
-                                    Job::Login => {
-                                        CliGateway::new(settings.clone(), load_credentials()?)?
-                                            .login_lark()?;
-                                        message="authorized";
+                                    Job::SaveAndConnect { credentials, .. } => {
+                                        backend.save(tool, &credentials).map_err(|_| anyhow::anyhow!("Cannot save credentials; enter complete credentials and check Keychain access"))?;
+                                        output.send(Event::CredentialsSaved(tool)).await?;
+                                        message = "credentials_saved";
+                                    }
+                                    Job::ClearCredentials(_) => {
+                                        backend.clear(tool).map_err(|_| anyhow::anyhow!("Cannot clear credentials; check Keychain access"))?;
+                                        output.send(Event::CredentialsCleared(tool)).await?;
+                                        message = "credentials_cleared";
                                     }
                                     _ => unreachable!(),
                                 }
+                                // 保存成功即作废旧账户与在途读取，不能等待后续 OAuth 成功。
                                 namespace.clear();
                                 settings.last_profile = None;
                                 generation += 1;
                                 checked.clear();
+                                for event in cancel_stale_reads(&mut pending, generation) { output.send(event).await?; }
                                 engine = Engine::open(&root.join("disconnected.db")).await?;
                                 engine.save_settings(settings.clone()).await?;
                                 preferences.save_settings(settings.clone()).await?;
+                                output.send(Event::Diagnostic { tool, version: None, connected: false, detail: String::new() }).await?;
+                                emit_connection_status(mode, backend.as_ref(), &output)?;
+                                output.send(Event::State { mode, snapshot: engine.snapshot().clone(), profile: namespace.clone(), message, new_count: 0 }).await?;
+                                if saving {
+                                    let result = (|| {
+                                        let credentials = backend.load()?;
+                                        // 手工令牌只保存，不能先发起 OAuth 再报告无法验证。
+                                        anyhow::ensure!(tool != CliTool::Lark || credentials.lark_user_token.is_empty(), "Manual token cannot be verified");
+                                        backend.connect(tool, &settings, credentials)
+                                    })();
+                                    let connected = result.is_ok();
+                                    let failure = match tool {
+                                        CliTool::Lark => "Credentials saved, but Lark connection could not be verified. Manual tokens cannot be verified; use OAuth instead.",
+                                        CliTool::Tapd => "Credentials saved, but TAPD connection could not be verified. Check the token and CLI installation.",
+                                    };
+                                    output.send(Event::Diagnostic { tool, version: result.ok().flatten(), connected,
+                                        detail: if connected { String::new() } else { failure.into() }
+                                    }).await?;
+                                    anyhow::ensure!(connected, failure);
+                                    if tool == CliTool::Lark { message = "authorized"; }
+                                }
                             }
                             Job::AddWorkspace(w) => {
                                 anyhow::ensure!(
@@ -1003,6 +1125,7 @@ pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
                         Ok(())
                     }
                     .await;
+                    if let Some(key) = activity { output.send(Event::Activity { key: key.into(), active: false }).await?; }
                     // 连接切换后的落盘即使失败，也必须释放旧代附件预留，不能只熄灭指示器。
                     for event in cancel_stale_reads(&mut pending,generation) { output.send(event).await?; }
                     if previous_profile != namespace || !same_content(&before, engine.snapshot()) || message=="refreshed" || (is_request && result.is_ok() && !message.is_empty()) {
@@ -1223,6 +1346,17 @@ fn discover_executable(configured: &str, fallback: &str, tools: &std::path::Path
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_form_errors_are_service_scoped() {
+        assert_eq!(
+            super::field(&super::Job::SaveAndConnect {
+                tool: super::CliTool::Lark,
+                credentials: super::Credentials::default()
+            }),
+            "lark-connection"
+        );
+    }
+
     use super::*;
     #[test]
     fn editor_and_appearance_jobs_do_not_postpone_polling() {
@@ -1231,7 +1365,10 @@ mod tests {
         theme.theme = "dark".into();
         for job in [
             Job::OpenDraft("guid".into(), false, 0),
-            Job::Login,
+            Job::SaveAndConnect {
+                tool: CliTool::Lark,
+                credentials: Credentials::default(),
+            },
             Job::Check(CliTool::Lark),
             Job::SetPreference(Preference::Theme(theme.theme)),
         ] {
@@ -1259,6 +1396,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match worker.events.try_recv() {
+                Ok(Event::ConnectionStatus { .. }) => continue,
                 Ok(event) => return event,
                 Err(async_channel::TryRecvError::Closed) => panic!("worker stopped"),
                 Err(_) => {}
@@ -1786,3 +1924,7 @@ mod tests {
         assert!(profile_file(Mode::Live, Some(&"a".repeat(64))).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "worker_connection_tests.rs"]
+mod connection_tests;

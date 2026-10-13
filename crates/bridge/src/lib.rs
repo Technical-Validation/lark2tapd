@@ -6,7 +6,8 @@ mod process;
 use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Local, TimeZone, Utc};
 pub use credentials::{
-    Credentials, clear_credentials, credentials_namespace, load_credentials, save_credentials,
+    Credentials, clear_credentials, credential_presence, credentials_namespace, load_credentials,
+    save_credentials,
 };
 pub use description::render_description;
 use lark2tapd_core::{

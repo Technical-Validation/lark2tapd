@@ -30,6 +30,7 @@ fn menu_and_shortcut_reuse_settings_and_reopen_after_close(cx: &mut TestAppConte
         })
         .unwrap();
     // 默认窗口尺寸下的真实控件交互，验证与主窗口共享偏好而非独立设置副本。
+    reveal_setting(cx, first, "en");
     click(cx, first, "en");
     pump(&events, &model, cx, |cx| model.read(cx).language() == "en");
     close_test_window(cx, first);
