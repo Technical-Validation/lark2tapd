@@ -10,6 +10,7 @@ use tray_icon::{
 pub enum NativeAction {
     Open,
     Pending,
+    Settings,
     Refresh,
     TogglePolling,
     Quit,
@@ -19,6 +20,7 @@ pub struct StatusMenu {
     tray: TrayIcon,
     open: MenuItem,
     pending: MenuItem,
+    settings: MenuItem,
     refresh: MenuItem,
     polling: MenuItem,
     quit: MenuItem,
@@ -29,15 +31,17 @@ impl StatusMenu {
         let menu = Menu::new();
         let open = MenuItem::new("打开 Lark → TAPD", true, None);
         let pending = MenuItem::new("未同步任务", true, None);
+        let settings = MenuItem::new("设置…", true, None);
         let refresh = MenuItem::new("立即检查", true, None);
         let polling = MenuItem::new("开启自动检查", true, None);
         let quit = MenuItem::new("退出", true, None);
-        for item in [&open, &pending, &refresh, &polling, &quit] {
+        for item in [&open, &pending, &settings, &refresh, &polling, &quit] {
             menu.append(item)?;
         }
         let ids = [
             open.id().clone(),
             pending.id().clone(),
+            settings.id().clone(),
             refresh.id().clone(),
             polling.id().clone(),
             quit.id().clone(),
@@ -47,6 +51,7 @@ impl StatusMenu {
                 let action = [
                     NativeAction::Open,
                     NativeAction::Pending,
+                    NativeAction::Settings,
                     NativeAction::Refresh,
                     NativeAction::TogglePolling,
                     NativeAction::Quit,
@@ -63,6 +68,7 @@ impl StatusMenu {
             tray,
             open,
             pending,
+            settings,
             refresh,
             polling,
             quit,
@@ -77,6 +83,7 @@ impl StatusMenu {
             "{} ({count})",
             text(language, "未同步任务", "Unimported tasks")
         ));
+        self.settings.set_text(text(language, "设置…", "Settings…"));
         self.refresh
             .set_text(text(language, "立即检查", "Check now"));
         self.polling.set_text(if polling {

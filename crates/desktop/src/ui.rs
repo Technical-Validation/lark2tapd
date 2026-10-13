@@ -1,4 +1,5 @@
 mod editor;
+mod feedback;
 mod media;
 use editor::DeferredMedia;
 use zorite_editor::EditorState;
@@ -36,6 +37,12 @@ use lark2tapd_bridge::Credentials;
 use lark2tapd_core::{Draft, Snapshot, SourceTask, SyncRecord, SyncStatus};
 
 #[derive(Clone)]
+struct Feedback {
+    message: String,
+    error: bool,
+}
+
+#[derive(Clone)]
 struct MediaReady {
     guid: String,
     profile: String,
@@ -69,6 +76,7 @@ pub struct Model {
     pub busy: bool,
     pub notice: String,
     pub error: bool,
+    pending_error: Option<String>,
     pub mode: Mode,
     pub install_plan: Option<InstallationPlan>,
     pub lark_diagnostic: String,
@@ -137,10 +145,28 @@ impl Model {
             .into();
             self.activities.clear();
             self.busy = false;
+            self.queue_feedback(cx);
         }
         cx.notify();
     }
     fn receive(&mut self, event: Event, cx: &mut Context<Self>) {
+        // 轻量提示只反馈操作结果；缓存刷新、目录读取等后台活动不反复弹出。
+        let feedback = matches!(&event, Event::Error(_))
+            || matches!(
+                &event,
+                Event::State {
+                    message: "imported"
+                        | "draft_saved"
+                        | "settings_saved"
+                        | "credentials_saved"
+                        | "credentials_cleared"
+                        | "recovered"
+                        | "authorized"
+                        | "target_accepted"
+                        | "installed",
+                    ..
+                }
+            );
         match event {
             Event::State {
                 mode,
@@ -301,8 +327,22 @@ impl Model {
                 );
             }
         }
+        if feedback {
+            self.queue_feedback(cx);
+        }
         cx.notify();
     }
+    fn queue_feedback(&mut self, cx: &mut Context<Self>) {
+        if self.error {
+            self.pending_error = Some(self.notice.clone());
+        }
+        let note = Feedback {
+            message: self.notice.clone(),
+            error: self.error,
+        };
+        cx.defer(move |cx| feedback::present(note, cx));
+    }
+
     fn language(&self) -> &str {
         self.snapshot
             .as_ref()
@@ -313,10 +353,11 @@ impl Model {
 struct Shell {
     model: Entity<Model>,
     window: Option<AnyWindowHandle>,
+    settings_window: Option<AnyWindowHandle>,
 }
 impl Global for Shell {}
 
-actions!(lark2tapd, [Quit, Refresh, OpenPending]);
+actions!(lark2tapd, [Quit, Refresh, OpenPending, OpenSettings]);
 
 pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
     let (native_tx, native_rx) = async_channel::unbounded();
@@ -326,6 +367,7 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
         busy: false,
         notice: String::new(),
         error: false,
+        pending_error: None,
         mode,
         install_plan: None,
         lark_diagnostic: String::new(),
@@ -344,19 +386,9 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
     cx.set_global(Shell {
         model: model.clone(),
         window: None,
+        settings_window: None,
     });
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-r", Refresh, None),
-        KeyBinding::new("cmd-1", OpenPending, None),
-    ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.on_action(|_: &Refresh, cx| {
-        let m = cx.global::<Shell>().model.clone();
-        m.update(cx, |m, cx| m.send(Job::Refresh, cx));
-    });
-    cx.on_action(|_: &OpenPending, cx| open_pending(cx));
-    set_app_menu("zh-CN", cx);
+    configure_actions(cx);
     show_window(cx);
     // Entity 由 App 全局拥有；关闭窗口不会销毁轮询和消息消费者。
     cx.spawn(async move |cx| {
@@ -369,28 +401,50 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
     .detach();
     cx.spawn(async move |cx| {
         while let Ok(action) = native_rx.recv().await {
-            cx.update(|cx| match action {
-                NativeAction::Open => show_window(cx),
-                NativeAction::Pending => open_pending(cx),
-                NativeAction::Quit => cx.quit(),
-                NativeAction::Refresh => {
-                    let m = cx.global::<Shell>().model.clone();
-                    m.update(cx, |m, cx| m.send(Job::Refresh, cx));
-                }
-                NativeAction::TogglePolling => {
-                    let m = cx.global::<Shell>().model.clone();
-                    m.update(cx, |m, cx| {
-                        if let Some(s) = &m.snapshot {
-                            let mut s = s.settings.clone();
-                            s.poll_enabled = !s.poll_enabled;
-                            m.send(Job::SetPreference(Preference::Polling(s.poll_enabled)), cx);
-                        }
-                    });
-                }
-            });
+            cx.update(|cx| handle_native_action(action, cx));
         }
     })
     .detach();
+}
+
+fn configure_actions(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-r", Refresh, None),
+        KeyBinding::new("cmd-1", OpenPending, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+    ]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Refresh, cx| {
+        let m = cx.global::<Shell>().model.clone();
+        m.update(cx, |m, cx| m.send(Job::Refresh, cx));
+    });
+    cx.on_action(|_: &OpenPending, cx| open_pending(cx));
+    cx.on_action(|_: &OpenSettings, cx| show_settings(cx));
+    set_app_menu("zh-CN", cx);
+}
+
+// 菜单栏和页面入口共用窗口路由，不借助主窗口的页面切换。
+fn handle_native_action(action: NativeAction, cx: &mut App) {
+    match action {
+        NativeAction::Open => show_window(cx),
+        NativeAction::Pending => open_pending(cx),
+        NativeAction::Settings => show_settings(cx),
+        NativeAction::Quit => cx.quit(),
+        NativeAction::Refresh => {
+            let model = cx.global::<Shell>().model.clone();
+            model.update(cx, |m, cx| m.send(Job::Refresh, cx));
+        }
+        NativeAction::TogglePolling => {
+            let model = cx.global::<Shell>().model.clone();
+            model.update(cx, |m, cx| {
+                if let Some(s) = &m.snapshot {
+                    let enabled = !s.settings.poll_enabled;
+                    m.send(Job::SetPreference(Preference::Polling(enabled)), cx);
+                }
+            });
+        }
+    }
 }
 
 fn set_app_menu(language: &str, cx: &mut App) {
@@ -398,6 +452,8 @@ fn set_app_menu(language: &str, cx: &mut App) {
         name: "Lark → TAPD".into(),
         disabled: false,
         items: vec![
+            MenuItem::action(text(language, "设置…", "Settings…"), OpenSettings),
+            MenuItem::separator(),
             MenuItem::action(text(language, "立即检查", "Check now"), Refresh),
             MenuItem::action(
                 text(language, "未同步任务", "Unimported tasks"),
@@ -430,6 +486,7 @@ pub fn show_window(cx: &mut App) {
             })
             .is_ok()
     {
+        feedback::replay(cx);
         let m = cx.global::<Shell>().model.clone();
         m.update(cx, |m, cx| m.send(Job::Refresh, cx));
         return;
@@ -462,6 +519,7 @@ pub fn show_window(cx: &mut App) {
     match result {
         Ok((handle, _)) => {
             cx.global_mut::<Shell>().window = Some(handle);
+            feedback::replay(cx);
             cx.activate(true);
             let m = cx.global::<Shell>().model.clone();
             m.update(cx, |m, cx| m.send(Job::Refresh, cx));
@@ -470,6 +528,58 @@ pub fn show_window(cx: &mut App) {
             eprintln!("Unable to open application window: {error}");
             cx.quit();
         }
+    }
+}
+
+fn show_settings(cx: &mut App) {
+    if !cx.has_global::<Shell>() {
+        return;
+    }
+    if let Some(handle) = cx.global::<Shell>().settings_window
+        && handle
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                cx.activate(true);
+            })
+            .is_ok()
+    {
+        feedback::replay(cx);
+        return;
+    }
+    let model = cx.global::<Shell>().model.clone();
+    let title = text(model.read(cx).language(), "设置", "Settings").to_owned();
+    // 控件状态绑定各自 Window；共享后台模型，但绝不复用主窗口正在编辑的表单实体。
+    let result = gpui_kit::open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(760.), px(720.)),
+                cx,
+            ))),
+            window_min_size: Some(size(px(620.), px(520.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+        |window, cx| {
+            cx.new(|cx| {
+                let mut view = Workspace::new(model.clone(), window, cx);
+                view.is_settings = true;
+                view.load_settings(window, cx);
+                view
+            })
+        },
+    );
+    match result {
+        Ok((handle, _)) => {
+            cx.global_mut::<Shell>().settings_window = Some(handle);
+            feedback::replay(cx);
+            cx.activate(true);
+        }
+        Err(error) => model.update(cx, |m, cx| m.receive(Event::Error(error.to_string()), cx)),
     }
 }
 
@@ -509,7 +619,6 @@ enum Filter {
     Pending,
     Changed,
     Synced,
-    Settings,
 }
 impl Filter {
     fn matches(self, r: &SyncRecord) -> bool {
@@ -523,7 +632,6 @@ impl Filter {
                     || matches!(r.status(), SyncStatus::Changed | SyncStatus::Uncertain)
             }
             Self::Synced => r.status() == SyncStatus::Synced && !r.has_pending_attachments(),
-            Self::Settings => false,
         }
     }
 }
@@ -531,6 +639,8 @@ impl Filter {
 pub struct Workspace {
     model: Entity<Model>,
     filter: Filter,
+    is_settings: bool,
+    settings_loaded: bool,
     selected: Option<String>,
     edit_source: Option<SourceTask>,
     edit_profile: String,
@@ -738,6 +848,9 @@ impl Workspace {
                     this.new_workspace_open = false;
                 }
             }
+            if this.is_settings && !this.settings_loaded && settings.is_some() {
+                this.load_settings(window, cx);
+            }
             this.sync_directory(window, cx);
             if let Some(settings) = settings
                 && this.last_prefixes != settings.workspace_prefixes
@@ -807,6 +920,8 @@ impl Workspace {
         let mut this = Self {
             model,
             filter: Filter::Pending,
+            is_settings: false,
+            settings_loaded: false,
             selected: None,
             edit_source: None,
             edit_profile: String::new(),
@@ -937,8 +1052,10 @@ impl Workspace {
         self.remote_target = None;
         self.send(Job::OpenDraft(guid, true, self.editor_session), cx);
     }
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.filter = Filter::Settings;
+    fn load_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.read(cx).snapshot.is_none() {
+            return;
+        }
         if let Some(s) = self
             .model
             .read(cx)
@@ -946,6 +1063,7 @@ impl Workspace {
             .as_ref()
             .map(|s| s.settings.clone())
         {
+            self.settings_loaded = true;
             self.fill_projects(true, &s.workspace_id, window, cx);
             self.fill_members(true, &s.owner, window, cx);
             self.fill_prefix_workspace(&s.workspace_id, window, cx);
@@ -989,15 +1107,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_lg().font_semibold().child("Lark → TAPD"))
-                    .child(
-                        Button::new("nav-settings")
-                            .label(self.tr(cx, "配置", "Settings"))
-                            .ghost()
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
-                            ),
-                    ),
+                    .child(div().text_lg().font_semibold().child("Lark → TAPD")),
             )
             .child(
                 div()
@@ -1019,6 +1129,9 @@ impl Workspace {
                         Tab::new()
                             .flex_1()
                             .label(format!("{} {count}", self.tr(cx, zh, en)))
+                            .when(filter == Filter::Synced, |tab| {
+                                tab.child(tasks::synced_icon(cx))
+                            })
                     }))
                     .on_click(cx.listener(|this, index, _, cx| {
                         if let Some(filter) =
@@ -1034,12 +1147,29 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_settings {
+            window.set_window_title(self.tr(cx, "设置", "Settings"));
+            let content = if self.settings_loaded {
+                self.settings_view(cx).into_any_element()
+            } else {
+                div()
+                    .p_6()
+                    .child(self.tr(cx, "正在读取配置…", "Loading settings…"))
+                    .into_any_element()
+            };
+            return div()
+                .size_full()
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .font_family(cx.theme().font_family.clone())
+                .text_sm()
+                .flex()
+                .child(content);
+        }
         self.sync_description(window, cx);
         let model = self.model.read(cx);
         let busy = model.busy;
         let checking = model.activities.contains("tasks");
-        let notice = model.notice.clone();
-        let error = model.error;
         let is_mock = model.mode == Mode::Mock;
         let checked = model
             .snapshot
@@ -1069,17 +1199,6 @@ impl Render for Workspace {
                             .items_center()
                             .border_b_1()
                             .border_color(cx.theme().border)
-                            .when(self.filter == Filter::Settings, |d| {
-                                d.child(
-                                    Button::new("back-to-tasks")
-                                        .label(self.tr(cx, "返回任务", "Back to tasks"))
-                                        .ghost()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.filter = Filter::Pending;
-                                            cx.notify();
-                                        })),
-                                )
-                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -1133,6 +1252,14 @@ impl Render for Workspace {
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.send(Job::Refresh, cx)),
                                     ),
+                            )
+                            .child(
+                                Button::new("nav-settings")
+                                    .icon(gpui_kit::component::IconName::Settings)
+                                    .accessibility_label(self.tr(cx, "设置", "Settings"))
+                                    .tooltip(self.tr(cx, "设置", "Settings"))
+                                    .ghost()
+                                    .on_click(|_, _, cx| show_settings(cx)),
                             ),
                     )
                     .child(
@@ -1140,26 +1267,8 @@ impl Render for Workspace {
                             .flex_1()
                             .min_h_0()
                             .flex()
-                            .when(self.filter == Filter::Settings, |d| {
-                                d.child(self.settings_view(cx))
-                            })
-                            .when(self.filter != Filter::Settings, |d| {
-                                d.child(self.task_list(cx)).child(self.detail(cx))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .px_5()
-                            .py_2()
-                            .min_h(px(36.))
-                            .bg(cx.theme().muted)
-                            .text_xs()
-                            .text_color(if error {
-                                cx.theme().danger
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(notice),
+                            .child(self.task_list(cx))
+                            .child(self.detail(cx)),
                     ),
             )
     }

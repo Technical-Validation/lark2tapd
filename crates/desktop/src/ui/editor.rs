@@ -72,7 +72,7 @@ pub(super) fn create_description(
 impl Workspace {
     pub(super) fn can_edit_description(&self, cx: &App) -> bool {
         let model = self.model.read(cx);
-        self.filter != Filter::Settings
+        !self.is_settings
             && !model.busy
             && self.edit_profile == model.profile
             && self.edit_source.as_ref().is_some_and(|source| {

@@ -3,6 +3,7 @@ use super::*;
 use crate::worker;
 #[path = "prefix_settings_tests.rs"]
 mod prefix_settings;
+use gpui_kit::component::WindowExt;
 use gpui_kit::test::TestWindowExt;
 use std::{
     prelude::v1::test,
@@ -48,6 +49,7 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
         busy: false,
         notice: String::new(),
         error: false,
+        pending_error: None,
         mode: Mode::Mock,
         install_plan: None,
         lark_diagnostic: String::new(),
@@ -80,8 +82,46 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
         )
         .unwrap()
     });
+    cx.update(|cx| {
+        cx.set_global(Shell {
+            model: model.clone(),
+            window: Some(handle),
+            settings_window: None,
+        });
+        configure_actions(cx);
+    });
     (dir, w.events, model, handle, view)
 }
+// 既有表单测试沿用大视口；独立窗口生命周期测试不修改默认窗口尺寸。
+fn open_settings_for_test(
+    cx: &mut TestAppContext,
+    main: AnyWindowHandle,
+) -> (AnyWindowHandle, Entity<Workspace>) {
+    click(cx, main, "nav-settings");
+    let handle = cx.read(|cx| cx.global::<Shell>().settings_window.unwrap());
+    cx.simulate_window_resize(handle, size(px(1440.), px(1800.)));
+    cx.run_until_parked();
+    let view = cx
+        .update_window(handle, |root, _, cx| {
+            root.downcast::<gpui_kit::base::Root>()
+                .unwrap()
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<Workspace>()
+                .unwrap()
+        })
+        .unwrap();
+    cx.run_until_parked();
+    (handle, view)
+}
+
+fn close_test_window(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+    cx.update_window(handle, |_, w, _| w.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+}
+
 fn click(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &str) {
     cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);
@@ -150,6 +190,7 @@ fn opening_main_window_checks_automatically(cx: &mut TestAppContext) {
         cx.set_global(Shell {
             model: model.clone(),
             window: Some(handle),
+            settings_window: None,
         });
         show_window(cx);
     });
@@ -244,8 +285,8 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
 
 #[gpui_kit::test]
 fn polling_autosaves_and_reports_invalid_input_inline(cx: &mut TestAppContext) {
-    let (_dir, events, model, handle, view) = setup(cx);
-    click(cx, handle, "nav-settings");
+    let (_dir, events, model, handle, _view) = setup(cx);
+    let (handle, view) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
         w.scroll(
             "lark-cli-help",
@@ -338,8 +379,8 @@ fn source_details_expand_and_settings_do_not_clobber_draft(cx: &mut TestAppConte
     click(cx, handle, "toggle-source-details");
     choose(cx, handle, "draft-owner", "alice");
     let before = cx.read(|cx| view.read(cx).draft(cx));
-    click(cx, handle, "nav-settings");
-    click(cx, handle, "back-to-tasks");
+    let (settings, _) = open_settings_for_test(cx, handle);
+    close_test_window(cx, settings);
     cx.read(|cx| {
         assert_eq!(view.read(cx).draft(cx), before);
     });
@@ -612,8 +653,8 @@ fn file_selected_image_is_referenced_and_removed_decode_cannot_return(cx: &mut T
 
 #[gpui_kit::test]
 fn successful_action_events_clear_credentials_and_install_confirmation(cx: &mut TestAppContext) {
-    let (_dir, _events, model, handle, view) = setup(cx);
-    click(cx, handle, "nav-settings");
+    let (_dir, _events, model, handle, _view) = setup(cx);
+    let (handle, view) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
         view.update(cx, |v, cx| {
             set(&v.app_secret, "dummy-secret".into(), w, cx);
@@ -752,7 +793,7 @@ fn attachment_or_body_failure_is_attention_not_synced(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn workspace_form_requires_check_for_exact_current_fields(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, _view) = setup(cx);
-    click(cx, handle, "nav-settings");
+    let (handle, _) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
         w.scroll(
             "lark-cli-help",
@@ -822,8 +863,8 @@ fn workspace_form_requires_check_for_exact_current_fields(cx: &mut TestAppContex
 
 #[gpui_kit::test]
 fn cli_test_buttons_remain_clickable_while_busy_and_paths_are_readonly(cx: &mut TestAppContext) {
-    let (_dir, _events, model, handle, view) = setup(cx);
-    click(cx, handle, "nav-settings");
+    let (_dir, _events, model, handle, _view) = setup(cx);
+    let (handle, view) = open_settings_for_test(cx, handle);
     model.update(cx, |m, cx| {
         m.busy = true;
         cx.notify();
@@ -873,8 +914,8 @@ fn segmented_status_switches_scope_and_settings_returns_to_tasks(cx: &mut TestAp
     for filter in [Filter::Pending, Filter::Changed, Filter::Synced] {
         assert!(!filter.matches(&record));
     }
-    click(cx, handle, "nav-settings");
-    click(cx, handle, "back-to-tasks");
+    let (settings, _) = open_settings_for_test(cx, handle);
+    close_test_window(cx, settings);
     cx.read(|cx| assert!(view.read(cx).filter == Filter::Pending));
 }
 
@@ -918,3 +959,5 @@ fn task_card_summary_area_and_keyboard_activate_same_task(cx: &mut TestAppContex
 
 #[path = "editor_tests.rs"]
 mod native_editor;
+#[path = "shell_tests.rs"]
+mod shell_tests;

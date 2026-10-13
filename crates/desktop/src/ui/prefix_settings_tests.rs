@@ -49,7 +49,7 @@ fn rapid_prefix_deletes_do_not_resurrect_removed_values(cx: &mut TestAppContext)
         });
     }
     wait_for_prefix_saves(&events, &model, 3, cx);
-    click(cx, handle, "nav-settings");
+    let (handle, _) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
         w.scroll(
             "lark-cli-help",
@@ -78,7 +78,7 @@ fn rapid_prefix_deletes_do_not_resurrect_removed_values(cx: &mut TestAppContext)
 fn rapid_prefix_adds_preserve_both_verbatim_values(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, view) = setup(cx);
     load_task(&events, &model, &view, handle, cx);
-    click(cx, handle, "nav-settings");
+    let (handle, _) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
         w.scroll(
             "lark-cli-help",
@@ -115,7 +115,7 @@ fn rapid_prefix_adds_preserve_both_verbatim_values(cx: &mut TestAppContext) {
 fn prefixes_add_one_verbatim_value_only_after_confirmation(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, view) = setup(cx);
     load_task(&events, &model, &view, handle, cx);
-    click(cx, handle, "nav-settings");
+    let (handle, view) = open_settings_for_test(cx, handle);
     cx.update_window(handle, |_, w, cx| {
         w.scroll(
             "lark-cli-help",
@@ -209,8 +209,8 @@ fn prefixes_add_one_verbatim_value_only_after_confirmation(cx: &mut TestAppConte
 
 #[gpui_kit::test]
 fn detected_cli_paths_ignore_mouse_input_and_endpoint_is_absent(cx: &mut TestAppContext) {
-    let (_dir, _events, _model, handle, view) = setup(cx);
-    click(cx, handle, "nav-settings");
+    let (_dir, _events, _model, handle, _view) = setup(cx);
+    let (handle, view) = open_settings_for_test(cx, handle);
     let old = cx.read(|cx| view.read(cx).lark_path.read(cx).value());
     cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);

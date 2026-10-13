@@ -1,6 +1,8 @@
 //! 列表只显示摘要；编辑、Markdown 和附件都留在单一任务详情中。
 use super::*;
+use gpui_kit::base::Selectable;
 use gpui_kit::component::input::{InputGroup, InputGroupAddon, InputGroupInput};
+use gpui_kit::component::{Icon, IconName, button::ButtonCustomVariant};
 
 impl Workspace {
     pub(super) fn task_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -60,19 +62,19 @@ impl Workspace {
                         // 原生 Button 包住整张卡片，鼠标和键盘共享同一个选择行为。
                         Button::new(SharedString::from(format!("select-{id}")))
                             .accessibility_label(record.source.title.clone())
-                            .ghost()
+                            // selected 使用组件的 active 样式，不让普通 hover 覆盖选中背景。
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .hover(cx.theme().secondary_hover)
+                                    .active(cx.theme().secondary_active),
+                            )
+                            .selected(selected)
                             .w_full()
                             .h_auto()
                             .p_3()
                             .mb_2()
                             .text_color(cx.theme().foreground)
-                            .border_1()
-                            .border_color(if selected {
-                                cx.theme().primary
-                            } else {
-                                cx.theme().border
-                            })
-                            .when(selected, |b| b.bg(cx.theme().accent))
+                            .border_0()
                             .child(
                                 div()
                                     .w_full()
@@ -88,42 +90,50 @@ impl Workspace {
                                             .text_left()
                                             .line_clamp(2)
                                             .font_semibold()
-                                            .child(record.source.title.clone()),
+                                            .child(summary.title),
                                     )
-                                    .children(summary.into_iter().enumerate().map(
-                                        |(index, value)| {
-                                            let value = if value.is_empty() {
-                                                match index {
-                                                    0 => self
-                                                        .tr(cx, "暂无描述", "No description")
-                                                        .to_owned(),
-                                                    1 => self
-                                                        .tr(
-                                                            cx,
-                                                            "处理人未提供",
-                                                            "Assignee not provided",
-                                                        )
-                                                        .to_owned(),
-                                                    _ => self
-                                                        .tr(
-                                                            cx,
-                                                            "创建时间未提供",
-                                                            "Created time not provided",
-                                                        )
-                                                        .to_owned(),
-                                                }
-                                            } else {
-                                                value
-                                            };
+                                    .when_some(summary.description, |d, value| {
+                                        d.child(
                                             div()
                                                 .w_full()
                                                 .text_left()
                                                 .line_clamp(2)
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child(value)
+                                                .child(value),
+                                        )
+                                    })
+                                    // 缺失字段不占位；仅有元数据时才创建底部一排。
+                                    .when(
+                                        summary.assignees.is_some() || summary.created.is_some(),
+                                        |d| {
+                                            d.child(
+                                                div()
+                                                    .w_full()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .gap_2()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .when_some(summary.assignees, |d, names| {
+                                                        d.child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .flex_1()
+                                                                .text_left()
+                                                                .truncate()
+                                                                .child(names),
+                                                        )
+                                                    })
+                                                    .when_some(summary.created, |d, created| {
+                                                        d.child(
+                                                            div().flex_shrink_0().child(created),
+                                                        )
+                                                    }),
+                                            )
                                         },
-                                    )),
+                                    ),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.select(record.clone(), window, cx)
@@ -173,9 +183,15 @@ impl Workspace {
         let guid = record.source.guid.clone();
         let partial = record.has_pending_attachments();
         div().id("detail-scroll").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.description_scroll).p_6().flex().flex_col().gap_4()
-            .child(div().flex().justify_between().child(div().text_xl().font_semibold().child(self.tr(cx,"任务详情","Task details"))).child(div().text_sm().text_color(cx.theme().muted_foreground).child(if partial{self.tr(cx,"附件待处理","Attachments pending")}else{status_text(model.language(),record.status())})))
-            .child(div().flex().gap_2().child(Button::new("open-source").child(img(lark_icon(cx.theme().is_dark())).size(px(20.))).accessibility_label(self.tr(cx,"在飞书中打开","Open in Lark")).tooltip(self.tr(cx,"在飞书中打开","Open in Lark")).ghost().disabled(record.source.url.is_empty()).on_click({let url=record.source.url.clone();move |_,_,cx|open_safe_url(&url,cx)}))
-                .when_some(record.target.as_ref(),|d,t|d.child(Button::new("open-target").label(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).ghost().disabled(t.url.is_empty()).on_click({let url=t.url.clone();move |_,_,cx|open_safe_url(&url,cx)}))))
+            // 状态与外部入口保持在标题行，飞书图标位于最右侧。
+            .child(div().flex().items_center().gap_2()
+                .child(div().flex_1().min_w_0().text_xl().font_semibold().child(self.tr(cx,"任务详情","Task details")))
+                .child(div().id("detail-sync-status").flex().items_center().gap_1().text_sm().text_color(cx.theme().muted_foreground)
+                    .when(Filter::Synced.matches(&record), |d| d.child(synced_icon(cx)))
+                    .child(if partial { self.tr(cx,"附件待处理","Attachments pending") } else { status_text(model.language(),record.status()) })
+                    .tooltip({let label = if partial { self.tr(cx,"附件待处理","Attachments pending") } else { status_text(model.language(),record.status()) }; move |window,cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window,cx) }))
+                .when_some(record.target.as_ref(),|d,t|d.child(Button::new("open-target").label(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).ghost().disabled(t.url.is_empty()).on_click({let url=t.url.clone();move |_,_,cx|open_safe_url(&url,cx)})))
+                .child(Button::new("open-source").child(img(lark_icon(cx.theme().is_dark())).size(px(20.))).accessibility_label(self.tr(cx,"在飞书中打开","Open in Lark")).tooltip(self.tr(cx,"在飞书中打开","Open in Lark")).ghost().disabled(record.source.url.is_empty()).on_click({let url=record.source.url.clone();move |_,_,cx|open_safe_url(&url,cx)})))
             .child(Collapsible::new().open(self.source_open).motion_id("source-details")
                 .child(Button::new("toggle-source-details").label(if self.source_open{self.tr(cx,"收起飞书任务详情","Hide Lark task details")}else{self.tr(cx,"展开飞书任务详情","Show Lark task details")}).ghost().on_click(cx.listener(|this,_,_,cx|{this.source_open = !this.source_open;cx.notify();})))
                 .content(self.source_details(&record.source,cx)))
@@ -268,6 +284,20 @@ impl Workspace {
             })
     }
 }
+// 与状态分段共享实心圆勾；是否完成沿用 Filter 的正文及附件判定。
+pub(super) fn synced_icon(cx: &App) -> impl IntoElement {
+    div()
+        .size(px(16.))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(cx.theme().success)
+        .text_color(cx.theme().success_foreground)
+        .child(Icon::new(IconName::Check).size(px(12.)))
+}
+
 // 编译进程序，运行时不请求远端图标或依赖工作目录。
 fn lark_icon(dark: bool) -> Arc<Image> {
     static ICONS: std::sync::OnceLock<[Arc<Image>; 2]> = std::sync::OnceLock::new();
@@ -298,7 +328,15 @@ fn local_time(value: Option<&str>) -> Option<String> {
                 .to_string()
         })
 }
-fn task_summary(source: &SourceTask) -> Vec<String> {
+// 明确字段，渲染时不会把缺失值误当成需要占位的一行。
+struct TaskSummary {
+    title: String,
+    description: Option<String>,
+    assignees: Option<String>,
+    created: Option<String>,
+}
+
+fn task_summary(source: &SourceTask) -> TaskSummary {
     let names = source
         .metadata
         .assignees
@@ -319,17 +357,78 @@ fn task_summary(source: &SourceTask) -> Vec<String> {
     if chars.next().is_some() {
         description.push('…');
     }
-    vec![
-        description,
-        names,
-        local_time(source.metadata.created_at.as_deref()).unwrap_or_default(),
-    ]
+    TaskSummary {
+        title: source.title.clone(),
+        description: nonblank(&description),
+        assignees: nonblank(&names),
+        created: local_time(source.metadata.created_at.as_deref()),
+    }
 }
 
 #[cfg(test)]
 mod summary_tests {
     use super::*;
     use std::prelude::v1::test;
+    #[test]
+    fn missing_metadata_does_not_create_placeholder_rows() {
+        let source = SourceTask {
+            guid: "empty".into(),
+            title: "保留标题".into(),
+            description: "  \n ** **".into(),
+            url: String::new(),
+            due: None,
+            completed: false,
+            metadata: Default::default(),
+        };
+        let summary = task_summary(&source);
+        assert_eq!(summary.title, "保留标题");
+        assert_eq!(summary.description, None);
+        assert_eq!(summary.assignees, None);
+        assert_eq!(summary.created, None);
+    }
+
+    #[test]
+    fn partial_metadata_keeps_only_available_fields() {
+        let mut source = SourceTask {
+            guid: "partial".into(),
+            title: "Title".into(),
+            description: String::new(),
+            url: String::new(),
+            due: None,
+            completed: false,
+            metadata: Default::default(),
+        };
+        source.metadata.assignees = vec![
+            lark2tapd_core::SourcePerson {
+                id: "1".into(),
+                name: "林".into(),
+            },
+            lark2tapd_core::SourcePerson {
+                id: "2".into(),
+                name: " \n".into(),
+            },
+            lark2tapd_core::SourcePerson {
+                id: "3".into(),
+                name: "Alex".into(),
+            },
+        ];
+        source.metadata.created_at = Some("invalid".into());
+        let summary = task_summary(&source);
+        assert_eq!(summary.assignees.as_deref(), Some("林, Alex"));
+        assert_eq!(summary.created, None);
+        assert_eq!(summary.description, None);
+
+        source.metadata.assignees.clear();
+        source.metadata.created_at = Some("1710000000000".into());
+        let summary = task_summary(&source);
+        assert_eq!(summary.assignees, None);
+        assert!(summary.created.is_some());
+        for invalid in ["", "0", "-1", "9223372036854775807"] {
+            source.metadata.created_at = Some(invalid.into());
+            assert_eq!(task_summary(&source).created, None);
+        }
+    }
+
     #[test]
     fn summary_includes_a_bounded_unicode_description() {
         let source = SourceTask {
@@ -342,9 +441,10 @@ mod summary_tests {
             metadata: Default::default(),
         };
         let summary = task_summary(&source);
-        assert!(summary[0].starts_with("你好 界"));
-        assert!(summary[0].ends_with('…'));
-        assert!(summary[0].chars().count() <= 121);
-        assert!(!summary[0].contains('\n'));
+        let description = summary.description.unwrap();
+        assert!(description.starts_with("你好 界"));
+        assert!(description.ends_with('…'));
+        assert!(description.chars().count() <= 121);
+        assert!(!description.contains('\n'));
     }
 }
