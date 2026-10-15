@@ -114,6 +114,24 @@ pub fn probe_cli(tool: CliTool, path: &Path) -> Result<String> {
     probe_with(tool, path, &[], &mut crate::process::run)
 }
 
+/// 产品配置入口与连接诊断共用同一份已验证的协议版本范围。
+pub fn probe_supported_cli(tool: CliTool, path: &Path) -> Result<String> {
+    let version = probe_cli(tool, path)?;
+    let supported = match tool {
+        CliTool::Lark => version == "1.0.96",
+        CliTool::Tapd => matches!(version.as_str(), "1.8.1" | "1.15.0"),
+    };
+    ensure!(
+        supported,
+        "Unsupported CLI version {version}; supported versions: {}",
+        match tool {
+            CliTool::Lark => "Lark 1.0.96",
+            CliTool::Tapd => "TAPD 1.8.1 or 1.15.0",
+        }
+    );
+    Ok(version)
+}
+
 type Runner<'a> =
     dyn FnMut(&Path, &[String], &[(String, String)], &[u8], Duration) -> Result<Vec<u8>> + 'a;
 fn probe_with(

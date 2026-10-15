@@ -36,4 +36,4 @@ PLIST
 plutil -lint "$app/Contents/Info.plist"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
-printf '\n已生成本地应用：%s\n默认真实模式；使用 LARK2TAPD_MOCK=1 或 --mock 启动演示，运行期间不能切换。\n' "$app"
+printf '\n已生成本地应用：%s\n仅支持真实连接；演示模式已移除，请移除 LARK2TAPD_MOCK 环境变量和旧 --mock/--live 参数。\n' "$app"

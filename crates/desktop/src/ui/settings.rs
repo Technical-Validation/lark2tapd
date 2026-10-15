@@ -8,7 +8,7 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let busy = self.model.read(cx).busy;
-        let credential_disabled = busy || self.model.read(cx).mode == Mode::Mock;
+        let credential_disabled = busy;
         div().p_4().rounded_md().bg(cx.theme().accent).flex().flex_col().gap_2()
                 .child(self.tr(cx,"确认安装到应用私有目录","Confirm app-local installation"))
                 .child(format!("{}: {}",self.tr(cx,"来源","Source"),plan.source))
@@ -21,22 +21,67 @@ impl Workspace {
     pub(super) fn settings_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let configured = model.tapd_configured();
-        div().flex_1().min_w_0().h_full().flex().flex_col()
-            .child(div().px_6().py_4().text_2xl().font_semibold().child(self.tr(cx,"设置中心","Settings")))
-            .child(div().id("settings-scroll").track_scroll(&self.settings_scroll).flex_1().min_w_0().min_h_0().overflow_y_scroll().p_6().flex().flex_col().gap_5()
-                .when(model.mode == Mode::Mock, |d| d.child(div().text_sm().text_color(cx.theme().muted_foreground).child(self.tr(cx,"演示模式：不会连接真实账号或保存凭证。","Demo mode: no real accounts are connected and no credentials are saved."))))
-                .child(section(self.tr(cx,"账号连接","Account connections")))
-                .child(self.inline_error("connection-status",cx))
-                .when(model.errors.contains_key("connection-status"), |d| d.child(self.focus_region("reload-connections", Button::new("reload-connections").label(self.tr(cx,"重新读取连接信息","Retry loading connections")).disabled(model.activities.contains("connection-status")).on_click(cx.listener(|this,_,_,cx| this.send(Job::LoadConnectionStatus,cx))))))
-                .child(self.connection_card(CliTool::Lark,cx))
-                .child(self.connection_card(CliTool::Tapd,cx))
-                .child(section(self.tr(cx,"导入设置","Import settings")))
-                .when(configured, |d| d.child(self.destination_settings(cx)))
-                .when(!configured, |d| d.child(section(self.tr(cx,"默认导入目标","Default destination"))).child(self.tapd_required("configure-tapd-destination",cx)))
-                .when(configured, |d| d.child(self.prefix_settings(cx)))
-                .when(!configured, |d| d.child(section(self.tr(cx,"项目空间前缀","Workspace prefixes"))).child(self.tapd_required("configure-tapd-prefixes",cx)))
-                .child(self.background_settings(cx))
-                .child(self.appearance_settings(cx)))
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_6()
+                    .py_4()
+                    .text_2xl()
+                    .font_semibold()
+                    .child(self.tr(cx, "设置中心", "Settings")),
+            )
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .track_scroll(&self.settings_scroll)
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .child(section(self.tr(cx, "账号连接", "Account connections")))
+                    .child(self.inline_error("connection-status", cx))
+                    .when(model.errors.contains_key("connection-status"), |d| {
+                        d.child(
+                            self.focus_region(
+                                "reload-connections",
+                                Button::new("reload-connections")
+                                    .label(self.tr(
+                                        cx,
+                                        "重新读取连接信息",
+                                        "Retry loading connections",
+                                    ))
+                                    .disabled(model.activities.contains("connection-status"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.send(Job::LoadConnectionStatus, cx)
+                                    })),
+                            ),
+                        )
+                    })
+                    .child(self.connection_card(CliTool::Lark, cx))
+                    .child(self.connection_card(CliTool::Tapd, cx))
+                    .child(section(self.tr(cx, "导入设置", "Import settings")))
+                    .when(configured, |d| d.child(self.destination_settings(cx)))
+                    .when(!configured, |d| {
+                        d.child(section(self.tr(cx, "默认导入目标", "Default destination")))
+                            .child(self.tapd_required("configure-tapd-destination", cx))
+                    })
+                    .when(configured, |d| d.child(self.prefix_settings(cx)))
+                    .when(!configured, |d| {
+                        d.child(section(self.tr(cx, "项目空间前缀", "Workspace prefixes")))
+                            .child(self.tapd_required("configure-tapd-prefixes", cx))
+                    })
+                    .child(self.background_settings(cx))
+                    .child(self.appearance_settings(cx)),
+            )
     }
     fn destination_settings(&self, cx: &Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);

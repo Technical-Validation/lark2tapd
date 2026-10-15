@@ -37,13 +37,381 @@ fn gateway(body: &str) -> (tempfile::TempDir, CliGateway) {
         .unwrap(),
     )
 }
+// 非零退出和 API 信封只保留结构化安全诊断，不能泄露消息、令牌或任务内容。
+#[test]
+fn safe_failures_preserve_exit_category_code_and_required_scope() {
+    for exit in [0, 7] {
+        let (_d, g) = gateway(&format!(
+            r#"
+print(json.dumps({{'status':0,'error':{{'type':'authorization','code':99991672,'missing_scopes':['task:task:read','secret-token'],'message':'secret-token task-content','hint':'secret-token'}}}}))
+print('secret-token',file=sys.stderr)
+sys.exit({exit})
+"#
+        ));
+        let error = g.check_tapd().unwrap_err().to_string();
+        assert!(error.contains("authorization"), "{error}");
+        assert!(error.contains("99991672"), "{error}");
+        assert!(error.contains("task:task:read"), "{error}");
+        if exit != 0 {
+            assert!(error.contains("exit 7"), "{error}");
+        }
+        assert!(!error.contains("secret-token") && !error.contains("task-content"));
+    }
+}
+
+// 原生 OAuth 必须使用相同 profile；环境 App Secret 会激活不支持 auth 的 provider。
+#[test]
+fn native_oauth_profile_is_used_for_auth_and_business_reads() {
+    let (_d, mut g) = gateway(
+        r#"
+assert not any(k in os.environ for k in ['LARKSUITE_CLI_APP_ID','LARKSUITE_CLI_APP_SECRET','LARKSUITE_CLI_USER_ACCESS_TOKEN'])
+assert os.environ.get('LARKSUITE_CLI_PROFILE')=='app'
+if a==['auth','status','--json','--verify']:
+ print(json.dumps({'appId':'app','identity':'user','verified':True,'identities':{'user':{'openId':'self'}}}))
+else:
+ assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']
+ print(json.dumps({'ok':True,'data':{'items':[],'has_more':False}}))
+"#,
+    );
+    g.credentials.lark_user_token.clear();
+    g.check_lark().unwrap();
+}
+
+#[test]
+fn device_login_is_split_and_rejects_partial_consent_and_untrusted_urls() {
+    for (url, missing) in [
+        (
+            "https://accounts.feishu.cn/oauth/verify?user_code=public",
+            false,
+        ),
+        ("https://accounts.larksuite.com/oauth/verify", true),
+        ("https://accounts.feishu.cn.evil.test/", false),
+        ("http://accounts.feishu.cn/", false),
+        ("https://user@accounts.feishu.cn/", false),
+    ] {
+        let (_d, mut g) = gateway(&format!(
+            r#"
+assert 'LARKSUITE_CLI_APP_SECRET' not in os.environ
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a==['auth','status','--json']:
+ print(json.dumps({{'appId':'app','brand':'feishu','identity':'none','identities':{{}}}}))
+elif a==['auth','login','--scope','task:task:read','--no-wait','--json']:
+ print(json.dumps({{'verification_url':'{url}','device_code':'one-time-secret','expires_in':600}}))
+elif a==['auth','login','--device-code','one-time-secret','--json']:
+ print(json.dumps({{'event':'authorization_complete','user_open_id':'self','scope':'task:task:read','granted':['task:task:read'],'missing':{missing_json},'warning':{{'hint':'one-time-secret'}}}}))
+ sys.exit({exit})
+else: sys.exit(99)
+"#,
+            missing_json = if missing { "['task:task:read']" } else { "[]" },
+            exit = if missing { 1 } else { 0 }
+        ));
+        g.credentials.lark_user_token.clear();
+        let start = g.begin_lark_login();
+        if url.starts_with("https://accounts.feishu.cn/")
+            || url.starts_with("https://accounts.larksuite.com/")
+        {
+            let authorization = start.unwrap();
+            assert_eq!(authorization.expires_in, 600);
+            assert_eq!(authorization.verification_url, url);
+            let result = g.finish_lark_login(&authorization);
+            assert_eq!(result.is_err(), missing);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("task:task:read"));
+                assert!(!format!("{error:?}").contains("one-time-secret"));
+            }
+        } else {
+            assert!(start.is_err());
+        }
+    }
+}
+
+#[test]
+fn report_keeps_scope_evidence_and_ancillary_failure_does_not_disconnect() {
+    let (_d, mut g) = gateway(
+        r#"
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a==['auth','status','--json','--verify']:
+ print(json.dumps({'appId':'app','brand':'feishu','identity':'user','verified':True,'identities':{'user':{'openId':'self','scope':'task:task:read offline_access'}}}))
+elif a==['auth','check','--scope','task:task:read','--json']:
+ print(json.dumps({'ok':True,'granted':['task:task:read'],'missing':None}))
+elif a==['auth','scopes','--json']:
+ print(json.dumps({'ok':False,'error':{'type':'network','code':503,'message':'secret-content'}})); sys.exit(2)
+else:
+ assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']
+ print(json.dumps({'ok':True,'data':{'items':[],'has_more':False}}))
+"#,
+    );
+    g.credentials.lark_user_token.clear();
+    let report = g.connection_report(installer::CliTool::Lark);
+    assert!(report.connected, "{report:?}");
+    assert_eq!(
+        report.user_scopes,
+        Some(vec!["offline_access".into(), "task:task:read".into()])
+    );
+    assert!(report.app_scopes.is_none());
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.state == PermissionState::Unknown && c.detail.contains("503"))
+    );
+    assert!(!format!("{report:?}").contains("secret-content"));
+}
+
+#[test]
+fn report_preserves_missing_scope_from_nonzero_check_and_partial_identity() {
+    let (_d, mut g) = gateway(
+        r#"
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a==['auth','status','--json','--verify']:
+ print(json.dumps({'appId':'app','identity':'user','verified':True,'identities':{'user':{'openId':'self'}}}))
+elif a==['auth','check','--scope','task:task:read','--json']:
+ print(json.dumps({'ok':False,'granted':None,'missing':['task:task:read']})); sys.exit(1)
+elif a==['auth','scopes','--json']: print(json.dumps({'userScopes':['task:task:read']}))
+else:
+ print(json.dumps({'ok':False,'error':{'type':'authorization','code':99991672,'missing_scopes':['task:task:read']}})); sys.exit(1)
+"#,
+    );
+    g.credentials.lark_user_token.clear();
+    let report = g.connection_report(installer::CliTool::Lark);
+    assert!(!report.connected);
+    assert!(report.failure.is_some());
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "User identity" && c.state == PermissionState::Granted)
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "task:task:read" && c.state == PermissionState::Missing)
+    );
+    assert_eq!(report.app_scopes, Some(vec!["task:task:read".into()]));
+}
+
+// profile add 在 CLI 内部拒绝碰撞和坏配置；只在显式保存后通过 stdin 提交凭据。
+#[test]
+fn explicit_profile_preparation_uses_stdin_and_never_switches_or_replaces_profiles() {
+    for existing in [false, true] {
+        let (dir, mut g) = gateway(&format!(
+            r#"
+assert 'LARKSUITE_CLI_APP_SECRET' not in os.environ
+assert 'secret' not in a
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a==['profile','list']:
+ print(json.dumps([{{'name':'other','appId':'other-app','brand':'lark','active':True}}]{existing}))
+else:
+ assert a==['profile','add','--name','lark2tapd-app','--app-id','app','--app-secret-stdin','--brand','feishu']
+ assert sys.stdin.read()=='secret\n'
+ with open(__file__+'.added','w') as f: f.write('added')
+"#,
+            existing = if existing {
+                "+[{'name':'existing','appId':'app','brand':'lark','active':False}]"
+            } else {
+                ""
+            }
+        ));
+        g.credentials.lark_user_token.clear();
+        g.prepare_lark_profile().unwrap();
+        assert_eq!(dir.path().join("fake.added").exists(), !existing);
+    }
+}
+
+#[test]
+fn preparation_refuses_bad_config_collision_and_multiline_secret_without_writing() {
+    for response in [
+        "print(json.dumps({'ok':False,'error':{'type':'config','message':'secret'}})); sys.exit(2)",
+        "print(json.dumps([{'name':'lark2tapd-app','appId':'unrelated','brand':'feishu'}]))",
+        "print('not-json')",
+    ] {
+        let (_dir, mut g) = gateway(&format!(
+            "if a==['--version']: print('lark-cli version 1.0.96')\nelif a==['profile','list']: {response}\nelse: sys.exit(99)"
+        ));
+        g.credentials.lark_user_token.clear();
+        let error = g.prepare_lark_profile().unwrap_err().to_string();
+        assert!(!error.contains("exit 99"));
+        assert!(!error.contains("\"secret\""));
+    }
+    let (_d, mut g) = gateway("sys.exit(99)");
+    g.credentials.lark_user_token.clear();
+    g.credentials.lark_app_secret = "first\nsecond".into();
+    assert!(
+        !g.prepare_lark_profile()
+            .unwrap_err()
+            .to_string()
+            .contains("exit 99")
+    );
+}
+
+#[test]
+fn mismatched_profile_cannot_authorize_or_read_tasks() {
+    let (_dir, mut g) = gateway(
+        r#"
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a[:2]==['auth','status']:
+ print(json.dumps({'appId':'other','identity':'user','verified':True,'identities':{'user':{'openId':'self'}}}))
+else: sys.exit(99)
+"#,
+    );
+    g.credentials.lark_user_token.clear();
+    assert!(
+        g.check_lark()
+            .unwrap_err()
+            .to_string()
+            .contains("does not match")
+    );
+    assert!(
+        g.begin_lark_login()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("does not match")
+    );
+}
+
+#[test]
+fn tapd_report_reads_selected_workspace_and_never_claims_write_permissions() {
+    let (_d, g) = gateway(
+        r#"
+if a==['--version']: print('1.15.0')
+elif a==['--help']: print('Usage: tapd-cli [options] [command]')
+elif a==['user','info']: print(json.dumps({'status':1,'data':{'id':'123'}}))
+else:
+ assert a==['story','list','workspaceid=42','limit=1','page=1']
+ print(json.dumps({'status':1,'data':[]}))
+"#,
+    );
+    let report = g.connection_report(installer::CliTool::Tapd);
+    assert!(report.connected, "{report:?}");
+    for name in [
+        "Token permission enumeration",
+        "Task write",
+        "Attachment upload",
+    ] {
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == name && c.state == PermissionState::Unknown)
+        );
+    }
+}
+
+#[test]
+fn tapd_initial_setup_accepts_known_versions_without_requiring_a_workspace() {
+    for version in ["1.15.0", "1.8.1"] {
+        let (_d, mut g) = gateway(&format!(
+            r#"
+if a==['--version']: print('{version}')
+elif a==['--help']: print('Usage: tapd-cli [options] [command]')
+else:
+ assert a==['user','info']
+ print(json.dumps({{'status':1,'data':{{'id':'123'}}}}))
+"#
+        ));
+        g.settings.workspace_id.clear();
+        let report = g.connection_report(installer::CliTool::Tapd);
+        assert!(report.connected, "{version}: {report:?}");
+        assert!(report.failure.is_none());
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "Workspace read" && c.state == PermissionState::Unknown)
+        );
+    }
+}
+
+#[test]
+fn app_scope_list_is_compared_to_required_permission_not_just_fetched() {
+    for (scopes, expected) in [
+        ("[]", PermissionState::Missing),
+        ("['contact:user.base:readonly']", PermissionState::Missing),
+        ("['task:task:read']", PermissionState::Granted),
+        ("None", PermissionState::Unknown),
+    ] {
+        let (_d, mut g) = gateway(&format!(
+            r#"
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a==['auth','status','--json','--verify']:
+ print(json.dumps({{'appId':'app','identity':'user','verified':True,'identities':{{'user':{{'openId':'self'}}}}}}))
+elif a==['auth','check','--scope','task:task:read','--json']:
+ print(json.dumps({{'ok':True,'granted':['task:task:read'],'missing':None}}))
+elif a==['auth','scopes','--json']: print(json.dumps({{'userScopes':{scopes}}}))
+else:
+ assert a[:2]==['task','+get-related-tasks']
+ print(json.dumps({{'ok':True,'data':{{'items':[],'has_more':False}}}}))
+"#
+        ));
+        g.credentials.lark_user_token.clear();
+        let report = g.connection_report(installer::CliTool::Lark);
+        assert!(
+            report.connected,
+            "a successful read remains evidence even if ancillary metadata differs"
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "App task:task:read")
+            .expect("required app permission comparison");
+        assert_eq!(check.state, expected);
+    }
+}
+
+#[test]
+fn missing_scope_metadata_is_unknown_not_missing_when_read_succeeds() {
+    let (_d, mut g) = gateway(
+        r#"
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a==['auth','status','--json','--verify']:
+ print(json.dumps({'appId':'native','identity':'user','verified':True,'identities':{'user':{'openId':'self'}}}))
+elif a==['auth','check','--scope','task:task:read','--json']:
+ print(json.dumps({'ok':True,'granted':None,'missing':None}))
+elif a==['auth','scopes','--json']: print(json.dumps({'userScopes':None}))
+else:
+ assert a[:2]==['task','+get-related-tasks']
+ print(json.dumps({'ok':True,'data':{'items':[],'has_more':False}}))
+"#,
+    );
+    g.credentials = Credentials::default();
+    let report = g.connection_report(installer::CliTool::Lark);
+    assert!(report.connected, "{report:?}");
+    assert!(report.user_scopes.is_none() && report.app_scopes.is_none());
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "task:task:read" && c.state == PermissionState::Unknown)
+    );
+}
+
+#[test]
+fn failed_identity_transport_does_not_probe_a_different_account() {
+    let (dir, mut g) = gateway(
+        r#"
+if a==['--version']: print('lark-cli version 1.0.96')
+elif a[:2]==['auth','status']:
+ print(json.dumps({'appId':'different','identity':'user','verified':True,'identities':{'user':{'openId':'other'}}}))
+else:
+ with open(__file__+'.unexpected','w') as f: f.write('unexpected')
+ sys.exit(99)
+"#,
+    );
+    g.credentials.lark_user_token.clear();
+    let report = g.connection_report(installer::CliTool::Lark);
+    assert!(!report.connected);
+    assert!(!dir.path().join("fake.unexpected").exists());
+}
+
 // OAuth 身份仅由假进程提供；检查每次刷新恰好验证一次。
 fn oauth_gateway(body: &str) -> (tempfile::TempDir, CliGateway) {
     let (d, mut g) = gateway(&format!(
         r#"
 if a==['auth','status','--json','--verify']:
  with open(__file__+'.auth','a') as f: f.write('verify\n')
- print('{{"identity":"user","verified":true,"identities":{{"user":{{"openId":"self"}}}}}}')
+ print('{{"appId":"app","identity":"user","verified":true,"identities":{{"user":{{"openId":"self"}}}}}}')
  sys.exit(0)
 {body}
 "#

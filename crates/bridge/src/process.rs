@@ -65,6 +65,52 @@ pub(crate) fn run(
     input: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    let output = run_output(path, args, env, input, timeout)?;
+    if !output.status.success() {
+        return Err(output.failure());
+    }
+    Ok(output.stdout.to_vec())
+}
+
+// 原始输出只在桥接内部短暂保留；错误由白名单字段重建，不携带输出链。
+pub(crate) struct ProcessOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: zeroize::Zeroizing<Vec<u8>>,
+    pub stderr: zeroize::Zeroizing<Vec<u8>>,
+}
+impl ProcessOutput {
+    pub fn failure(&self) -> anyhow::Error {
+        let stdout: serde_json::Value = serde_json::from_slice(&self.stdout).unwrap_or_default();
+        let value = if stdout.get("error").is_some()
+            || stdout.get("code").is_some()
+            || stdout.get("type").is_some()
+        {
+            stdout
+        } else {
+            serde_json::from_slice(&self.stderr).unwrap_or(stdout)
+        };
+        crate::diagnostics::api_failure("CLI", &value, self.status.code())
+    }
+}
+pub(crate) fn run_output(
+    path: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    input: &[u8],
+    timeout: Duration,
+) -> Result<ProcessOutput> {
+    run_output_cancellable(path, args, env, input, timeout, &AtomicBool::new(false))
+}
+
+pub(crate) fn run_output_cancellable(
+    path: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    input: &[u8],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<ProcessOutput> {
+    anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "CLI operation cancelled");
     let deadline = Instant::now() + timeout;
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<_> = std::env::split_paths(&inherited).collect();
@@ -141,6 +187,9 @@ pub(crate) fn run(
         Ok(())
     });
     let result = loop {
+        if cancelled.load(Ordering::SeqCst) {
+            break Err(anyhow::anyhow!("CLI operation cancelled"));
+        }
         if overflow.load(Ordering::Relaxed) {
             break Err(anyhow::anyhow!("CLI output exceeded safety limit"));
         }
@@ -168,15 +217,20 @@ pub(crate) fn run(
     if overflow.load(Ordering::Relaxed) {
         bail!("CLI output exceeded safety limit");
     }
-    if !status.success() {
-        bail!("CLI command failed; check authentication and configuration");
-    }
-    if !matches!(write_result, Ok(Ok(()))) || !matches!(errors, Ok(Ok(_))) {
+    if status.success() && !matches!(write_result, Ok(Ok(()))) {
         bail!("CLI I/O failed");
     }
-    output
+    let stdout = output
         .map_err(|_| anyhow::anyhow!("CLI reader failed"))?
-        .map_err(|_| anyhow::anyhow!("CLI I/O failed"))
+        .map_err(|_| anyhow::anyhow!("CLI I/O failed"))?;
+    let stderr = errors
+        .map_err(|_| anyhow::anyhow!("CLI reader failed"))?
+        .map_err(|_| anyhow::anyhow!("CLI I/O failed"))?;
+    Ok(ProcessOutput {
+        status,
+        stdout: zeroize::Zeroizing::new(stdout),
+        stderr: zeroize::Zeroizing::new(stderr),
+    })
 }
 
 #[cfg(test)]
@@ -189,6 +243,44 @@ mod tests {
         fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
         (dir, p)
+    }
+    #[test]
+    fn cancellation_stops_exchange_before_token_write() {
+        let (dir, p) =
+            script("(sleep 0.4; printf token > \"$MARKER\") & printf ready > \"$READY\"; wait");
+        let marker = dir.path().join("token");
+        let ready = dir.path().join("ready");
+        let cancelled = AtomicBool::new(false);
+        let cancelled_at = std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !ready.exists() {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(2));
+                }
+                *cancelled_at.lock().unwrap() = Some(Instant::now());
+                cancelled.store(true, Ordering::SeqCst);
+            });
+            let result = run_output_cancellable(
+                &p,
+                &[],
+                &[
+                    ("MARKER".into(), marker.to_string_lossy().into_owned()),
+                    ("READY".into(), ready.to_string_lossy().into_owned()),
+                ],
+                b"",
+                Duration::from_secs(5),
+                &cancelled,
+            );
+            assert!(
+                result.is_err(),
+                "cancelled exchange completed and wrote a token"
+            );
+        });
+        assert!(cancelled_at.lock().unwrap().unwrap().elapsed() < Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists(), "cancelled descendant persisted a token");
     }
     #[test]
     fn passes_stdin_and_env_without_shell_interpolation() {
@@ -226,6 +318,20 @@ mod tests {
         let (_d, p) = script("echo secret; echo secret >&2; exit 4");
         let e = run(&p, &["secret".into()], &[], b"", Duration::from_secs(2)).unwrap_err();
         assert!(!format!("{e:?}").contains("secret"));
+    }
+    #[test]
+    fn structured_stderr_survives_nonzero_with_uninformative_stdout() {
+        let (_d, p) = script(
+            "echo '{}'; echo '{\"error\":{\"type\":\"network\",\"code\":503,\"message\":\"private-token\"}}' >&2; exit 8",
+        );
+        let error = run(&p, &[], &[], b"", Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("network") && error.contains("503") && error.contains("exit 8"),
+            "{error}"
+        );
+        assert!(!error.contains("private-token"));
     }
     #[test]
     fn output_limit_rejects_instead_of_truncating_json() {

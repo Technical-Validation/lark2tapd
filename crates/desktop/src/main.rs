@@ -13,15 +13,13 @@ use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--help") {
-        println!(
-            "lark2tapd [--mock | --live] [--data-dir PATH]\nLARK2TAPD_MOCK=1 enables isolated demo mode. Default: live; CLI flags override environment. Credentials stay in macOS Keychain."
-        );
-        return;
-    }
+    let mock_env = std::env::var_os("LARK2TAPD_MOCK");
     let options = match startup::LaunchOptions::parse(
         &args[1..],
-        std::env::var("LARK2TAPD_MOCK").ok().as_deref(),
+        mock_env
+            .as_ref()
+            .map(|value| value.to_string_lossy())
+            .as_deref(),
     ) {
         Ok(options) => options,
         Err(error) => {
@@ -29,7 +27,13 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mode = options.mode;
+    if options.help {
+        println!(
+            "lark2tapd [--data-dir PATH] [--help]\nLive connections only. Demo mode removed: unset LARK2TAPD_MOCK and remove --mock/--live. Credentials stay in macOS Keychain."
+        );
+        return;
+    }
+    let mode = worker::Mode::Live;
     let root = options.data_dir.unwrap_or_else(|| {
         PathBuf::from(std::env::var_os("HOME").expect("HOME is required"))
             .join("Library/Application Support/Lark2Tapd")

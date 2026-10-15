@@ -1,5 +1,8 @@
+mod connection;
 mod credentials;
+pub use connection::{ConnectionReport, DeviceAuthorization, PermissionCheck, PermissionState};
 mod description;
+mod diagnostics;
 pub mod installer;
 mod media;
 mod process;
@@ -76,14 +79,8 @@ impl CliGateway {
     fn env(&self, lark: bool) -> Vec<(String, String)> {
         let c = &self.credentials;
         let pairs = if lark {
-            vec![
-                ("LARKSUITE_CLI_APP_ID", c.lark_app_id.as_str()),
-                ("LARKSUITE_CLI_APP_SECRET", c.lark_app_secret.as_str()),
-                (
-                    "LARKSUITE_CLI_USER_ACCESS_TOKEN",
-                    c.lark_user_token.as_str(),
-                ),
-            ]
+            // auth 与任务读取必须使用同一原生 profile；AppID/Secret 环境变量会切换 provider。
+            vec![("LARKSUITE_CLI_PROFILE", c.lark_app_id.as_str())]
         } else {
             vec![
                 ("TAPD_TOKEN", c.tapd_token.as_str()),
@@ -131,10 +128,9 @@ impl CliGateway {
             params,
             remaining(deadline)?,
         )?;
-        ensure!(
-            v.get("ok").and_then(Value::as_bool) == Some(true),
-            "Lark request failed; check task read permission and authentication"
-        );
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(diagnostics::api_failure("Lark", &v, None));
+        }
         v.get("data")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Lark response missing data"))
@@ -154,10 +150,9 @@ impl CliGateway {
         let mut args = vec![kind.into(), verb.into()];
         args.extend(params);
         let v = self.invoke(false, args, Value::Null, Duration::from_secs(30))?;
-        ensure!(
-            v.get("status").and_then(Value::as_i64) == Some(1),
-            "TAPD request failed; check workspace and authentication"
-        );
+        if v.get("status").and_then(Value::as_i64) != Some(1) {
+            return Err(diagnostics::api_failure("TAPD", &v, None));
+        }
         v.get("data")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("TAPD response missing data"))
@@ -239,26 +234,6 @@ impl CliGateway {
             })
             .collect()
     }
-    /// 必须由用户主动触发并在工作线程执行；CLI 自行打开浏览器和管理其凭据。
-    pub fn login_lark(&self) -> Result<()> {
-        let v = self.invoke(
-            true,
-            ["auth", "login", "--scope", "task:task:read", "--json"]
-                .map(String::from)
-                .to_vec(),
-            Value::Null,
-            Duration::from_secs(180),
-        )?;
-        ensure!(
-            v.get("ok").and_then(Value::as_bool) != Some(false),
-            "Lark login failed"
-        );
-        ensure!(
-            self.oauth_status()?.authenticated,
-            "Lark login is not verified"
-        );
-        Ok(())
-    }
     fn lark_identity(&self) -> Result<Value> {
         self.lark_identity_until(Instant::now() + Duration::from_secs(30))
     }
@@ -268,14 +243,16 @@ impl CliGateway {
             self.credentials.lark_user_token.is_empty(),
             "Cannot verify manual Lark user token identity; clear saved credentials and use CLI OAuth login"
         );
-        self.invoke(
+        let status = self.invoke(
             true,
             ["auth", "status", "--json", "--verify"]
                 .map(String::from)
                 .to_vec(),
             Value::Null,
             remaining(deadline)?,
-        )
+        )?;
+        self.validate_lark_profile(&status)?;
+        Ok(status)
     }
     pub fn oauth_status(&self) -> Result<AuthStatus> {
         self.oauth_status_until(Instant::now() + Duration::from_secs(30))
@@ -444,10 +421,9 @@ impl CliGateway {
             args.extend(["--page-token".into(), page.into()]);
         }
         let response = self.invoke(true, args, Value::Null, remaining(deadline)?)?;
-        ensure!(
-            response.get("ok").and_then(Value::as_bool) == Some(true),
-            "Lark related task request failed; check user task permission"
-        );
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(diagnostics::api_failure("Lark", &response, None));
+        }
         let data = response
             .get("data")
             .ok_or_else(|| anyhow::anyhow!("Lark response missing data"))?;

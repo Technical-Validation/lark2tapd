@@ -2,8 +2,108 @@
 use super::*;
 
 #[gpui_kit::test]
-fn connection_forms_are_hidden_until_requested(cx: &mut TestAppContext) {
+fn cli_must_be_verified_before_configuration(cx: &mut TestAppContext) {
     let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    model.update(cx, |m, cx| {
+        m.lark_connection = ServiceConnection::default();
+        m.tapd_connection = ServiceConnection::default();
+        cx.notify();
+    });
+    cx.update_window(settings, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("connect-lark").is_none(),
+            "an existing path alone must not enable account configuration"
+        );
+        assert!(w.try_find("connect-tapd").is_none());
+        assert!(w.try_find("check-lark").is_none());
+        assert!(w.try_find("probe-lark-cli").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn permission_summary_precedes_test_and_failure_is_below_it(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::ConnectionReport {
+                tool: CliTool::Lark,
+                report: ConnectionReport {
+                    connected: false,
+                    checks: vec![lark2tapd_bridge::PermissionCheck {
+                        name: "task:task:read".into(),
+                        state: PermissionState::Missing,
+                        detail: "Required user grant missing".into(),
+                    }],
+                    user_scopes: Some(Vec::new()),
+                    app_scopes: Some(vec!["task:task:read".into()]),
+                    failure: Some(
+                        "Lark permission check: missing task:task:read (code 99991672)".into(),
+                    ),
+                },
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let button = cx
+        .update_window(settings, |_, w, cx| {
+            w.render_frame(cx);
+            w.find("check-lark").bounds()
+        })
+        .unwrap();
+    let mut visual = VisualTestContext::from_window(settings, cx);
+    let summary = visual.debug_bounds("lark-permission-summary").unwrap();
+    let error = visual.debug_bounds("lark-operation-error").unwrap();
+    assert!(summary.bottom() <= button.top());
+    assert!(error.top() >= button.bottom());
+    assert!(error.size.height > px(0.));
+    cx.read(|cx| assert!(model.read(cx).errors["lark-connection"].contains("99991672")));
+}
+
+#[gpui_kit::test]
+fn device_authorization_link_requires_explicit_click_and_is_cleared(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    let url = "https://accounts.feishu.cn/accounts/page/device";
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::AuthorizationRequired {
+                verification_url: url.into(),
+                expires_in: 180,
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert!(cx.opened_url().is_none());
+    click(cx, settings, "open-lark-authorization");
+    assert_eq!(cx.opened_url().as_deref(), Some(url));
+    model.update(cx, |m, cx| m.receive(Event::AuthorizationFinished, cx));
+    cx.run_until_parked();
+    cx.update_window(settings, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("open-lark-authorization").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn product_has_no_demo_action(cx: &mut TestAppContext) {
+    let (_dir, _events, _model, main, _) = setup(cx);
+    cx.update_window(main, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("demo-change").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn connection_forms_are_hidden_until_requested(cx: &mut TestAppContext) {
+    let (_dir, _events, _model, main, _) = setup(cx);
     let (settings, view) = open_settings_for_test(cx, main);
     cx.update_window(settings, |_, w, cx| {
         w.render_frame(cx);
@@ -27,18 +127,6 @@ fn connection_forms_are_hidden_until_requested(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| set(&v.tapd_token, "dummy-token".into(), w, cx));
     })
     .unwrap();
-    click(cx, settings, "save-tapd-connection");
-    cx.read(|cx| {
-        assert!(view.read(cx).tapd_form_open);
-        assert_eq!(
-            view.read(cx).tapd_token.read(cx).value().as_ref(),
-            "dummy-token"
-        );
-        assert!(
-            !model.read(cx).activities.contains("tapd-connection"),
-            "disabled mock form must not enqueue a save"
-        );
-    });
 }
 
 #[gpui_kit::test]
@@ -47,7 +135,8 @@ fn unconfigured_tapd_gates_destination_and_prefixes(cx: &mut TestAppContext) {
     let (settings, _) = open_settings_for_test(cx, main);
     // 只改变 UI 的展示模式；后台仍是 mock，不会发起真实账户操作。
     model.update(cx, |m, cx| {
-        m.mode = Mode::Live;
+        m.tapd_connection.saved = false;
+        m.tapd_connection.verified = false;
         cx.notify();
     });
     cx.update_window(settings, |_, w, cx| {
@@ -96,11 +185,15 @@ fn saved_connections_are_distinct_from_verification_and_clear_independently(
             cx,
         );
         m.receive(
-            Event::Diagnostic {
+            Event::ConnectionReport {
                 tool: CliTool::Tapd,
-                version: None,
-                connected: true,
-                detail: String::new(),
+                report: ConnectionReport {
+                    connected: true,
+                    checks: Vec::new(),
+                    user_scopes: None,
+                    app_scopes: None,
+                    failure: None,
+                },
             },
             cx,
         );
@@ -109,7 +202,16 @@ fn saved_connections_are_distinct_from_verification_and_clear_independently(
     cx.read(|cx| {
         assert!(model.read(cx).tapd_connection.verified);
         assert!(!model.read(cx).lark_connection.verified);
-        assert!(!model.read(cx).tapd_diagnostic.contains("CLI 不可用"));
+        assert!(
+            model
+                .read(cx)
+                .tapd_connection
+                .report
+                .as_ref()
+                .unwrap()
+                .failure
+                .is_none()
+        );
     });
     cx.update_window(settings, |_, w, cx| {
         w.render_frame(cx);

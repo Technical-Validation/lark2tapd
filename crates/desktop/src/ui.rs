@@ -40,7 +40,7 @@ use gpui_kit::component::{
     input::{Input, InputState},
 };
 use gpui_kit::{prelude::*, *};
-use lark2tapd_bridge::Credentials;
+use lark2tapd_bridge::{ConnectionReport, Credentials, PermissionState};
 use lark2tapd_core::{Draft, Snapshot, SourceTask, SyncRecord, SyncStatus};
 
 #[derive(Clone)]
@@ -89,8 +89,7 @@ pub struct Model {
     pending_error: Option<String>,
     pub mode: Mode,
     pub install_plan: Option<InstallationPlan>,
-    pub lark_diagnostic: String,
-    pub tapd_diagnostic: String,
+    lark_authorization: Option<(String, u64)>,
     pub activities: BTreeSet<String>,
     pub errors: BTreeMap<&'static str, String>,
     pub checked_workspace: Option<TapdWorkspace>,
@@ -112,18 +111,6 @@ impl Model {
         self.send_at(job, self.profile.clone(), cx);
     }
     fn send_at(&mut self, job: Job, profile: String, cx: &mut Context<Self>) {
-        // 测试按钮始终可点；演示模式解释边界，不伪装为真实连接成功。
-        if let Job::Check(tool) = &job
-            && self.mode == Mode::Mock
-        {
-            let note=text(self.language(),"演示模式：未执行真实连接测试。以 LARK2TAPD_MOCK=0 重启后可测试真实服务。","Demo mode: no real connection test was run. Restart with LARK2TAPD_MOCK=0 to test real services.").to_owned();
-            match tool {
-                CliTool::Lark => self.lark_diagnostic = note,
-                CliTool::Tapd => self.tapd_diagnostic = note,
-            }
-            cx.notify();
-            return;
-        }
         let field = match &job {
             Job::SetPreference(Preference::PollMinutes(_)) => Some("poll"),
             Job::SetPreference(Preference::DefaultDestination { .. }) => Some("destination"),
@@ -132,23 +119,42 @@ impl Model {
             ) => Some("prefixes"),
             Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
             Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
-            Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => {
+            Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) | Job::Check(tool) => {
                 Some(connections::field_key(*tool))
             }
             Job::LoadConnectionStatus => Some("connection-status"),
+            Job::ProbeCli(tool) => Some(connections::cli_key(*tool)),
             Job::LocalFile { .. } | Job::PastedImage { .. } => Some("attachments"),
             _ => None,
         };
         if let Some(field) = field {
             self.errors.remove(field);
         }
+        if let Job::ProbeCli(tool) = &job {
+            let state = self.connection_mut(*tool);
+            state.cli_version = None;
+            state.cli_error = None;
+            state.verified = false;
+            state.report = None;
+            self.errors.remove(connections::field_key(*tool));
+        }
+        if let Job::Check(tool) = &job {
+            self.connection_mut(*tool).report = None;
+            self.connection_mut(*tool).verified = false;
+        }
         // 提交即锁定该服务，避免后台 Activity 到达前的重复保存/清除。
         if let Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) = &job {
-            if self.activities.contains(connections::field_key(*tool)) {
+            if matches!(&job, Job::SaveAndConnect { .. })
+                && self.activities.contains(connections::field_key(*tool))
+            {
                 return;
             }
             self.activities.insert(connections::field_key(*tool).into());
             self.connection_mut(*tool).verified = false;
+            self.connection_mut(*tool).report = None;
+            if *tool == CliTool::Lark {
+                self.lark_authorization = None;
+            }
         }
         if matches!(&job, Job::Submit(..)) {
             if self.activities.contains("submit") {
@@ -190,6 +196,37 @@ impl Model {
                 }
             );
         match event {
+            Event::CliProbe {
+                tool,
+                version,
+                error,
+            } => {
+                let state = self.connection_mut(tool);
+                state.cli_version = version;
+                state.cli_error = error;
+                if state.cli_version.is_none() {
+                    state.verified = false;
+                    state.report = None;
+                }
+            }
+            Event::ConnectionReport { tool, report } => {
+                if let Some(error) = &report.failure {
+                    self.errors
+                        .insert(connections::field_key(tool), error.clone());
+                } else {
+                    self.errors.remove(connections::field_key(tool));
+                }
+                let state = self.connection_mut(tool);
+                state.verified = report.connected;
+                state.report = Some(report);
+            }
+            Event::AuthorizationRequired {
+                verification_url,
+                expires_in,
+            } => {
+                self.lark_authorization = Some((verification_url, expires_in));
+            }
+            Event::AuthorizationFinished => self.lark_authorization = None,
             Event::ConnectionStatus {
                 lark_saved,
                 tapd_saved,
@@ -207,10 +244,12 @@ impl Model {
                 });
             }
             Event::CredentialsCleared(tool) => {
-                *self.connection_mut(tool) = ServiceConnection::default();
-                match tool {
-                    CliTool::Lark => self.lark_diagnostic.clear(),
-                    CliTool::Tapd => self.tapd_diagnostic.clear(),
+                let state = self.connection_mut(tool);
+                state.saved = false;
+                state.verified = false;
+                state.report = None;
+                if tool == CliTool::Lark {
+                    self.lark_authorization = None;
                 }
                 cx.emit(CredentialChange {
                     tool,
@@ -262,9 +301,25 @@ impl Model {
                 if new_count > 0 && !first && mode == Mode::Live {
                     native::notify_new(&snapshot.settings.language, new_count);
                 }
-                if matches!(message, "installed") {
-                    self.lark_diagnostic.clear();
-                    self.tapd_diagnostic.clear();
+                for (tool, path) in [
+                    (CliTool::Lark, &snapshot.settings.lark_path),
+                    (CliTool::Tapd, &snapshot.settings.tapd_path),
+                ] {
+                    let changed_path = self.snapshot.as_ref().is_some_and(|s| match tool {
+                        CliTool::Lark => &s.settings.lark_path != path,
+                        CliTool::Tapd => &s.settings.tapd_path != path,
+                    });
+                    if changed_path || message == "installed" {
+                        let state = self.connection_mut(tool);
+                        state.cli_version = None;
+                        state.cli_error = None;
+                        state.verified = false;
+                        state.report = None;
+                        let model = cx.entity();
+                        cx.defer(move |cx| {
+                            model.update(cx, |m, cx| m.send(Job::ProbeCli(tool), cx))
+                        });
+                    }
                 }
                 if matches!(message, "installed" | "install_cancelled") {
                     self.install_plan = None;
@@ -345,37 +400,6 @@ impl Model {
             Event::InstallPlan(plan) => {
                 self.install_plan = Some(plan);
             }
-            Event::Diagnostic {
-                tool,
-                version,
-                connected,
-                detail,
-            } => {
-                self.connection_mut(tool).verified = connected;
-                let status = if connected {
-                    text(self.language(), "连接通过", "Connected")
-                } else {
-                    text(self.language(), "连接未通过", "Connection failed")
-                };
-                // 未探测版本不是 CLI 不可用；清除凭证只重置验证状态，不伪造失败。
-                let result = if !connected && version.is_none() && detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "{}{status}{}",
-                        version.map(|v| format!("{v} · ")).unwrap_or_default(),
-                        if detail.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {detail}")
-                        }
-                    )
-                };
-                match tool {
-                    CliTool::Lark => self.lark_diagnostic = result,
-                    CliTool::Tapd => self.tapd_diagnostic = result,
-                }
-            }
             Event::Error(error) => {
                 self.error = true;
                 self.notice = format!(
@@ -440,8 +464,7 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
         pending_error: None,
         mode,
         install_plan: None,
-        lark_diagnostic: String::new(),
-        tapd_diagnostic: String::new(),
+        lark_authorization: None,
         activities: BTreeSet::new(),
         errors: BTreeMap::new(),
         checked_workspace: None,
@@ -1147,6 +1170,12 @@ impl Workspace {
             }
         }
         self.send(Job::LoadConnectionStatus, cx);
+        for tool in [CliTool::Lark, CliTool::Tapd] {
+            let state = self.model.read(cx).connection(tool);
+            if state.cli_version.is_none() && state.cli_error.is_none() {
+                self.send(Job::ProbeCli(tool), cx);
+            }
+        }
         cx.notify();
     }
     // 产品入口与状态分段属于列表栏，不再占用第三个导航栏。
@@ -1216,9 +1245,7 @@ impl Render for Workspace {
         }
         self.sync_description(window, cx);
         let model = self.model.read(cx);
-        let busy = model.busy;
         let checking = model.activities.contains("tasks");
-        let is_mock = model.mode == Mode::Mock;
         div()
             .track_focus(&self.focus_handle)
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
@@ -1263,19 +1290,11 @@ impl Render for Workspace {
                                             .text_xs()
                                             .truncate()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(if is_mock {
-                                                self.tr(
-                                                    cx,
-                                                    "演示模式 · 不会写入远端",
-                                                    "Demo · no remote writes",
-                                                )
-                                            } else {
-                                                self.tr(
-                                                    cx,
-                                                    "真实连接 · 手动确认写入",
-                                                    "Live · confirm every write",
-                                                )
-                                            }),
+                                            .child(self.tr(
+                                                cx,
+                                                "手动确认写入",
+                                                "Confirm every write",
+                                            )),
                                     ),
                             )
                             .child(self.last_check.clone())
@@ -1296,21 +1315,6 @@ impl Render for Workspace {
                                         self.tr(cx, "就绪", "Ready")
                                     }),
                             )
-                            .when(is_mock, |d| {
-                                d.child(
-                                    Button::new("demo-change")
-                                        .label(self.tr(
-                                            cx,
-                                            "模拟来源变更",
-                                            "Simulate a source change",
-                                        ))
-                                        .ghost()
-                                        .disabled(busy)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.send(Job::ChangeDemo, cx)
-                                        })),
-                                )
-                            })
                             .child(
                                 Button::new("refresh")
                                     .label(if checking {

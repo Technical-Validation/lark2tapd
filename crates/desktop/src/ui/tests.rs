@@ -52,15 +52,21 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
         snapshot: None,
         busy: false,
         connections_loaded: false,
-        lark_connection: ServiceConnection::default(),
-        tapd_connection: ServiceConnection::default(),
+        lark_connection: ServiceConnection {
+            cli_version: Some("test Lark CLI".into()),
+            ..Default::default()
+        },
+        tapd_connection: ServiceConnection {
+            cli_version: Some("test TAPD CLI".into()),
+            verified: true,
+            ..Default::default()
+        },
         notice: String::new(),
         error: false,
         pending_error: None,
         mode: Mode::Mock,
         install_plan: None,
-        lark_diagnostic: String::new(),
-        tapd_diagnostic: String::new(),
+        lark_authorization: None,
         activities: BTreeSet::new(),
         errors: BTreeMap::new(),
         checked_workspace: None,
@@ -863,8 +869,9 @@ fn workspace_form_requires_check_for_exact_current_fields(cx: &mut TestAppContex
 
 #[gpui_kit::test]
 fn cli_test_buttons_remain_clickable_while_busy_and_paths_are_readonly(cx: &mut TestAppContext) {
-    let (_dir, _events, model, handle, _view) = setup(cx);
+    let (_dir, events, model, handle, _view) = setup(cx);
     let (handle, view) = open_settings_for_test(cx, handle);
+    click(cx, handle, "connect-lark");
     model.update(cx, |m, cx| {
         m.busy = true;
         cx.notify();
@@ -879,12 +886,13 @@ fn cli_test_buttons_remain_clickable_while_busy_and_paths_are_readonly(cx: &mut 
     .unwrap();
     cx.read(|cx| assert_eq!(view.read(cx).lark_path.read(cx).value(), original));
     click(cx, handle, "check-lark");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).errors.contains_key("lark-connection")
+    });
     cx.read(|cx| {
         assert!(
-            model
-                .read(cx)
-                .lark_diagnostic
-                .contains("未执行真实连接测试")
+            model.read(cx).errors["lark-connection"]
+                .contains("Test mode never accesses external accounts")
         )
     });
 }

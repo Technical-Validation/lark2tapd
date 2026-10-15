@@ -1,24 +1,46 @@
 //! 串行 actor 拥有数据库与写入日志；只读任务并行取回数据，按账户/配置代数合并。
 use anyhow::{Result, bail};
 use lark2tapd_bridge::installer::{
-    CliTool, InstallationPlan, install_cli, installation_plan, probe_cli,
+    CliTool, InstallationPlan, install_cli, installation_plan, probe_supported_cli,
 };
-use lark2tapd_bridge::{CliGateway, Credentials, load_credentials, save_credentials};
+use lark2tapd_bridge::{
+    CliGateway, ConnectionReport, Credentials, load_credentials, save_credentials,
+};
+#[cfg(test)]
+use lark2tapd_core::MockGateway;
 use lark2tapd_core::{
-    Draft, DraftAttachment, Engine, Gateway, MockGateway, Settings, Snapshot, SourceTask,
-    TapdMember, TapdWorkspace, TargetTask,
+    Draft, DraftAttachment, Engine, Gateway, Settings, Snapshot, SourceTask, TapdMember,
+    TapdWorkspace, TargetTask,
 };
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Weak, mpsc},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    #[cfg(test)]
     Mock,
     Live,
+}
+
+impl Mode {
+    pub fn is_mock(self) -> bool {
+        #[cfg(test)]
+        {
+            self == Self::Mock
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
 }
 
 pub enum Job {
@@ -61,7 +83,7 @@ pub enum Job {
         credentials: Credentials,
     },
     Check(CliTool),
-    ChangeDemo,
+    ProbeCli(CliTool),
     Recover {
         guid: String,
         workspace: String,
@@ -89,6 +111,20 @@ pub enum Preference {
 }
 
 pub enum Event {
+    CliProbe {
+        tool: CliTool,
+        version: Option<String>,
+        error: Option<String>,
+    },
+    ConnectionReport {
+        tool: CliTool,
+        report: ConnectionReport,
+    },
+    AuthorizationRequired {
+        verification_url: String,
+        expires_in: u64,
+    },
+    AuthorizationFinished,
     ConnectionStatus {
         lark_saved: bool,
         tapd_saved: bool,
@@ -133,12 +169,6 @@ pub enum Event {
     },
     Editor(Editor),
     InstallPlan(InstallationPlan),
-    Diagnostic {
-        tool: CliTool,
-        version: Option<String>,
-        connected: bool,
-        detail: String,
-    },
     Error(String),
 }
 
@@ -155,54 +185,63 @@ pub struct WorkerHandle {
 
 // 显式枚举只有两种传输，避免为了 mock 引入通用插件系统。
 enum Connection {
+    #[cfg(test)]
     Mock(MockGateway),
     Live(Box<CliGateway>),
 }
 impl Gateway for Connection {
     fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.list_workspaces(),
             Self::Live(g) => g.list_workspaces(),
         }
     }
     fn list_members(&self, workspace: &str) -> Result<Vec<TapdMember>> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.list_members(workspace),
             Self::Live(g) => g.list_members(workspace),
         }
     }
     fn get_source(&self, guid: &str) -> Result<SourceTask> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.get_source(guid),
             Self::Live(g) => g.get_source(guid),
         }
     }
     fn validate_draft(&self, draft: &Draft) -> Result<()> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.validate_draft(draft),
             Self::Live(g) => g.validate_draft(draft),
         }
     }
     fn fetch_tasks(&self) -> Result<Vec<SourceTask>> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.fetch_tasks(),
             Self::Live(g) => g.fetch_tasks(),
         }
     }
     fn get_target(&self, w: &str, id: &str, k: &str) -> Result<TargetTask> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.get_target(w, id, k),
             Self::Live(g) => g.get_target(w, id, k),
         }
     }
     fn create_target(&self, d: &Draft, s: &SourceTask) -> Result<TargetTask> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.create_target(d, s),
             Self::Live(g) => g.create_target(d, s),
         }
     }
     fn update_target(&self, t: &TargetTask, d: &Draft, s: &SourceTask) -> Result<TargetTask> {
         match self {
+            #[cfg(test)]
             Self::Mock(g) => g.update_target(t, d, s),
             Self::Live(g) => g.update_target(t, d, s),
         }
@@ -220,12 +259,18 @@ impl WorkerSender {
     }
 }
 enum Envelope {
+    Authorization {
+        generation: u64,
+        verification_url: String,
+        expires_in: u64,
+    },
     Request(Request),
     Complete(Completion),
 }
 type AttachmentOrigin = (String, String, Option<String>, u64);
 struct PendingRead {
     generation: u64,
+    cancelled: Arc<AtomicBool>,
     attachment_origin: Option<AttachmentOrigin>,
 }
 struct Completion {
@@ -235,6 +280,16 @@ struct Completion {
     attachment_origin: Option<AttachmentOrigin>,
 }
 enum ReadData {
+    CliProbe {
+        tool: CliTool,
+        version: Option<String>,
+        error: Option<String>,
+    },
+    ConnectionReport {
+        tool: CliTool,
+        report: ConnectionReport,
+        authorization: bool,
+    },
     Tasks(Vec<SourceTask>),
     Projects(Vec<TapdWorkspace>),
     Members(String, Vec<TapdMember>),
@@ -249,12 +304,6 @@ enum ReadData {
         session: u64,
         attachment: DraftAttachment,
         marker: Option<String>,
-    },
-    Diagnostic {
-        tool: CliTool,
-        version: Option<String>,
-        connected: bool,
-        detail: String,
     },
 }
 // 远端结果只携带数据；复用核心校验和事务，不将 Engine 移入网络线程。
@@ -300,10 +349,14 @@ fn begin_read(
     {
         return false;
     }
+    if let Some(old) = pending.get(key) {
+        old.cancelled.store(true, Ordering::SeqCst);
+    }
     pending.insert(
         key.into(),
         PendingRead {
             generation,
+            cancelled: Arc::new(AtomicBool::new(false)),
             attachment_origin,
         },
     );
@@ -328,9 +381,13 @@ fn cancel_stale_reads(pending: &mut BTreeMap<String, PendingRead>, generation: u
         .collect();
     let mut events = Vec::new();
     for key in keys {
+        pending[&key].cancelled.store(true, Ordering::SeqCst);
         let read = pending
             .remove(&key)
             .expect("key collected from pending reads");
+        if key == "lark-connection" {
+            events.push(Event::AuthorizationFinished);
+        }
         events.push(Event::Activity { key, active: false });
         if let Some((guid, profile, marker, session)) = read.attachment_origin {
             events.push(Event::AttachmentFailed {
@@ -376,8 +433,8 @@ fn read_key(job: &Job) -> Option<String> {
             session,
             ..
         } => format!("attachment:{guid}:{session}:{marker}"),
-        Job::Check(CliTool::Lark) => "lark".into(),
-        Job::Check(CliTool::Tapd) => "tapd".into(),
+        Job::Check(tool) => connection_key(*tool).into(),
+        Job::ProbeCli(tool) => cli_key(*tool).into(),
         _ => return None,
     })
 }
@@ -394,8 +451,10 @@ fn read_error_field(key: &str) -> &'static str {
         match key {
             "tasks" => "tasks",
             "projects" => "projects",
-            "lark" => "lark",
-            "tapd" => "tapd",
+            "lark-connection" => "lark-connection",
+            "tapd-connection" => "tapd-connection",
+            "lark-cli" => "lark-cli",
+            "tapd-cli" => "tapd-cli",
             _ => "read",
         }
     }
@@ -406,8 +465,8 @@ fn field(job: &Job) -> &'static str {
         Job::Refresh => "tasks",
         Job::LoadProjects => "projects",
         Job::LoadMembers(_) => "members",
-        Job::Check(CliTool::Lark) => "lark",
-        Job::Check(CliTool::Tapd) => "tapd",
+        Job::Check(tool) => connection_key(*tool),
+        Job::ProbeCli(tool) => cli_key(*tool),
         Job::SetPreference(Preference::PollMinutes(_) | Preference::Polling(_)) => "poll",
         Job::SetPreference(Preference::DefaultDestination { .. }) => "destination",
         Job::SetPreference(
@@ -475,7 +534,9 @@ struct ReadTask {
     job: Job,
     mode: Mode,
     settings: Settings,
+    #[cfg(test)]
     mock: MockGateway,
+    backend: Arc<dyn ConnectionBackend>,
     data_root: PathBuf,
     origin: String,
     target_identity: Option<(String, TargetTask)>,
@@ -487,7 +548,9 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
         job,
         mode,
         settings,
+        #[cfg(test)]
         mock,
+        backend,
         data_root,
         origin,
         target_identity,
@@ -533,41 +596,53 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
                     },
                 ));
             }
-            if let Job::Check(tool) = job {
-                anyhow::ensure!(
-                    mode != Mode::Mock,
-                    "Demo mode never accesses external accounts"
-                );
-                let path = if tool == CliTool::Lark {
-                    &settings.lark_path
+            if let Job::ProbeCli(tool) = job {
+                #[cfg(test)]
+                let result = if mode.is_mock() {
+                    Ok("test-only CLI".into())
                 } else {
-                    &settings.tapd_path
+                    backend.probe(tool, &settings)
                 };
-                let mut version = None;
-                let result = (|| -> Result<()> {
-                    version = Some(probe_cli(tool, std::path::Path::new(path))?);
-                    let cli = CliGateway::new(settings.clone(), load_credentials()?)?;
-                    match tool {
-                        CliTool::Lark => cli.check_lark(),
-                        CliTool::Tapd => cli.check_tapd(),
-                    }
-                })();
+                #[cfg(not(test))]
+                let result = backend.probe(tool, &settings);
+                let (version, error) = match result {
+                    Ok(version) => (Some(version), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
                 return Ok((
-                    settings.last_profile.unwrap_or_default(),
-                    ReadData::Diagnostic {
+                    origin,
+                    ReadData::CliProbe {
                         tool,
                         version,
-                        connected: result.is_ok(),
-                        detail: result.err().map(|e| e.to_string()).unwrap_or_default(),
+                        error,
                     },
                 ));
             }
-            let (profile, gateway) = if mode == Mode::Mock {
-                ("mock".into(), Connection::Mock(mock))
-            } else {
-                let cli = CliGateway::new(settings, load_credentials()?)?;
-                (cli.account_namespace()?, Connection::Live(Box::new(cli)))
-            };
+            if let Job::Check(tool) = job {
+                anyhow::ensure!(
+                    !mode.is_mock(),
+                    "Test mode never accesses external accounts"
+                );
+                let report = (|| {
+                    backend.probe(tool, &settings)?;
+                    backend.check(tool, &settings, backend.load()?)
+                })()
+                .unwrap_or_else(failed_report);
+                return Ok((
+                    origin,
+                    ReadData::ConnectionReport {
+                        tool,
+                        report,
+                        authorization: false,
+                    },
+                ));
+            }
+            let (profile, gateway) = connection(
+                mode,
+                settings,
+                #[cfg(test)]
+                mock,
+            )?;
             let data = match job {
                 Job::CheckTarget { guid, session } => {
                     let (workspace, target) =
@@ -607,6 +682,18 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
     });
 }
 
+// 授权等待时暂停定时器而非重复拒绝过期刷新；请求通道仍即时响应用户操作。
+fn poll_wait(
+    settings: &Settings,
+    opened: bool,
+    deadline: Instant,
+    now: Instant,
+    pending: &BTreeMap<String, PendingRead>,
+) -> Option<Duration> {
+    (opened && settings.poll_enabled && !pending.keys().any(|key| key.ends_with("-connection")))
+        .then(|| deadline.saturating_duration_since(now))
+}
+
 fn connection_key(tool: CliTool) -> &'static str {
     match tool {
         CliTool::Lark => "lark-connection",
@@ -618,12 +705,27 @@ trait ConnectionBackend: Send + Sync {
     fn load(&self) -> Result<Credentials>;
     fn save(&self, tool: CliTool, credentials: &Credentials) -> Result<()>;
     fn clear(&self, tool: CliTool) -> Result<()>;
+    fn probe(&self, tool: CliTool, settings: &Settings) -> Result<String> {
+        let path = match tool {
+            CliTool::Lark => &settings.lark_path,
+            CliTool::Tapd => &settings.tapd_path,
+        };
+        probe_supported_cli(tool, std::path::Path::new(path))
+    }
+    fn check(
+        &self,
+        tool: CliTool,
+        settings: &Settings,
+        credentials: Credentials,
+    ) -> Result<ConnectionReport>;
     fn connect(
         &self,
         tool: CliTool,
         settings: &Settings,
         credentials: Credentials,
-    ) -> Result<Option<String>>;
+        cancelled: &AtomicBool,
+        authorization: &mut dyn FnMut(String, u64) -> Result<()>,
+    ) -> Result<ConnectionReport>;
 }
 struct SystemConnectionBackend;
 impl ConnectionBackend for SystemConnectionBackend {
@@ -636,32 +738,147 @@ impl ConnectionBackend for SystemConnectionBackend {
     fn clear(&self, tool: CliTool) -> Result<()> {
         lark2tapd_bridge::clear_credentials(tool)
     }
+    fn check(
+        &self,
+        tool: CliTool,
+        settings: &Settings,
+        credentials: Credentials,
+    ) -> Result<ConnectionReport> {
+        Ok(CliGateway::new(settings.clone(), credentials)?.connection_report(tool))
+    }
     fn connect(
         &self,
         tool: CliTool,
         settings: &Settings,
         credentials: Credentials,
-    ) -> Result<Option<String>> {
+        cancelled: &AtomicBool,
+        authorization: &mut dyn FnMut(String, u64) -> Result<()>,
+    ) -> Result<ConnectionReport> {
+        ensure_auth_active(cancelled)?;
         let cli = CliGateway::new(settings.clone(), credentials)?;
-        match tool {
-            CliTool::Lark => {
-                cli.login_lark()?;
-                cli.check_lark()?;
-            }
-            CliTool::Tapd => {
-                cli.check_tapd()?;
-            }
+        if tool == CliTool::Lark {
+            // 只有显式保存并连接才允许创建原生 CLI profile；检查和启动不走此分支。
+            ensure_auth_active(cancelled)?;
+            cli.prepare_lark_profile()?;
+            ensure_auth_active(cancelled)?;
+            // 设备码只在此后台线程中存活；actor/UI 只接收经过桥接层验证的 URL。
+            let pending = cli.begin_lark_login()?;
+            ensure_auth_active(cancelled)?;
+            authorization(pending.verification_url.clone(), pending.expires_in)?;
+            ensure_auth_active(cancelled)?;
+            cli.finish_lark_login_cancellable(&pending, cancelled)?;
         }
-        Ok(None)
+        ensure_auth_active(cancelled)?;
+        Ok(cli.connection_report(tool))
     }
 }
+fn cli_key(tool: CliTool) -> &'static str {
+    match tool {
+        CliTool::Lark => "lark-cli",
+        CliTool::Tapd => "tapd-cli",
+    }
+}
+fn failed_report(error: anyhow::Error) -> ConnectionReport {
+    ConnectionReport {
+        connected: false,
+        checks: vec![],
+        user_scopes: None,
+        app_scopes: None,
+        failure: Some(error.to_string()),
+    }
+}
+fn connection(
+    mode: Mode,
+    settings: Settings,
+    #[cfg(test)] mock: MockGateway,
+) -> Result<(String, Connection)> {
+    #[cfg(test)]
+    if mode.is_mock() {
+        return Ok(("mock".into(), Connection::Mock(mock)));
+    }
+    let _ = mode;
+    let cli = CliGateway::new(settings, load_credentials()?)?;
+    Ok((cli.account_namespace()?, Connection::Live(Box::new(cli))))
+}
+// 授权等待不占用串行 actor；进度与最终报告都必须通过同一代数检查。
+fn ensure_auth_active(cancelled: &AtomicBool) -> Result<()> {
+    anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "Authorization cancelled");
+    Ok(())
+}
+fn spawn_connect(
+    sender: Weak<mpsc::Sender<Envelope>>,
+    backend: Arc<dyn ConnectionBackend>,
+    tool: CliTool,
+    settings: Settings,
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+    profile_writes: Arc<Mutex<()>>,
+) {
+    std::thread::spawn(move || {
+        let report = (|| {
+            ensure_auth_active(&cancelled)?;
+            // 包住 profile 准备、设备授权及最终落盘；替换操作须等旧进程退出。
+            let _profile_guard = if tool == CliTool::Lark {
+                Some(profile_writes.lock().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Previous native profile operation stopped unexpectedly; restart the app"
+                    )
+                })?)
+            } else {
+                None
+            };
+            ensure_auth_active(&cancelled)?;
+            backend.probe(tool, &settings)?;
+            let credentials = backend.load()?;
+            anyhow::ensure!(
+                tool != CliTool::Lark || credentials.lark_user_token.is_empty(),
+                "Manual token cannot be verified; use OAuth instead"
+            );
+            backend.connect(
+                tool,
+                &settings,
+                credentials,
+                &cancelled,
+                &mut |verification_url, expires_in| {
+                    ensure_auth_active(&cancelled)?;
+                    let sender = sender
+                        .upgrade()
+                        .ok_or_else(|| anyhow::anyhow!("Application closed"))?;
+                    sender.send(Envelope::Authorization {
+                        generation,
+                        verification_url,
+                        expires_in,
+                    })?;
+                    ensure_auth_active(&cancelled)
+                },
+            )
+        })()
+        .unwrap_or_else(failed_report);
+        if let Some(sender) = sender.upgrade() {
+            let _ = sender.send(Envelope::Complete(Completion {
+                key: connection_key(tool).into(),
+                generation,
+                attachment_origin: None,
+                result: Ok((
+                    String::new(),
+                    ReadData::ConnectionReport {
+                        tool,
+                        report,
+                        authorization: tool == CliTool::Lark,
+                    },
+                )),
+            }));
+        }
+    });
+}
+
 fn emit_connection_status(
     mode: Mode,
     backend: &dyn ConnectionBackend,
     output: &async_channel::Sender<Event>,
 ) -> Result<()> {
     let (lark_saved, tapd_saved) =
-        if mode == Mode::Mock {
+        if mode.is_mock() {
             (false, false)
         } else {
             lark2tapd_bridge::credential_presence(&backend.load().map_err(|_| {
@@ -708,7 +925,7 @@ fn start_with_backend(
                 anyhow::anyhow!("This data directory is already open in another app instance")
             })?;
             tokio::runtime::Runtime::new()?.block_on(async {
-                let mut preferences = Engine::open(&root.join(if mode == Mode::Mock {
+                let mut preferences = Engine::open(&root.join(if mode.is_mock() {
                     "preferences-mock.db"
                 } else {
                     "preferences-live.db"
@@ -718,19 +935,21 @@ fn start_with_backend(
                 let mut engine =
                     Engine::open(&root.join(profile_file(mode, settings.last_profile.as_deref())?))
                         .await?;
-                if mode == Mode::Mock && settings.workspace_id.is_empty() {
+                if mode.is_mock() && settings.workspace_id.is_empty() {
                     settings.workspace_id = "demo".into();
                 }
                 settings.lark_path = discover_executable(&settings.lark_path, "lark-cli", &root.join("tools"));
                 settings.tapd_path = discover_executable(&settings.tapd_path, "tapd-cli", &root.join("tools"));
                 settings.tapd_endpoint = Settings::default().tapd_endpoint;
                 engine.save_settings(settings.clone()).await?;
+                #[cfg(test)]
                 let mock = MockGateway::from_snapshot(engine.snapshot());
-                let mut namespace = if mode == Mode::Mock {
+                let mut namespace = if mode.is_mock() {
                     "mock".into()
                 } else {
                     settings.last_profile.clone().unwrap_or_default()
                 };
+                let profile_writes = Arc::new(Mutex::new(()));
                 let mut generation = 0;
                 let mut pending = BTreeMap::<String, PendingRead>::new();
                 let mut checked = Vec::<TapdWorkspace>::new();
@@ -750,14 +969,10 @@ fn start_with_backend(
                     output.send(Event::FormError { field: "connection-status", message: error.to_string() }).await?;
                 }
                 loop {
-                    let wait = if opened && settings.poll_enabled {
-                        next_check.saturating_duration_since(Instant::now())
-                    } else {
-                        Duration::from_secs(3600)
-                    };
-                    let envelope = match input.recv_timeout(wait) {
+                    let scheduled = poll_wait(&settings, opened, next_check, Instant::now(), &pending);
+                    let envelope = match input.recv_timeout(scheduled.unwrap_or(Duration::from_secs(3600))) {
                         Ok(v) => v,
-                        Err(mpsc::RecvTimeoutError::Timeout) if opened && settings.poll_enabled => {
+                        Err(mpsc::RecvTimeoutError::Timeout) if scheduled.is_some() => {
                             Envelope::Request(Request {
                                 job: Job::Refresh,
                                 profile: namespace.clone(),
@@ -766,7 +981,7 @@ fn start_with_backend(
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
-                    let activity = match &envelope {
+                    let mut activity = match &envelope {
                         Envelope::Request(Request { job: Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool), .. }) => Some(connection_key(*tool)),
                         Envelope::Request(Request { job: Job::LoadConnectionStatus, .. }) => Some("connection-status"),
                         _ => None,
@@ -780,6 +995,12 @@ fn start_with_backend(
                     let mut error_field = "submit";
                     let result: Result<()> = async {
                         let Request { job, profile } = match envelope {
+                            Envelope::Authorization { generation: current, verification_url, expires_in } => {
+                                if current == generation && pending.get("lark-connection").is_some_and(|read| read.generation == current) {
+                                    output.send(Event::AuthorizationRequired { verification_url, expires_in }).await?;
+                                }
+                                return Ok(());
+                            }
                             Envelope::Complete(done) => {
                                 if !finish_read(&mut pending,&done.key,done.generation) {
                                     return Ok(());
@@ -799,7 +1020,7 @@ fn start_with_backend(
                                 if matches!(data, ReadData::Members(..) | ReadData::Workspace(_) | ReadData::Attachment {..} | ReadData::RemoteTarget{..}) {
                                     anyhow::ensure!(current == namespace, "Account changed; refresh tasks before checking this project");
                                 }
-                                if !matches!(data, ReadData::Diagnostic { .. })
+                                if !matches!(data, ReadData::CliProbe { .. } | ReadData::ConnectionReport { .. })
                                     && current != namespace
                                 {
                                     engine = Engine::open(
@@ -815,6 +1036,16 @@ fn start_with_backend(
                                     for event in cancel_stale_reads(&mut pending,generation) { output.send(event).await?; }
                                 }
                                 match &data {
+                                    ReadData::CliProbe { tool, version, error } => {
+                                        output.send(Event::CliProbe { tool: *tool, version: version.clone(), error: error.clone() }).await?;
+                                    }
+                                    ReadData::ConnectionReport { tool, report, authorization } => {
+                                        if *authorization { output.send(Event::AuthorizationFinished).await?; }
+                                        output.send(Event::ConnectionReport { tool: *tool, report: report.clone() }).await?;
+                                        if let Some(failure) = &report.failure {
+                                            output.send(Event::FormError { field: connection_key(*tool), message: failure.clone() }).await?;
+                                        }
+                                    }
                                     ReadData::Tasks(_) => {
                                         new_count = engine.refresh(&data).await?;
                                         message = "refreshed";
@@ -834,21 +1065,7 @@ fn start_with_backend(
                                     }
                                     ReadData::RemoteTarget{guid,session,target}=>{output.send(Event::RemoteTarget{guid:guid.clone(),profile:namespace.clone(),session:*session,target:target.clone()}).await?;}
                                     ReadData::Attachment{guid,attachment,marker,session}=>{output.send(Event::AttachmentReady{guid:guid.clone(),profile:namespace.clone(),attachment:attachment.clone(),marker:marker.clone(),session:*session}).await?;}
-                                    ReadData::Diagnostic {
-                                        tool,
-                                        version,
-                                        connected,
-                                        detail,
-                                    } => {
-                                        output
-                                            .send(Event::Diagnostic {
-                                                tool: *tool,
-                                                version: version.clone(),
-                                                connected: *connected,
-                                                detail: detail.clone(),
-                                            })
-                                            .await?;
-                                    }
+
                                 }
                                 return Ok(());
                             }
@@ -856,6 +1073,12 @@ fn start_with_backend(
                         };
                         error_field = field(&job);
                         if let Some(key) = read_key(&job) {
+                            // Account reads may otherwise adopt the old native profile and cancel OAuth itself.
+                            anyhow::ensure!(
+                                matches!(job, Job::ProbeCli(_))
+                                    || !pending.keys().any(|key| key.ends_with("-connection")),
+                                "Connection in progress; finish authorization before refreshing account data"
+                            );
                             if matches!(job, Job::LoadMembers(_) | Job::CheckWorkspace(_) | Job::LocalFile{..} | Job::PastedImage{..} | Job::CheckTarget{..}) {
                                 anyhow::ensure!(profile == namespace, "Account changed; refresh tasks first");
                             }
@@ -889,10 +1112,10 @@ fn start_with_backend(
                                     active: true,
                                 })
                                 .await?;
-                            spawn_read(weak.clone(),ReadTask{key,generation,job,mode,settings:settings.clone(),mock:mock.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
+                            spawn_read(weak.clone(),ReadTask{key,generation,job,mode,settings:settings.clone(),#[cfg(test)] mock:mock.clone(),backend:backend.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
                             return Ok(());
                         }
-                        if mode == Mode::Mock
+                        if mode.is_mock()
                             && matches!(
                                 job,
                                 Job::SaveAndConnect { .. }
@@ -942,6 +1165,9 @@ fn start_with_backend(
                                     pending_install.take() == Some(tool),
                                     "Review installation before confirming"
                                 );
+                                for read in pending.values() {
+                                    read.cancelled.store(true, Ordering::SeqCst);
+                                }
                                 let path = install_cli(tool, &root.join("tools"))?
                                     .to_string_lossy()
                                     .into_owned();
@@ -960,8 +1186,13 @@ fn start_with_backend(
                             }
                             Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => {
                                 let saving = matches!(&job, Job::SaveAndConnect { .. });
+                                // 请求旧授权停止；后台写入锁确保新原生操作等待旧进程退出。
+                                for read in pending.values() {
+                                    read.cancelled.store(true, Ordering::SeqCst);
+                                }
                                 match job {
                                     Job::SaveAndConnect { credentials, .. } => {
+                                        backend.probe(tool, &settings)?;
                                         backend.save(tool, &credentials).map_err(|_| anyhow::anyhow!("Cannot save credentials; enter complete credentials and check Keychain access"))?;
                                         output.send(Event::CredentialsSaved(tool)).await?;
                                         message = "credentials_saved";
@@ -974,6 +1205,7 @@ fn start_with_backend(
                                     _ => unreachable!(),
                                 }
                                 // 保存成功即作废旧账户与在途读取，不能等待后续 OAuth 成功。
+                                output.send(Event::AuthorizationFinished).await?;
                                 namespace.clear();
                                 settings.last_profile = None;
                                 generation += 1;
@@ -982,27 +1214,17 @@ fn start_with_backend(
                                 engine = Engine::open(&root.join("disconnected.db")).await?;
                                 engine.save_settings(settings.clone()).await?;
                                 preferences.save_settings(settings.clone()).await?;
-                                output.send(Event::Diagnostic { tool, version: None, connected: false, detail: String::new() }).await?;
                                 emit_connection_status(mode, backend.as_ref(), &output)?;
                                 output.send(Event::State { mode, snapshot: engine.snapshot().clone(), profile: namespace.clone(), message, new_count: 0 }).await?;
                                 if saving {
-                                    let result = (|| {
-                                        let credentials = backend.load()?;
-                                        // 手工令牌只保存，不能先发起 OAuth 再报告无法验证。
-                                        anyhow::ensure!(tool != CliTool::Lark || credentials.lark_user_token.is_empty(), "Manual token cannot be verified");
-                                        backend.connect(tool, &settings, credentials)
-                                    })();
-                                    let connected = result.is_ok();
-                                    let failure = match tool {
-                                        CliTool::Lark => "Credentials saved, but Lark connection could not be verified. Manual tokens cannot be verified; use OAuth instead.",
-                                        CliTool::Tapd => "Credentials saved, but TAPD connection could not be verified. Check the token and CLI installation.",
-                                    };
-                                    output.send(Event::Diagnostic { tool, version: result.ok().flatten(), connected,
-                                        detail: if connected { String::new() } else { failure.into() }
-                                    }).await?;
-                                    anyhow::ensure!(connected, failure);
-                                    if tool == CliTool::Lark { message = "authorized"; }
+                                    begin_read(&mut pending, connection_key(tool), generation, None);
+                                    // 旧授权取消可能刚关闭同名活动，重新标记本代等待状态。
+                                    output.send(Event::Activity { key: connection_key(tool).into(), active: true }).await?;
+                                    // 本次保存的活动状态由后台完成或代数失效负责释放。
+                                    activity = None;
+                                    spawn_connect(weak.clone(), backend.clone(), tool, settings.clone(), generation, pending[connection_key(tool)].cancelled.clone(), profile_writes.clone());
                                 }
+
                             }
                             Job::AddWorkspace(w) => {
                                 anyhow::ensure!(
@@ -1048,22 +1270,13 @@ fn start_with_backend(
                                 engine.save_draft_for_source(&guid, &draft, &source).await?;
                                 message = "draft_saved";
                             }
-                            Job::Submit(..) | Job::Recover { .. } | Job::ChangeDemo | Job::AcceptTarget{..} => {
+                            Job::Submit(..) | Job::Recover { .. } | Job::AcceptTarget{..} => {
                                 anyhow::ensure!(
                                     profile == namespace,
                                     "Account changed; reopen this task"
                                 );
-                                let gateway = if mode == Mode::Mock {
-                                    Connection::Mock(mock.clone())
-                                } else {
-                                    let cli =
-                                        CliGateway::new(settings.clone(), load_credentials()?)?;
-                                    anyhow::ensure!(
-                                        cli.account_namespace()? == namespace,
-                                        "Account changed; refresh tasks first"
-                                    );
-                                    Connection::Live(Box::new(cli))
-                                };
+                                let (current, gateway) = connection(mode, settings.clone(), #[cfg(test)] mock.clone())?;
+                                anyhow::ensure!(current == namespace, "Account changed; refresh tasks first");
                                 match job {
                                     Job::AcceptTarget{guid,target}=>{
                                         let r=engine.snapshot().records.iter().find(|r|r.source.guid==guid).ok_or_else(||anyhow::anyhow!("Task no longer available"))?;
@@ -1108,11 +1321,6 @@ fn start_with_backend(
                                             .bind_existing(&gateway, &guid, &workspace, &id, &kind)
                                             .await?;
                                         message = "recovered";
-                                    }
-                                    Job::ChangeDemo => {
-                                        mock.change_demo_task()?;
-                                        new_count = engine.refresh(&gateway).await?;
-                                        message = "refreshed";
                                     }
                                     _ => unreachable!(),
                                 }
@@ -1242,6 +1450,7 @@ async fn submit(
         attachment.uncertain = true;
         engine.attachment_progress(guid, attachment).await?;
         let mut uploaded = match gateway {
+            #[cfg(test)]
             Connection::Mock(_) => {
                 let mut a = attachment.clone();
                 a.remote_id = Some(format!("mock-{}", a.id));
@@ -1277,7 +1486,7 @@ pub fn media_root(data_root: &std::path::Path, profile: &str) -> Result<PathBuf>
 
 // 持久化配置仍是不可信输入；缓存定位只接受固定长度散列，不能逃逸应用数据目录。
 fn profile_file(mode: Mode, profile: Option<&str>) -> Result<String> {
-    if mode == Mode::Mock {
+    if mode.is_mock() {
         return Ok("mock.db".into());
     }
     match profile {
@@ -1757,8 +1966,8 @@ mod tests {
             ("tasks", "tasks"),
             ("projects", "projects"),
             ("members:demo", "members"),
-            ("lark", "lark"),
-            ("tapd", "tapd"),
+            ("lark-connection", "lark-connection"),
+            ("tapd-connection", "tapd-connection"),
             ("workspace:demo:name", "new-workspace"),
             ("attachment:guid:file", "attachments"),
         ] {

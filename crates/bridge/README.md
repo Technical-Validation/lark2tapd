@@ -15,7 +15,11 @@
 - `list_workspaces() -> Result<Vec<TapdWorkspace>>`：执行 `user workspaces`，严格读取 `data: [{Workspace: {id, name}}]`；只列管理员项目，**不是所有可访问项目**。ID 必须为数字字符串，名称必须非空；不支持的结构直接报错，不回退为空列表。
 - `list_members(workspace) -> Result<Vec<TapdMember>>`：执行 `user members workspaceid=<id> fields=user,name`，读取未分页的 `data: [{UserWorkspace: {user, name}}]`。`account` 保存 `user` 昵称账号，不使用数字用户 ID；缺账号或有意义的显示名时报错。
 - `verify_workspace(id) -> Result<()>`：通过上述成员接口验证显式输入的项目 ID。普通成员可由 UI 手动输入项目 ID/名称，不需要管理员项目枚举成功。目录缓存及按已验证账户隔离由核心/调用方负责；这些方法不会自动联网。
-- `login_lark() -> Result<()>`：仅用户点击时执行 `auth login --scope task:task:read --json`，最多 180 秒，然后检查状态。不启动自动登录，不执行配置导出。
+- `prepare_lark_profile() -> Result<()>`：**仅在用户确认“保存并连接”后调用**，不得用于启动、检查或普通连接。先验证固定版本和 `profile list`，已有相同 App ID 时保留原品牌、密钥及默认 profile；否则执行 `profile add --name lark2tapd-<APP_ID> --app-id <APP_ID> --app-secret-stdin --brand feishu`，密钥仅通过清零缓冲区的 stdin 传递，不进入 argv、环境或应用文件。绝不传 `--use`，不覆盖其他 profile；命名冲突、坏配置、安全存储失败直接报告。首次空配置会出现首个原生 profile；已有默认选择不变。新建默认按本产品飞书品牌，Lark 国际版应先自行配置正确品牌。已有原生密钥不会被应用保存表单静默轮换，须用户显式通过 CLI 更新。
+- `begin_lark_login() -> Result<DeviceAuthorization>`：仅用户点击时使用原生 profile；先通过 `auth status --json` 验证 App ID，再执行 `auth login --scope task:task:read --no-wait --json`。返回 `verification_url` / `expires_in`，私有 `device_code` 只留工作线程内存、析构清零，不实现 `Debug` / 序列化。只接受 `https://accounts.feishu.cn` 或 `https://accounts.larksuite.com` 的无用户名/密码/自定义端口地址，验证完成后 UI 才能打开浏览器。此方法自身不配置 profile。
+- `finish_lark_login(&DeviceAuthorization) -> Result<()>`：执行 `auth login --device-code <一次性代码> --json`；代码是该 CLI 的必需参数，短暂可见于本机进程参数，但绝不进入应用日志/错误/文件。等待最多剩余有效期与 180 秒中的较小者，缺少 `task:task:read` 的非零退出完成记录仍提供明确缺权诊断，不冒充授权成功。CLI 自行维护请求 scope 与原生 token 缓存；测试全部使用假 CLI。完成后调用方应执行连接报告，认证完成本身不代表业务读权限已验证。
+- `finish_lark_login_cancellable(&DeviceAuthorization, &AtomicBool) -> Result<()>`：应用使用的可取消版本。取消后停止并回收进程组；桌面端还须串行化原生配置准备与授权写入，等待旧操作退出才允许替换连接。不能回滚取消前已完成的原生写入。
+- `connection_report(CliTool) -> ConnectionReport`：不登录、不配置，只读诊断，先通过与界面共用的 `installer::probe_supported_cli` 验证 Lark `1.0.96` / TAPD `1.8.1` 或 `1.15.0`。报告包含 `connected`、逐项 `checks: Vec<PermissionCheck>`、可选完整 `user_scopes` / `app_scopes` 和安全 `failure`；状态为 `Granted` / `Missing` / `Unknown`。Lark 必须验证用户身份及实际任务读取；结合 `auth status` 已保存 scope 与 `auth check --scope task:task:read --json` 的非零缺权结果。`auth scopes --json` 返回的 `userScopes` 是应用启用的用户令牌 scopes，属于辅助信息，失败不单独断开已验证连接。应用权限列表也与 `task:task:read` 单独比对，不能把成功取到空列表当成已具备权限；缺元数据不是缺权限。TAPD 验证身份和已选项目读取，尚未选项目时身份验证可通过，项目读取标为未核验；Token 权限枚举、写任务、上传始终明确未知，绝不写入探测。报告保留已取得的部分证据；旧 `check_tapd()` 无项目时仅验证身份的语义保持不变。
 - `oauth_status() -> Result<AuthStatus>`：执行 `auth status --json --verify`；返回 `authenticated: bool` 与 `user_id: String`，不向 UI 暴露原始认证响应。
 - `account_namespace() -> Result<String>`：要求 Lark 状态 `identity=user`、`verified=true`，公开 `brand` / `appId` / `identities.user.openId` 均有效；再通过 `tapd-cli user info` 的 `data.id` 验证实际 TAPD Token 主体。稳定键仅包含版本、语义提供商标识和以上公开身份，同一账户轮换令牌或搬迁 CLI 不改变键。手动注入 Lark user token 一律拒绝，提示清除凭据后使用 CLI OAuth。桌面端应在操作前重新计算并阻止跨账户复用草稿。
 - 实现 `lark2tapd_core::Gateway` 全部方法。`validate_draft` 本地验证数字 workspace、标题和日期，供核心在不确定日志之前调用；`get_source` 重新验证 OAuth 主体，只读选中的单个原生任务，并再次确认创建者或负责人包含本人；关系已移除则拒绝提交。写入成功后根据实际返回的 `Task` / `Story` 类型读回并核对 title / description / owner / due；读回失败或任何字段不符仍返回错误，由核心保留不确定结果，不自动重试写入。
@@ -32,9 +36,9 @@
 
 ## 安全与边界
 
-进程直接通过 `Command` 启动，不使用 shell。凭据只进环境变量；任务内容按 CLI 契约进入 argv（TAPD 不支持 stdin），因此任务内容可能在本机进程参数中可见，绝不放入日志或错误。运行环境清除后只保留 HOME、必要本地化及证书位置等白名单，PATH 保留 GUI 原始值并补充可执行文件目录和常见 Node 安装目录。
+进程直接通过 `Command` 启动，不使用 shell。TAPD 凭据只进环境变量；Lark 原生 OAuth 不注入 App ID / Secret / user token，避免切换到拒绝 `auth` 的外部 provider。保存的 App ID 通过 `LARKSUITE_CLI_PROFILE` 选择匹配原生 profile（无 App ID 则使用 CLI 默认），认证及业务读取使用同一选择，并在访问前验证返回的 App ID。手动 user token 仍拒绝。新 profile 密钥仅进 `profile add` 的 stdin。任务内容按 CLI 契约进入 argv（TAPD 不支持 stdin），因此任务内容可能在本机进程参数中可见，绝不放入日志或错误。运行环境清除后只保留 HOME、必要本地化及证书位置等白名单，PATH 保留 GUI 原始值并补充可执行文件目录和常见 Node 安装目录。
 
-单次普通调用 30 秒；每个输出管道最多缓存 4 MiB。超时、失败、超限都会终止进程组并回收直接子进程；非阻塞管道读写共用截止时间，即使后代 `setsid` 后保留管道也不会无限等待。错误不包含 argv、stdout、stderr。假 CLI 测试在临时目录运行，不读写用户真实认证或业务数据。
+单次普通调用 30 秒；每个输出管道最多缓存 4 MiB。超时、失败、超限都会终止进程组并回收直接子进程；非阻塞管道读写共用截止时间，即使后代 `setsid` 后保留管道也不会无限等待。错误不包含 argv、原始 stdout/stderr 或任意服务端 message/hint。非零退出保留退出码；API 失败仅白名单类别、整数 API code、应用需要的 `task:task:read` 和固定恢复建议进入错误。`auth check` 与授权完成允许解析预期非零 JSON，其他非零退出不会转为成功。诊断类型与 begin/finish 返回的错误可直接交 UI；不要再覆盖为泛化“连接失败”。假 CLI 测试在临时目录运行，不读写用户真实认证或业务数据。
 
 飞书任务刷新每次先调用一次 `auth status --json --verify`，只接受已验证的用户 `openId`。使用 `task +get-related-tasks --as user --format json --page-limit 1`，通过 `--page-token` 手动继续读取 `data.items` / `has_more` / `page_token`。`my_tasks` 会漏掉仅由本人创建的任务，因此不作为候选来源。仅保留创建者 ID 为本人或 `role=assignee` 成员 ID 包含本人的候选；只有关注关系、其他人、缺失身份或仅同名均不算。候选在详情读取前按 GUID 去重；原生 `task tasks get` 返回后再验证关系，已移除的任务不进入结果。
 
@@ -45,6 +49,10 @@
 描述先按 Markdown AST 消除非授权图片和不安全链接，再使用安全编译选项生成 HTML；不下载任何 Markdown 图片，也不读取其中的本地路径。来源标记 `[lark-task:{guid}]` 在 Markdown 渲染后追加，防止被代码块或引用语法吞掉；随后追加白名单验证的来源 URL。远端写入标题使用 `Draft::rendered_title()`，保留固定 `【前缀】` 与原始标题。返回的远端 HTML 作为冲突基线，不作为本地可执行 HTML 渲染。
 
 ## 身份协议证据与未验证边界
+
+- 原生 profile / 环境 provider 的契约固定核对官方 v1.0.96 [`auth/auth.go`](https://github.com/larksuite/cli/blob/v1.0.96/cmd/auth/auth.go)、[`factory_default.go`](https://github.com/larksuite/cli/blob/v1.0.96/internal/cmdutil/factory_default.go)、[`credential/env/env.go`](https://github.com/larksuite/cli/blob/v1.0.96/extension/credential/env/env.go)：环境 App ID / Secret 激活外部 provider，全部 `auth` 子命令拒绝该 provider，不能仅靠保存表单后注入环境实现原生 OAuth。`core/config.go` 的 `FindApp` 先匹配名称再匹配 App ID；桥接因此还验证返回 App ID，防止名称遮蔽。
+- 安全引导使用 [`profile/add.go`](https://github.com/larksuite/cli/blob/v1.0.96/cmd/profile/add.go)：只有不存在配置才新建；坏配置拒绝；先验证名称/App ID 唯一性，再调用 [`core.ForStorage`](https://github.com/larksuite/cli/blob/v1.0.96/internal/core/secret_resolve.go)，后者把密钥交原生 keychain 接口，配置仅保存引用，不静默回退明文。macOS CLI 的 [`keychain_darwin.go`](https://github.com/larksuite/cli/blob/v1.0.96/internal/keychain/keychain_darwin.go) 使用加密缓存和系统 Keychain 主密钥（用户此前主动 downgrade 时可使用文件主密钥），不等于所有凭据原文都在 OS Keychain。应用不主动 downgrade、不导出密钥、不直接编辑 CLI 配置。没有采用 `config init` 自动引导，因为该命令可把读取失败当作空配置。
+- 分步授权及 scope 字段来自固定版本 [`login.go`](https://github.com/larksuite/cli/blob/v1.0.96/cmd/auth/login.go)、[`login_result.go`](https://github.com/larksuite/cli/blob/v1.0.96/cmd/auth/login_result.go)、[`check.go`](https://github.com/larksuite/cli/blob/v1.0.96/cmd/auth/check.go)、[`scopes.go`](https://github.com/larksuite/cli/blob/v1.0.96/cmd/auth/scopes.go)。原始阻塞 login 会输出多个 JSON 记录，不能作为单一 JSON 解析。`syncLoginUserToProfile` 要求已存在原生 profile，成功完成会更新该 profile 的用户与原生 token 缓存。
 
 - `lark-cli whoami --help` 只承诺当前有效身份诊断；官方 [whoami 源码](https://github.com/larksuite/cli/blob/main/cmd/whoami/whoami.go) 对内建凭据明确为 local-only，并传递 `verify=false`，不能验证注入令牌的主体。因此不猜测不存在的 authen 服务，而是拒绝此配置。
 - OAuth 状态字段依据官方 [auth/status.go](https://github.com/larksuite/cli/blob/main/cmd/auth/status.go)：`appId`、`brand`、`identity`、`identities.user.openId`，以及 `--verify` 后有效身份的 `verified`。
