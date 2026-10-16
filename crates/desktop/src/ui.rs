@@ -5,6 +5,8 @@ mod connections;
 use connections::{CredentialChange, ServiceConnection};
 mod editor;
 mod feedback;
+mod field_feedback;
+use field_feedback::SaveState;
 mod focus_scroll;
 mod help;
 mod last_check;
@@ -94,6 +96,8 @@ pub struct Model {
     lark_authorization: Option<(String, u64)>,
     pub activities: BTreeSet<String>,
     pub errors: BTreeMap<&'static str, String>,
+    save_states: BTreeMap<&'static str, SaveState>,
+    next_request_sequence: u64,
     pub checked_workspace: Option<TapdWorkspace>,
     pub data_root: PathBuf,
     state_revision: u64,
@@ -114,11 +118,7 @@ impl Model {
     }
     fn send_at(&mut self, job: Job, profile: String, cx: &mut Context<Self>) {
         let field = match &job {
-            Job::SetPreference(Preference::PollMinutes(_)) => Some("poll"),
-            Job::SetPreference(Preference::DefaultDestination { .. }) => Some("destination"),
-            Job::SetPreference(
-                Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. },
-            ) => Some("prefixes"),
+            Job::SetPreference(p) => Some(crate::worker::setting_field(p)),
             Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
             Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
             Job::SaveAndConnect { tool, .. }
@@ -163,7 +163,27 @@ impl Model {
             self.activities.insert("submit".into());
             self.busy = true;
         }
-        if self.jobs.send(Request { job, profile }).is_err() {
+        self.next_request_sequence += 1;
+        let sequence = self.next_request_sequence;
+        let saving = match &job {
+            Job::SetPreference(p) => Some(crate::worker::setting_field(p)),
+            Job::SaveAndConnect { tool, .. } => Some(connections::field_key(*tool)),
+            Job::AddWorkspace(_) => Some("new-workspace"),
+            Job::Install(tool) => Some(connections::cli_key(*tool)),
+            _ => None,
+        };
+        if let Some(key) = saving {
+            self.save_states.insert(key, SaveState::Saving(sequence));
+        }
+        if self
+            .jobs
+            .send(Request {
+                sequence,
+                job,
+                profile,
+            })
+            .is_err()
+        {
             self.error = true;
             self.notice = text(
                 self.language(),
@@ -173,6 +193,11 @@ impl Model {
             .into();
             self.activities.clear();
             self.busy = false;
+            if let Some(key) = saving {
+                self.save_states.insert(key, SaveState::Dirty);
+                self.errors.insert(key, self.notice.clone());
+            }
+            crate::console::failure("worker", "Worker stopped");
             self.queue_feedback(cx);
         }
         cx.notify();
@@ -185,8 +210,6 @@ impl Model {
                 Event::State {
                     message: "imported"
                         | "draft_saved"
-                        | "settings_saved"
-                        | "credentials_saved"
                         | "credentials_cleared"
                         | "recovered"
                         | "authorized"
@@ -196,11 +219,32 @@ impl Model {
                 }
             );
         match event {
+            Event::SettingResult {
+                sequence,
+                field,
+                error,
+            } => {
+                if self.save_states.get(field) == Some(&SaveState::Saving(sequence)) {
+                    if let Some(error) = error {
+                        self.save_states.insert(field, SaveState::Dirty);
+                        self.errors.insert(field, error);
+                    } else {
+                        self.save_states.insert(field, SaveState::Saved);
+                        self.errors.remove(field);
+                    }
+                }
+            }
             Event::CliProbe {
                 tool,
                 version,
                 error,
             } => {
+                if let Some(error) = &error {
+                    self.errors
+                        .insert(connections::cli_key(tool), error.clone());
+                } else {
+                    self.errors.remove(connections::cli_key(tool));
+                }
                 let state = self.connection_mut(tool);
                 state.cli_version = version;
                 state.cli_error = error;
@@ -226,7 +270,7 @@ impl Model {
                 state.report = Some(report);
                 state.tested_at = Some(chrono::Utc::now().to_rfc3339());
                 state.tested_saved_configuration = saved_configuration;
-                cx.defer(move |cx| connection_results::show(tool, cx));
+                // 结果仅通知已打开的窗口；保存时的后台验证不主动打开或置前弹窗。
             }
             Event::AuthorizationRequired {
                 verification_url,
@@ -242,6 +286,14 @@ impl Model {
                 self.connections_loaded = true;
                 self.lark_connection.saved = lark_saved;
                 self.tapd_connection.saved = tapd_saved;
+                for (key, saved) in [
+                    ("lark-connection", lark_saved),
+                    ("tapd-connection", tapd_saved),
+                ] {
+                    if saved {
+                        self.save_states.entry(key).or_insert(SaveState::Saved);
+                    }
+                }
             }
             Event::CredentialsSaved(tool) => {
                 self.connection_mut(tool).saved = true;
@@ -255,6 +307,7 @@ impl Model {
                 let state = self.connection_mut(tool);
                 state.saved = false;
                 state.invalidate_result();
+                self.save_states.remove(connections::field_key(tool));
                 if tool == CliTool::Lark {
                     self.lark_authorization = None;
                 }
@@ -270,6 +323,16 @@ impl Model {
                 message,
                 new_count,
             } => {
+                if self.snapshot.is_none() {
+                    for key in ["language", "theme", "poll-enabled", "poll"] {
+                        self.save_states.entry(key).or_insert(SaveState::Saved);
+                    }
+                    if !snapshot.settings.workspace_id.is_empty() {
+                        self.save_states
+                            .entry("destination")
+                            .or_insert(SaveState::Saved);
+                    }
+                }
                 let changed = self.profile != profile;
                 let first = changed
                     || self
@@ -360,7 +423,6 @@ impl Model {
                 for tool in [CliTool::Lark, CliTool::Tapd] {
                     if field == connections::field_key(tool) {
                         self.activities.remove(field);
-                        cx.defer(move |cx| connection_results::show(tool, cx));
                     }
                 }
             }
@@ -479,6 +541,8 @@ pub fn start(worker: WorkerHandle, mode: Mode, cx: &mut App) {
         lark_authorization: None,
         activities: BTreeSet::new(),
         errors: BTreeMap::new(),
+        save_states: BTreeMap::new(),
+        next_request_sequence: 0,
         checked_workspace: None,
         data_root: worker.data_root.clone(),
         state_revision: 0,
@@ -522,7 +586,12 @@ fn configure_actions(cx: &mut App) {
         KeyBinding::new("cmd-1", OpenPending, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_window_closed(|_, _| crate::console::event("ui.window", "closed"))
+        .detach();
+    cx.on_action(|_: &Quit, cx| {
+        crate::console::event("app.lifecycle", "quit_requested_shortcut_or_menu");
+        cx.quit();
+    });
     cx.on_action(|_: &Refresh, cx| {
         let m = cx.global::<Shell>().model.clone();
         m.update(cx, |m, cx| m.send(Job::Refresh, cx));
@@ -538,7 +607,10 @@ fn handle_native_action(action: NativeAction, cx: &mut App) {
         NativeAction::Open => show_window(cx),
         NativeAction::Pending => open_pending(cx),
         NativeAction::Settings => show_settings(cx),
-        NativeAction::Quit => cx.quit(),
+        NativeAction::Quit => {
+            crate::console::event("app.lifecycle", "quit_requested_tray");
+            cx.quit();
+        }
         NativeAction::Refresh => {
             let model = cx.global::<Shell>().model.clone();
             model.update(cx, |m, cx| m.send(Job::Refresh, cx));
@@ -725,6 +797,7 @@ pub struct Workspace {
     connection_bounds: [std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>; 2],
     cli_focus: [FocusHandle; 2],
     settings_target: Option<CliTool>,
+    expanded_errors: BTreeSet<String>,
     settings_directory_loaded: bool,
     selected: Option<String>,
     edit_source: Option<SourceTask>,
@@ -809,6 +882,7 @@ impl Workspace {
         .detach();
         let workspace = choice_state(window, cx);
         let settings_workspace = choice_state(window, cx);
+        let settings_owner = choice_state(window, cx);
         let prefix_workspace = choice_state(window, cx);
         cx.subscribe_in(
             &workspace,
@@ -823,6 +897,16 @@ impl Workspace {
             window,
             |this, _, _: &SelectEvent<ChoiceList>, window, cx| {
                 this.project_changed(true, window, cx)
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &settings_owner,
+            window,
+            |this, _, _: &SelectEvent<ChoiceList>, _, cx| {
+                if this.settings_loaded {
+                    this.save_destination(cx);
+                }
             },
         )
         .detach();
@@ -1039,6 +1123,7 @@ impl Workspace {
             }),
             cli_focus: std::array::from_fn(|_| cx.focus_handle()),
             settings_target: None,
+            expanded_errors: BTreeSet::new(),
             settings_directory_loaded: false,
             selected: None,
             edit_source: None,
@@ -1065,7 +1150,7 @@ impl Workspace {
             prefix: choice_state(window, cx),
             due,
             settings_workspace,
-            settings_owner: choice_state(window, cx),
+            settings_owner,
             prefix_workspace,
             prefix_options: cx.new(|cx| InputState::new(window, cx)),
             new_prefix_open: false,
@@ -1088,6 +1173,29 @@ impl Workspace {
             pending_file_paths: BTreeSet::new(),
             next_paste: 0,
         };
+        // set_value 不发 Change；这里只将用户输入的新值标记为未保存。
+        for (input, key) in [
+            (this.app_id.clone(), "lark-connection"),
+            (this.app_secret.clone(), "lark-connection"),
+            (this.lark_token.clone(), "lark-connection"),
+            (this.tapd_token.clone(), "tapd-connection"),
+            (this.prefix_options.clone(), "prefixes"),
+            (this.manual_workspace_id.clone(), "new-workspace"),
+            (this.manual_workspace_name.clone(), "new-workspace"),
+        ] {
+            cx.subscribe(
+                &input,
+                move |this, _, event: &gpui_kit::component::input::InputEvent, cx| {
+                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                        this.model.update(cx, |m, cx| {
+                            m.dirty_field(key);
+                            cx.notify();
+                        });
+                    }
+                },
+            )
+            .detach();
+        }
         this.sync_directory(window, cx);
         this
     }
@@ -1106,16 +1214,10 @@ impl Workspace {
     }
     fn form_error(&self, key: &'static str, message: String, cx: &mut Context<Self>) {
         self.model.update(cx, |m, cx| {
+            m.dirty_field(key);
             m.errors.insert(key, message);
             cx.notify();
         });
-    }
-    fn inline_error(&self, key: &str, cx: &App) -> AnyElement {
-        div()
-            .when_some(self.model.read(cx).errors.get(key).cloned(), |d, e| {
-                d.mt_1().text_sm().text_color(cx.theme().danger).child(e)
-            })
-            .into_any_element()
     }
     fn draft(&self, cx: &App) -> Draft {
         Draft {

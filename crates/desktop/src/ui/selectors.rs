@@ -181,6 +181,15 @@ impl Workspace {
         let id = selected(&self.prefix_workspace, cx);
         self.fill_prefix_workspace(&id, window, cx);
     }
+    pub(super) fn save_destination(&self, cx: &mut Context<Self>) {
+        self.preference(
+            Preference::DefaultDestination {
+                workspace: selected(&self.settings_workspace, cx),
+                owner: selected(&self.settings_owner, cx),
+            },
+            cx,
+        );
+    }
     pub(super) fn project_changed(
         &mut self,
         settings: bool,
@@ -198,6 +207,9 @@ impl Workspace {
         );
         if !settings {
             self.fill_prefixes("", window, cx);
+        } else if self.settings_loaded {
+            // 切换空间与清空旧处理人一起保存，避免跨空间沿用默认处理人。
+            self.save_destination(cx);
         }
         if !id.is_empty() {
             self.send(Job::LoadMembers(id), cx);

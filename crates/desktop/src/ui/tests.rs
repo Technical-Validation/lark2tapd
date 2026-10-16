@@ -69,6 +69,8 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
         lark_authorization: None,
         activities: BTreeSet::new(),
         errors: BTreeMap::new(),
+        save_states: BTreeMap::new(),
+        next_request_sequence: 0,
         checked_workspace: None,
         data_root: w.data_root.clone(),
         state_revision: 0,
@@ -460,6 +462,43 @@ fn pasted_image_and_attachment_reach_mock_target_once(cx: &mut TestAppContext) {
         assert!(d.attachments[0].remote_url.is_some());
         assert_eq!(e.snapshot().records[0].target.as_ref().unwrap().id, first);
     });
+}
+
+#[gpui_kit::test]
+fn default_destination_saves_on_selection_without_confirmation(cx: &mut TestAppContext) {
+    let (_dir, events, model, main, view) = setup(cx);
+    load_task(&events, &model, &view, main, cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    choose(cx, settings, "settings-workspace", "演示项目二");
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .settings
+            .workspace_id
+            == "demo-2"
+    });
+    pump(&events, &model, cx, |cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .directory
+            .members
+            .contains_key("demo-2")
+    });
+    choose(cx, settings, "settings-owner", "bob");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).snapshot.as_ref().unwrap().settings.owner == "bob"
+    });
+    cx.update_window(settings, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("confirm-destination").is_none());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

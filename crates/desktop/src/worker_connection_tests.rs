@@ -119,6 +119,7 @@ fn send(worker: &WorkerHandle, job: Job) {
     worker
         .jobs
         .send(Request {
+            sequence: 0,
             job,
             profile: "old-profile".into(),
         })
@@ -377,13 +378,18 @@ fn failed_persistence_never_authenticates_or_clears_the_form() {
             credentials: credentials(),
         },
     );
-    let events = until(&worker, |event| matches!(event, Event::Error(_)));
+    let events = until(&worker, |event| {
+        matches!(
+            event,
+            Event::Error(_) | Event::SettingResult { error: Some(_), .. }
+        )
+    });
     assert!(
         !events
             .iter()
             .any(|event| matches!(event, Event::CredentialsSaved(_)))
     );
-    assert!(events.iter().any(|event| matches!(event, Event::FormError { field: "lark-connection", message } if !message.contains("injected-secret"))));
+    assert!(events.iter().any(|event| matches!(event, Event::SettingResult { field: "lark-connection", error:Some(message), .. } if !message.contains("injected-secret"))));
     assert_eq!(backend.connects.load(Ordering::SeqCst), 0);
     assert_eq!(backend.saves.load(Ordering::SeqCst), 1);
 }
@@ -590,8 +596,13 @@ fn missing_cli_blocks_save_and_reports_check_failure_for_selected_service() {
             credentials: credentials(),
         },
     );
-    let events = until(&worker, |event| matches!(event, Event::Error(_)));
-    assert!(events.iter().any(|event| matches!(event, Event::FormError { field: "tapd-connection", message } if message.contains("not executable"))));
+    let events = until(&worker, |event| {
+        matches!(
+            event,
+            Event::Error(_) | Event::SettingResult { error: Some(_), .. }
+        )
+    });
+    assert!(events.iter().any(|event| matches!(event, Event::SettingResult { field: "tapd-connection", error:Some(message), .. } if message.contains("not executable"))));
     assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
     send(&worker, Job::Check(CliTool::Tapd));
     let events = finished(&worker, CliTool::Tapd);
@@ -690,7 +701,12 @@ fn test_mock_probe_and_rejected_mutations_never_touch_system_backend() {
         Job::ClearCredentials(CliTool::Tapd),
     ] {
         send(&worker, job);
-        until(&worker, |event| matches!(event, Event::Error(_)));
+        until(&worker, |event| {
+            matches!(
+                event,
+                Event::Error(_) | Event::SettingResult { error: Some(_), .. }
+            )
+        });
     }
     assert_eq!(backend.loads.load(Ordering::SeqCst), 0);
     assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
@@ -911,7 +927,12 @@ fn account_refresh_during_authorization_does_not_cancel_login() {
         matches!(event, Event::AuthorizationRequired { .. })
     });
     send(&worker, Job::Refresh);
-    let events = until(&worker, |event| matches!(event, Event::Error(_)));
+    let events = until(&worker, |event| {
+        matches!(
+            event,
+            Event::Error(_) | Event::SettingResult { error: Some(_), .. }
+        )
+    });
     assert!(events.iter().any(|event| matches!(event, Event::FormError { field: "tasks", message } if message.contains("Connection in progress"))));
     assert!(
         !events

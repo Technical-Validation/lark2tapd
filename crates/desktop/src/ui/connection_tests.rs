@@ -2,6 +2,155 @@
 use super::*;
 
 #[gpui_kit::test]
+fn stale_save_acknowledgments_cannot_mark_newer_values_saved(cx: &mut TestAppContext) {
+    let (_dir, _events, model, _, _) = setup(cx);
+    model.update(cx, |m, cx| {
+        m.send(Job::SetPreference(Preference::Theme("dark".into())), cx);
+        let first = m.next_request_sequence;
+        m.send(Job::SetPreference(Preference::Theme("light".into())), cx);
+        let last = m.next_request_sequence;
+        m.receive(
+            Event::SettingResult {
+                sequence: first,
+                field: "theme",
+                error: None,
+            },
+            cx,
+        );
+        assert_eq!(m.save_states.get("theme"), Some(&SaveState::Saving(last)));
+        m.receive(
+            Event::SettingResult {
+                sequence: first,
+                field: "theme",
+                error: Some("old failure".into()),
+            },
+            cx,
+        );
+        assert!(!m.errors.contains_key("theme"));
+        m.receive(
+            Event::SettingResult {
+                sequence: last,
+                field: "theme",
+                error: None,
+            },
+            cx,
+        );
+        assert_eq!(m.save_states.get("theme"), Some(&SaveState::Saved));
+        m.dirty_field("theme");
+        m.receive(
+            Event::SettingResult {
+                sequence: last,
+                field: "theme",
+                error: None,
+            },
+            cx,
+        );
+        assert_eq!(m.save_states.get("theme"), Some(&SaveState::Dirty));
+    });
+}
+
+#[gpui_kit::test]
+fn edited_credentials_hide_saved_marker_and_errors_expand_inline(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::ConnectionStatus {
+                lark_saved: false,
+                tapd_saved: true,
+            },
+            cx,
+        )
+    });
+    click(cx, settings, "connect-tapd");
+    cx.update_window(settings, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("saved-tapd-connection")
+            .is_some()
+    );
+    cx.update_window(settings, |_, w, cx| {
+        w.click("tapd-token", cx);
+        w.input("dummy-new-token", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(settings, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("saved-tapd-connection")
+            .is_none()
+    );
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::FormError {
+                field: "tapd-connection",
+                message: "Missing permission: task write".into(),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.update_window(settings, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("error-detail-tapd-connection")
+            .is_none()
+    );
+    click(cx, settings, "toggle-error-tapd-connection");
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("error-detail-tapd-connection")
+            .is_some()
+    );
+}
+
+#[gpui_kit::test]
+fn save_validation_never_opens_a_result_window(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    let count = cx.windows().len();
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::ConnectionReport {
+                tool: CliTool::Tapd,
+                report: ConnectionReport {
+                    connected: true,
+                    ..Default::default()
+                },
+                saved_configuration: true,
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.windows().len(),
+        count,
+        "only an explicit Test click may open results"
+    );
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::FormError {
+                field: "tapd-connection",
+                message: "Connection verification failed".into(),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.windows().len(),
+        count,
+        "silent validation failure stays inline"
+    );
+    assert!(cx.windows().contains(&settings));
+}
+
+#[gpui_kit::test]
 fn repeating_cli_probe_preserves_previous_connection_report(cx: &mut TestAppContext) {
     let (_dir, _events, model, _, _) = setup(cx);
     model.update(cx, |m, cx| {
@@ -128,6 +277,7 @@ fn cli_must_be_verified_before_configuration(cx: &mut TestAppContext) {
 fn results_window_contains_the_report_and_settings_stay_compact(cx: &mut TestAppContext) {
     let (_dir, _events, model, main, _) = setup(cx);
     let (settings, _) = open_settings_for_test(cx, main);
+    cx.update(|cx| connection_results::show(CliTool::Lark, cx));
     model.update(cx, |m, cx| {
         m.receive(
             Event::ConnectionReport {

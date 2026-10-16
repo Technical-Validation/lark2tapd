@@ -48,7 +48,7 @@ impl Workspace {
                     .flex_col()
                     .gap_5()
                     .child(section(self.tr(cx, "账号连接", "Account connections")))
-                    .child(self.inline_error("connection-status", cx))
+                    .child(self.field_feedback("connection-status", cx))
                     .when(model.errors.contains_key("connection-status"), |d| {
                         d.child(
                             self.focus_region(
@@ -93,7 +93,11 @@ impl Workspace {
         // 权限检查结果必须匹配当前输入；修改后不得沿用旧确认。
         let workspace_checked = model.checked_workspace.as_ref() == Some(&candidate);
         div().flex().flex_col().gap_3()
-            .child(section(self.tr(cx,"默认导入目标","Default import destination")))
+            .child(div().flex().items_center().justify_between()
+                .child(section(self.tr(cx,"默认导入目标","Default import destination")))
+                .child(self.focus_region("add-workspace", Button::new("add-workspace").icon(gpui_kit::component::IconName::Plus).ghost()
+                    .accessibility_label(self.tr(cx,"添加目标项目空间","Add TAPD workspace")).tooltip(self.tr(cx,"添加目标项目空间","Add TAPD workspace"))
+                    .disabled(self.new_workspace_open).on_click(cx.listener(|this,_,_,cx|{this.new_workspace_open=true;cx.notify();})))))
             .child(div().p_4().border_1().border_color(cx.theme().border).rounded_md().flex().flex_col().gap_3()
                 .child(self.focus_region("destination-workspace-field", field(self.tr(cx,"目标项目空间","TAPD workspace"),div().flex().items_center().gap_2()
                     .child(div().flex_1().min_w_0().child(Select::new(&self.settings_workspace).id("settings-workspace").placeholder(self.tr(cx,"选择目标项目空间","Select TAPD workspace")).search_placeholder(self.tr(cx,"搜索目标项目空间","Search TAPD workspaces"))))
@@ -101,19 +105,18 @@ impl Workspace {
                 .child(self.focus_region("destination-owner-field", field(self.tr(cx,"默认处理人","Default assignee"),div().flex().items_center().gap_2()
                     .child(div().flex_1().min_w_0().child(Select::new(&self.settings_owner).id("settings-owner").placeholder(self.tr(cx,"选择处理人","Select assignee")).search_placeholder(self.tr(cx,"搜索处理人","Search assignees")).cleanable(true)))
                     .child(self.focus_region("settings-member-refresh", Button::new("settings-member-refresh").icon(gpui_kit::component::IconName::RefreshCw).accessibility_label(self.tr(cx,"刷新处理人","Refresh assignees")).tooltip(self.tr(cx,"刷新处理人","Refresh assignees")).disabled(busy||selected(&self.settings_workspace,cx).is_empty()).on_click(cx.listener(|this,_,_,cx|this.send(Job::LoadMembers(selected(&this.settings_workspace,cx)),cx))))))))
-                .child(self.inline_error("destination",cx))
-                .child(self.focus_region("confirm-destination", Button::new("confirm-destination").primary().label(self.tr(cx,"确认默认目标","Confirm destination")).disabled(busy).on_click(cx.listener(|this,_,_,cx|this.preference(Preference::DefaultDestination{workspace:selected(&this.settings_workspace,cx),owner:selected(&this.settings_owner,cx)},cx))))))
+                .child(self.field_feedback("destination",cx)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.tr(cx,"CLI 仅列出管理员的目标项目空间。其他空间可按 ID 与名称添加；检查只验证权限，确认后才加入缓存。","The CLI lists administrator workspaces only. Add other workspaces by ID and name; checking only verifies access, and confirmation saves the workspace.")))
-            .child(self.focus_region("add-workspace", Button::new("add-workspace").label(self.tr(cx,"添加目标项目空间","Add TAPD workspace")).disabled(self.new_workspace_open).on_click(cx.listener(|this,_,_,cx|{this.new_workspace_open=true;cx.notify();}))))
             .when(self.new_workspace_open,|d|d.child(div().p_4().border_1().border_color(cx.theme().border).rounded_md().flex().flex_col().gap_3()
                 .child(self.help_field(self.tr(cx,"目标项目空间 ID","TAPD workspace ID"),"workspace-id-help",self.tr(cx,"从 TAPD 项目链接获取空间 ID。先检查权限，再确认加入列表。","Find the workspace ID in its TAPD project URL. Check access before confirming the addition."),Some("https://www.tapd.cn"),Input::new(&self.manual_workspace_id).id("manual-project-id"),cx))
                 .child(self.focus_region("workspace-name-field", field(self.tr(cx,"目标项目空间名称","TAPD workspace name"),Input::new(&self.manual_workspace_name).id("manual-project-name"))))
-                .child(self.inline_error("new-workspace",cx))
+                .child(self.field_feedback("new-workspace",cx))
                 .when(workspace_checked,|d|d.child(div().text_sm().child(self.tr(cx,"检查通过；确认后加入目标项目空间列表。","Check passed. Confirm to add this workspace."))))
                 .child(div().flex().gap_3()
                     .child(self.focus_region("check-workspace", Button::new("check-workspace").label(self.tr(cx,"检查权限","Check access")).on_click(cx.listener(|this,_,_,cx|this.send(Job::CheckWorkspace(TapdWorkspace{id:this.manual_workspace_id.read(cx).value().trim().into(),name:this.manual_workspace_name.read(cx).value().trim().into()}),cx)))))
                     .child(self.focus_region("confirm-workspace", Button::new("confirm-workspace").primary().label(self.tr(cx,"确认添加","Confirm add")).disabled(busy||!workspace_checked).on_click(cx.listener(|this,_,_,cx|this.send(Job::AddWorkspace(TapdWorkspace{id:this.manual_workspace_id.read(cx).value().trim().into(),name:this.manual_workspace_name.read(cx).value().trim().into()}),cx)))))
                     .child(self.focus_region("cancel-workspace", Button::new("cancel-workspace").label(self.tr(cx,"取消","Cancel")).on_click(cx.listener(|this,_,_,cx|{this.new_workspace_open=false;cx.notify();})))))))
+            .when(!self.new_workspace_open, |d| d.child(self.field_feedback("new-workspace",cx)))
     }
     fn prefix_settings(&self, cx: &Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
@@ -136,12 +139,13 @@ impl Workspace {
                         let workspace=selected(&this.prefix_workspace,cx);
                         this.preference(Preference::RemoveWorkspacePrefix{workspace,prefix:prefix.clone()},cx);
                     }))))))
-                .child(self.inline_error("prefixes",cx))
+                .when(!self.new_prefix_open,|d|d.child(self.field_feedback("prefixes",cx)))
                 .child(self.focus_region("add-prefix", Button::new("add-prefix").label(self.tr(cx,"添加前缀","Add prefix")).disabled(busy||prefix_workspace.is_empty()||self.new_prefix_open).on_click(cx.listener(|this,_,window,cx|{
                     this.load_prefix_form(window,cx);this.new_prefix_open=true;this.prefix_options.read(cx).focus_handle(cx).focus(window,cx);cx.notify();
                 }))))
                 .when(self.new_prefix_open,|d|d.child(div().flex().flex_col().gap_3()
                     .child(self.help_field(self.tr(cx,"前缀原文","Prefix text"),"prefix-help",self.tr(cx,"原样保存并拼接标题，不自动加括号或删除空格。最多 66 字符；不允许全空白或控制字符。","Saved and prepended verbatim, without adding brackets or trimming spaces. Up to 66 characters; no whitespace-only values or control characters."),None,Input::new(&self.prefix_options).id("workspace-prefixes").disabled(busy),cx))
+                    .child(self.field_feedback("prefixes",cx))
                     .child(div().flex().gap_3()
                         .child(self.focus_region("confirm-prefixes", Button::new("confirm-prefixes").primary().label(self.tr(cx,"确认添加","Confirm add")).disabled(busy).on_click(cx.listener(|this,_,_,cx|{
                             let workspace=selected(&this.prefix_workspace,cx);
@@ -161,7 +165,8 @@ impl Workspace {
         div().flex().flex_col().gap_3()
             .child(section(self.tr(cx,"后台检查","Background checks")))
             .child(self.focus_region("poll-toggle-field", Switch::new("toggle-poll").label(self.tr(cx,"定时检查新任务","Check for new tasks periodically")).checked(settings.poll_enabled).disabled(busy).on_click(cx.listener(|this,enabled,_,cx|this.preference(Preference::Polling(*enabled),cx)))))
-            .when(settings.poll_enabled,|d|d.child(self.focus_region("poll-interval-field", field(self.tr(cx,"检查间隔（1–1440 分钟）","Interval (1–1440 minutes)"),Input::new(&self.poll).id("poll-minutes")))).child(self.inline_error("poll",cx)))
+            .child(self.field_feedback("poll-enabled",cx))
+            .when(settings.poll_enabled,|d|d.child(self.focus_region("poll-interval-field", field(self.tr(cx,"检查间隔（1–1440 分钟）","Interval (1–1440 minutes)"),Input::new(&self.poll).id("poll-minutes")))).child(self.field_feedback("poll",cx)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.tr(cx,"关闭窗口后仍可检查；退出应用后停止。首次读取只建立基线，不发送历史任务通知。","Checks continue when the window closes, but stop when the app quits. Initial fetch establishes a baseline without notifying historical tasks.")))
     }
     fn appearance_settings(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -201,6 +206,7 @@ impl Workspace {
                     ),
                 ),
             )
+            .child(self.field_feedback("language", cx))
             .child(
                 self.focus_region(
                     "theme-options",
@@ -224,6 +230,7 @@ impl Workspace {
                     ),
                 ),
             )
+            .child(self.field_feedback("theme", cx))
     }
     pub(super) fn help_field(
         &self,

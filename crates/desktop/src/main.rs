@@ -2,6 +2,7 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("Lark → TAPD currently supports macOS only.");
 
+mod console;
 mod i18n;
 mod native;
 mod startup;
@@ -12,6 +13,7 @@ use gpui_kit::*;
 use std::path::PathBuf;
 
 fn main() {
+    console::install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
     let mock_env = std::env::var_os("LARK2TAPD_MOCK");
     let options = match startup::LaunchOptions::parse(
@@ -23,6 +25,7 @@ fn main() {
     ) {
         Ok(options) => options,
         Err(error) => {
+            console::failure("app.startup", &error);
             eprintln!("{error}");
             std::process::exit(2);
         }
@@ -33,6 +36,7 @@ fn main() {
         );
         return;
     }
+    console::event("app.lifecycle", "starting");
     let mode = worker::Mode::Live;
     let root = options.data_dir.unwrap_or_else(|| {
         PathBuf::from(std::env::var_os("HOME").expect("HOME is required"))
@@ -43,8 +47,15 @@ fn main() {
         .with_assets(assets::Assets)
         .with_quit_mode(QuitMode::Explicit);
     app.on_reopen(ui::show_window);
+    console::event("app.lifecycle", "event_loop_enter");
     app.run(move |cx| {
         gpui_kit::init(cx);
+        cx.on_app_quit(|_| {
+            console::event("app.lifecycle", "quitting");
+            async {}
+        })
+        .detach();
         ui::start(worker, mode, cx);
     });
+    console::event("app.lifecycle", "event_loop_returned");
 }

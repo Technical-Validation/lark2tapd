@@ -122,8 +122,7 @@ impl Workspace {
                 .when(!ready, |d| d.child(self.focus_region(if lark { "install-lark" } else { "install-tapd" }, Button::new(if lark { "install-lark" } else { "install-tapd" })
                     .label(self.tr(cx,"安装 CLI","Install CLI")).disabled(model.busy || probing)
                     .on_click(cx.listener(move |this,_,_,cx| this.send(Job::PlanInstall(tool),cx)))))))
-            .when_some(state.cli_error.clone(), |d,e| d.child(div().text_sm().text_color(cx.theme().danger).child(e)))
-            .child(self.inline_error(cli_key(tool),cx))
+            .child(self.field_feedback(cli_key(tool),cx))
             .when_some(model.install_plan.clone().filter(|p| p.tool==tool), |d,p| d.child(self.install_confirmation(p,cx)))
             .when_some(last_verified(model,tool), |d,time| d.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{}: {time}",self.tr(cx,"已保存配置上次通过","Saved configuration last verified")))))
             .when(ready, |d| d.child(self.account_section(tool,cx)))
@@ -175,7 +174,7 @@ impl Workspace {
                 .child(self.focus_region("open-lark-authorization",Button::new("open-lark-authorization").primary()
                     .label(self.tr(cx,"打开飞书授权页面","Open Lark authorization"))
                     .on_click(move |_,_,cx| open_safe_url(&url,cx))))))
-            .child(div().debug_selector(move || if lark { "lark-operation-error".into() } else { "tapd-operation-error".into() }).child(self.inline_error(field_key(tool),cx)))
+            .child(div().debug_selector(move || if lark { "lark-operation-error".into() } else { "tapd-operation-error".into() }).child(self.field_feedback(field_key(tool),cx)))
     }
 
     fn test_button(&self, tool: CliTool, draft: bool, cx: &Context<Self>) -> impl IntoElement {

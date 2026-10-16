@@ -97,8 +97,8 @@ fn background_errors_are_retained_until_a_window_can_show_them(cx: &mut TestAppC
     cx.update_window(main, |_, w, cx| {
         assert_eq!(
             w.notifications(cx).len(),
-            2,
-            "an unrelated success must not replace an error awaiting dismissal"
+            1,
+            "silent setting save must leave an error awaiting dismissal intact"
         )
     })
     .unwrap();

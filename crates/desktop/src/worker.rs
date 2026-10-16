@@ -147,6 +147,11 @@ pub enum Event {
         key: String,
         active: bool,
     },
+    SettingResult {
+        sequence: u64,
+        field: &'static str,
+        error: Option<String>,
+    },
     FormError {
         field: &'static str,
         message: String,
@@ -178,6 +183,7 @@ pub enum Event {
 }
 
 pub struct Request {
+    pub sequence: u64,
     pub job: Job,
     pub profile: String,
 }
@@ -473,16 +479,24 @@ fn field(job: &Job) -> &'static str {
         Job::LoadMembers(_) => "members",
         Job::Check(tool) | Job::TestConnection { tool, .. } => connection_key(*tool),
         Job::ProbeCli(tool) => cli_key(*tool),
-        Job::SetPreference(Preference::PollMinutes(_) | Preference::Polling(_)) => "poll",
-        Job::SetPreference(Preference::DefaultDestination { .. }) => "destination",
-        Job::SetPreference(
-            Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. },
-        ) => "prefixes",
+        Job::SetPreference(p) => setting_field(p),
         Job::CheckWorkspace(_) | Job::AddWorkspace(_) => "new-workspace",
         Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => connection_key(*tool),
         Job::LoadConnectionStatus => "connection-status",
         Job::LocalFile { .. } | Job::PastedImage { .. } => "attachments",
         _ => "submit",
+    }
+}
+pub fn setting_field(preference: &Preference) -> &'static str {
+    match preference {
+        Preference::Language(_) => "language",
+        Preference::Theme(_) => "theme",
+        Preference::Polling(_) => "poll-enabled",
+        Preference::PollMinutes(_) => "poll",
+        Preference::DefaultDestination { .. } => "destination",
+        Preference::AddWorkspacePrefix { .. } | Preference::RemoveWorkspacePrefix { .. } => {
+            "prefixes"
+        }
     }
 }
 fn patch(settings: &mut Settings, preference: Preference) -> Result<()> {
@@ -997,6 +1011,7 @@ fn start_with_backend(
                 let mut pending_install = None;
                 let mut next_check = Instant::now() + interval(&settings);
                 let mut opened = false;
+                crate::console::event("worker","ready");
                 output
                     .send(Event::State {
                         mode,
@@ -1015,6 +1030,7 @@ fn start_with_backend(
                         Ok(v) => v,
                         Err(mpsc::RecvTimeoutError::Timeout) if scheduled.is_some() => {
                             Envelope::Request(Request {
+                                sequence: 0,
                                 job: Job::Refresh,
                                 profile: namespace.clone(),
                             })
@@ -1022,6 +1038,14 @@ fn start_with_backend(
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    let setting_operation = match &envelope {
+                        Envelope::Request(Request {sequence,job:Job::SetPreference(p),..}) => Some((*sequence,setting_field(p))),
+                        Envelope::Request(Request {sequence,job:Job::SaveAndConnect {tool,..},..}) => Some((*sequence,connection_key(*tool))),
+                        Envelope::Request(Request {sequence,job:Job::AddWorkspace(_),..}) => Some((*sequence,"new-workspace")),
+                        Envelope::Request(Request {sequence,job:Job::Install(tool),..}) => Some((*sequence,cli_key(*tool))),
+                        _=>None,
+                    };
+                    if let Some((_,key))=setting_operation { crate::console::change(key,"save_started"); }
                     let mut activity = match &envelope {
                         Envelope::Request(Request { job: Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool), .. }) => Some(connection_key(*tool)),
                         Envelope::Request(Request { job: Job::LoadConnectionStatus, .. }) => Some("connection-status"),
@@ -1035,7 +1059,7 @@ fn start_with_backend(
                     let mut new_count = 0;
                     let mut error_field = "submit";
                     let result: Result<()> = async {
-                        let Request { job, profile } = match envelope {
+                        let Request { job, profile, .. } = match envelope {
                             Envelope::Authorization { generation: current, verification_url, expires_in } => {
                                 if current == generation && pending.get("lark-connection").is_some_and(|read| read.generation == current) {
                                     output.send(Event::AuthorizationRequired { verification_url, expires_in }).await?;
@@ -1078,6 +1102,7 @@ fn start_with_backend(
                                 }
                                 match &data {
                                     ReadData::CliProbe { tool, version, error } => {
+                                        if let Some(error)=error {crate::console::failure(crate::console::setting_module(cli_key(*tool)),error);} else {crate::console::change(cli_key(*tool),"probe_succeeded");}
                                         output.send(Event::CliProbe { tool: *tool, version: version.clone(), error: error.clone() }).await?;
                                     }
                                     ReadData::ConnectionReport { tool, report, authorization, binding } => {
@@ -1099,11 +1124,14 @@ fn start_with_backend(
                                         }
                                         output.send(Event::ConnectionReport { tool: *tool, report: report.clone(), saved_configuration }).await?;
                                         if let Some(failure) = &report.failure {
+                                            crate::console::failure(crate::console::setting_module(connection_key(*tool)),failure);
                                             output.send(Event::FormError { field: connection_key(*tool), message: failure.clone() }).await?;
-                                        }
+                                        } else if report.connected { crate::console::change(connection_key(*tool),"verification_succeeded"); }
                                     }
                                     ReadData::Tasks(_) => {
+                                        let prior = engine.snapshot().clone();
                                         new_count = engine.refresh(&data).await?;
+                                        crate::console::tasks(&prior,engine.snapshot());
                                         message = "refreshed";
                                     }
                                     ReadData::Projects(_) => {
@@ -1168,6 +1196,7 @@ fn start_with_backend(
                                     active: true,
                                 })
                                 .await?;
+                            if matches!(job,Job::Refresh) {crate::console::event("tasks.lark","fetch_started");}
                             spawn_read(weak.clone(),ReadTask{key,generation,job,mode,settings:settings.clone(),#[cfg(test)] mock:mock.clone(),backend:backend.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
                             return Ok(());
                         }
@@ -1263,6 +1292,7 @@ fn start_with_backend(
                                     Job::ClearCredentials(_) => {
                                         backend.clear(tool).map_err(|_| anyhow::anyhow!("Cannot clear credentials; check Keychain access"))?;
                                         output.send(Event::CredentialsCleared(tool)).await?;
+                                        crate::console::change(connection_key(tool),"credentials_cleared");
                                         message = "credentials_cleared";
                                     }
                                     _ => unreachable!(),
@@ -1413,7 +1443,14 @@ fn start_with_backend(
                             })
                             .await?;
                     }
+                    if let Some((sequence,field))=setting_operation {
+                        let error=result.as_ref().err().map(ToString::to_string);
+                        if let Some(error)=&error {crate::console::failure(crate::console::setting_module(field),error);} else {crate::console::change(field,"save_succeeded");}
+                        output.send(Event::SettingResult {sequence,field,error}).await?;
+                    }
                     if let Err(error) = result {
+                        if setting_operation.is_some() { continue; }
+                        crate::console::failure(crate::console::setting_module(error_field), &error.to_string());
                         output
                             .send(Event::FormError {
                                 field: error_field,
@@ -1427,6 +1464,7 @@ fn start_with_backend(
             })
         })();
         if let Err(error) = result {
+            crate::console::failure("worker", &error.to_string());
             let _ = output.send_blocking(Event::Error(error.to_string()));
         }
     });
@@ -1671,7 +1709,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match worker.events.try_recv() {
-                Ok(Event::ConnectionStatus { .. }) => continue,
+                Ok(Event::ConnectionStatus { .. } | Event::SettingResult { error: None, .. }) => {
+                    continue;
+                }
                 Ok(event) => return event,
                 Err(async_channel::TryRecvError::Closed) => panic!("worker stopped"),
                 Err(_) => {}
@@ -1684,6 +1724,7 @@ mod tests {
         worker
             .jobs
             .send(Request {
+                sequence: 0,
                 job,
                 profile: "mock".into(),
             })
@@ -1740,7 +1781,11 @@ mod tests {
         request(&worker, Job::SetPreference(Preference::PollMinutes(0)));
         assert!(matches!(
             event(&worker),
-            Event::FormError { field: "poll", .. }
+            Event::SettingResult {
+                field: "poll",
+                error: Some(_),
+                ..
+            }
         ));
     }
     #[test]
@@ -1807,8 +1852,9 @@ mod tests {
         );
         assert!(matches!(
             event(&worker),
-            Event::FormError {
+            Event::SettingResult {
                 field: "new-workspace",
+                error: Some(_),
                 ..
             }
         ));
