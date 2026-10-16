@@ -2,6 +2,163 @@
 use super::*;
 
 #[gpui_kit::test]
+fn loading_saved_configuration_does_not_claim_a_new_save(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::ConnectionStatus {
+                lark_saved: true,
+                tapd_saved: true,
+            },
+            cx,
+        );
+        assert!(
+            m.save_states
+                .values()
+                .all(|state| *state != SaveState::Saved)
+        );
+    });
+    cx.update_window(settings, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("saved-theme")
+            .is_none()
+    );
+}
+
+#[gpui_kit::test]
+fn unchanged_preference_does_not_show_saved_feedback(cx: &mut TestAppContext) {
+    let (_dir, events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    click(cx, settings, "system");
+    pump(&events, &model, cx, |cx| {
+        !matches!(
+            model.read(cx).save_states.get("theme"),
+            Some(SaveState::Saving(_))
+        )
+    });
+    cx.read(|cx| {
+        assert_ne!(
+            model.read(cx).save_states.get("theme"),
+            Some(&SaveState::Saved)
+        )
+    });
+}
+
+#[gpui_kit::test]
+fn persisted_preference_survives_reopening_without_its_saved_marker(cx: &mut TestAppContext) {
+    let (_dir, events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    click(cx, settings, "dark");
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).save_states.get("theme") == Some(&SaveState::Saved)
+    });
+    cx.update_window(settings, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("saved-theme")
+            .is_some()
+    );
+    close_test_window(cx, settings);
+    let (reopened, _) = open_settings_for_test(cx, main);
+    cx.read(|cx| {
+        assert_eq!(
+            model.read(cx).snapshot.as_ref().unwrap().settings.theme,
+            "dark"
+        )
+    });
+    cx.update_window(reopened, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(reopened, cx)
+            .debug_bounds("saved-theme")
+            .is_none()
+    );
+}
+
+#[gpui_kit::test]
+fn saved_feedback_ends_with_settings_window_and_ignores_late_results(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    let pending = model.update(cx, |m, cx| {
+        m.send(Job::SetPreference(Preference::Theme("dark".into())), cx);
+        m.receive(
+            Event::SettingResult {
+                changed: true,
+                sequence: m.next_request_sequence,
+                field: "theme",
+                error: None,
+            },
+            cx,
+        );
+        m.send(Job::SetPreference(Preference::Language("en".into())), cx);
+        m.next_request_sequence
+    });
+    cx.update(show_settings);
+    cx.read(|cx| {
+        assert_eq!(
+            model.read(cx).save_states.get("theme"),
+            Some(&SaveState::Saved)
+        )
+    });
+    // 关闭其他窗口不能清除设置反馈；真正关闭设置才结束此次会话。
+    close_test_window(cx, main);
+    cx.read(|cx| {
+        assert_eq!(
+            model.read(cx).save_states.get("theme"),
+            Some(&SaveState::Saved)
+        )
+    });
+    close_test_window(cx, settings);
+    cx.read(|cx| assert!(model.read(cx).save_states.is_empty()));
+    cx.update(show_settings);
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::SettingResult {
+                changed: true,
+                sequence: pending,
+                field: "language",
+                error: None,
+            },
+            cx,
+        );
+        assert!(
+            m.save_states.is_empty(),
+            "old window's success must not reappear"
+        );
+        m.send(Job::SetPreference(Preference::Language("zh-CN".into())), cx);
+        let current = m.next_request_sequence;
+        m.receive(
+            Event::SettingResult {
+                changed: true,
+                sequence: pending,
+                field: "language",
+                error: Some("stale failure".into()),
+            },
+            cx,
+        );
+        assert_eq!(
+            m.save_states.get("language"),
+            Some(&SaveState::Saving(current))
+        );
+        assert!(!m.errors.contains_key("language"));
+        m.receive(
+            Event::SettingResult {
+                changed: true,
+                sequence: current,
+                field: "language",
+                error: None,
+            },
+            cx,
+        );
+        assert_eq!(m.save_states.get("language"), Some(&SaveState::Saved));
+    });
+}
+
+#[gpui_kit::test]
 fn stale_save_acknowledgments_cannot_mark_newer_values_saved(cx: &mut TestAppContext) {
     let (_dir, _events, model, _, _) = setup(cx);
     model.update(cx, |m, cx| {
@@ -11,6 +168,7 @@ fn stale_save_acknowledgments_cannot_mark_newer_values_saved(cx: &mut TestAppCon
         let last = m.next_request_sequence;
         m.receive(
             Event::SettingResult {
+                changed: true,
                 sequence: first,
                 field: "theme",
                 error: None,
@@ -20,6 +178,7 @@ fn stale_save_acknowledgments_cannot_mark_newer_values_saved(cx: &mut TestAppCon
         assert_eq!(m.save_states.get("theme"), Some(&SaveState::Saving(last)));
         m.receive(
             Event::SettingResult {
+                changed: true,
                 sequence: first,
                 field: "theme",
                 error: Some("old failure".into()),
@@ -29,6 +188,7 @@ fn stale_save_acknowledgments_cannot_mark_newer_values_saved(cx: &mut TestAppCon
         assert!(!m.errors.contains_key("theme"));
         m.receive(
             Event::SettingResult {
+                changed: true,
                 sequence: last,
                 field: "theme",
                 error: None,
@@ -39,6 +199,7 @@ fn stale_save_acknowledgments_cannot_mark_newer_values_saved(cx: &mut TestAppCon
         m.dirty_field("theme");
         m.receive(
             Event::SettingResult {
+                changed: true,
                 sequence: last,
                 field: "theme",
                 error: None,
@@ -63,6 +224,31 @@ fn edited_credentials_hide_saved_marker_and_errors_expand_inline(cx: &mut TestAp
         )
     });
     click(cx, settings, "connect-tapd");
+    model.update(cx, |m, cx| {
+        m.send(
+            Job::SaveAndConnect {
+                tool: CliTool::Tapd,
+                credentials: Credentials::default(),
+            },
+            cx,
+        );
+        m.receive(
+            Event::SettingResult {
+                changed: true,
+                sequence: m.next_request_sequence,
+                field: "tapd-connection",
+                error: None,
+            },
+            cx,
+        );
+        m.receive(
+            Event::Activity {
+                key: "tapd-connection".into(),
+                active: false,
+            },
+            cx,
+        );
+    });
     cx.update_window(settings, |_, w, cx| w.render_frame(cx))
         .unwrap();
     assert!(

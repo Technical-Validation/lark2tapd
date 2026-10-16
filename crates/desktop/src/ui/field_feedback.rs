@@ -23,6 +23,7 @@ impl Workspace {
                 "permission" => self.tr(cx, "权限", "Permission"),
                 "authentication" => self.tr(cx, "认证", "Authentication"),
                 "network" => self.tr(cx, "网络", "Network"),
+                "api" => self.tr(cx, "接口", "API"),
                 "timeout" => self.tr(cx, "超时", "Timeout"),
                 "validation" => self.tr(cx, "配置", "Configuration"),
                 "cancelled" => self.tr(cx, "取消", "Cancelled"),

@@ -167,6 +167,7 @@ pub enum Event {
     SettingResult {
         sequence: u64,
         field: &'static str,
+        changed: bool,
         error: Option<String>,
     },
     FormError {
@@ -1080,6 +1081,7 @@ fn start_with_backend(
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    let preference_operation = matches!(&envelope, Envelope::Request(Request { job: Job::SetPreference(_), .. }));
                     let setting_operation = match &envelope {
                         Envelope::Request(Request {sequence,job:Job::SetPreference(p),..}) => Some((*sequence,setting_field(p))),
                         Envelope::Request(Request {sequence,job:Job::SaveAndConnect {tool,..},..}) => Some((*sequence,connection_key(*tool))),
@@ -1488,7 +1490,9 @@ fn start_with_backend(
                     if let Some((sequence,field))=setting_operation {
                         let error=result.as_ref().err().map(ToString::to_string);
                         if let Some(error)=&error {crate::console::failure(crate::console::setting_module(field),error);} else {crate::console::change(field,"save_succeeded");}
-                        output.send(Event::SettingResult {sequence,field,error}).await?;
+                        // 以串行 actor 的落盘前后状态为准，避免未改值的点击生成“已保存”。
+                        let changed = !preference_operation || before.settings != engine.snapshot().settings;
+                        output.send(Event::SettingResult {sequence,field,changed,error}).await?;
                     }
                     if let Err(error) = result {
                         if setting_operation.is_some() { continue; }

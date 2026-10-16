@@ -77,7 +77,7 @@ open dist/Lark2Tapd.app
 
 默认目标项目空间和处理人选择后自动保存，不再需要确认默认目标；切换空间与清空旧处理人原子保存。初始化控件、更新下拉选项不会误触发保存。空间前缀仍逐项确认添加；未配置 TAPD 时显示连接引导。刷新按钮分别位于输入框后，添加项目空间使用标题右侧带 tooltip 的加号按钮。
 
-对应控件或编辑区域下方显示「保存中…」或绿色勾选「已保存」。继续编辑会清除旧保存标记；回执按请求序号匹配，旧请求不能将新输入标为已保存。失败使用同位置的轻量折叠项，收起显示分类与标题，展开查看脱敏详情；凭证已保存不等于连接已验证。
+对应控件或编辑区域下方显示「保存中…」或绿色勾选「已保存」。保存提示仅属于当前设置窗口会话：加载已有配置不会显示「已保存」，未改变偏好值的重复选择也不会生成保存成功标记。关闭设置窗口清除提示与待确认序号，但不撤销实际保存；重新打开不会继承旧提示，旧窗口的延迟回执也不会点亮新窗口。继续编辑会清除旧保存标记；回执按请求序号匹配，旧请求不能将新输入标为已保存。失败使用同位置的轻量折叠项，收起显示分类与标题，展开查看脱敏详情；凭证已保存不等于连接已验证。
 
 各服务的凭证保存成功后，只清空并收起该服务表单；保存失败保留输入，取消表单会清空其未保存输入。CLI 检查按钮不因其他后台读取而禁用，重复读取会合并；写入仍串行处理。
 
@@ -85,7 +85,7 @@ open dist/Lark2Tapd.app
 
 ## 控制台日志与输入法诊断
 
-日志仅写终端 stderr，暂不记录文件。格式为本地时间、级别、模块和事件：`settings.language`、`settings.theme`、`settings.destination`、`settings.polling`、`settings.prefixes`、`connection.lark`、`connection.tapd`、`tasks.lark` 等。设置提交及保存结果分别记录；失败只在日志中记录分类，具体脱敏详情在界面查看，不打印 Secret、Token、授权码、原始 CLI 输出、任务标题或正文。
+日志仅写终端 stderr，暂不记录文件。格式为本地时间、级别、模块和事件：`settings.language`、`settings.theme`、`settings.destination`、`settings.polling`、`settings.prefixes`、`connection.lark`、`connection.tapd`、`tasks.lark` 等。设置提交及保存结果分别记录；失败记录分类，并在可用时附带经过校验的 `exit_code` 与整数 `api_code`，具体脱敏详情在界面查看。CLI/API 失败优先按明确的错误类型分类，恢复建议中的认证、权限等词不会改变分类；普通 `api` 或 `unknown` 不代表令牌失效。不打印 Secret、Token、授权码、原始 CLI 输出、任务标题或正文。
 
 每轮任务完整读取且成功更新缓存后，打印一行 `read / unfinished / added / changed / unimported / attention / unsynced` 数量。新增和变化对比上一份缓存；只统计当前范围内任务。`unsynced` 包含未导入、待更新、待核对和附件/正文未完成的任务，不把这些状态当成全部已同步。
 
@@ -94,6 +94,7 @@ open dist/Lark2Tapd.app
 - `event=request_timeout`：某个 CLI 调用超过单次时间限制，优先检查该阶段的网络、代理或 CLI。
 - `event=refresh_budget_timeout`：整轮 120 秒预算耗尽，可以看到当时已经完成多少详情。
 - `event=cancelled`：配置或账号切换等操作取消了旧读取。
+- `event=request_failed`：非超时请求失败；结合随后 `operation_failed` 的分类、`exit_code` 和 `api_code` 定位。`detail` 是当前页内的详情请求序号，不是任务 ID。
 
 详情读取最多四路并发，分页仍顺序读取；任一详情失败都会保留旧缓存，不会把半份列表写入数据库。标准代理环境变量及大小写形式会原样传给 CLI，但不记录值。`proxy_env_set` 仅表明进程环境里存在代理相关变量，不证明请求实际经过代理；Finder 启动不一定继承终端环境，应用不替你设置代理。
 

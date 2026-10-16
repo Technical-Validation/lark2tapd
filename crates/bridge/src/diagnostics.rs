@@ -60,7 +60,7 @@ pub(crate) fn api_failure(provider: &str, value: &Value, exit: Option<i32>) -> a
         "policy" => "; resolve the account security policy or browser challenge",
         "confirmation" => "; explicit operation confirmation is required",
         "internal" => "; check native CLI storage access and supported version",
-        _ => "; check authentication, configuration and remote service status",
+        _ => "; inspect the API code and remote service status before retrying",
     });
     anyhow::anyhow!(text)
 }

@@ -222,6 +222,7 @@ impl Model {
             Event::SettingResult {
                 sequence,
                 field,
+                changed,
                 error,
             } => {
                 if self.save_states.get(field) == Some(&SaveState::Saving(sequence)) {
@@ -229,7 +230,11 @@ impl Model {
                         self.save_states.insert(field, SaveState::Dirty);
                         self.errors.insert(field, error);
                     } else {
-                        self.save_states.insert(field, SaveState::Saved);
+                        if changed {
+                            self.save_states.insert(field, SaveState::Saved);
+                        } else {
+                            self.save_states.remove(field);
+                        }
                         self.errors.remove(field);
                     }
                 }
@@ -286,14 +291,6 @@ impl Model {
                 self.connections_loaded = true;
                 self.lark_connection.saved = lark_saved;
                 self.tapd_connection.saved = tapd_saved;
-                for (key, saved) in [
-                    ("lark-connection", lark_saved),
-                    ("tapd-connection", tapd_saved),
-                ] {
-                    if saved {
-                        self.save_states.entry(key).or_insert(SaveState::Saved);
-                    }
-                }
             }
             Event::CredentialsSaved(tool) => {
                 self.connection_mut(tool).saved = true;
@@ -323,16 +320,6 @@ impl Model {
                 message,
                 new_count,
             } => {
-                if self.snapshot.is_none() {
-                    for key in ["language", "theme", "poll-enabled", "poll"] {
-                        self.save_states.entry(key).or_insert(SaveState::Saved);
-                    }
-                    if !snapshot.settings.workspace_id.is_empty() {
-                        self.save_states
-                            .entry("destination")
-                            .or_insert(SaveState::Saved);
-                    }
-                }
                 let changed = self.profile != profile;
                 let first = changed
                     || self
@@ -586,8 +573,24 @@ fn configure_actions(cx: &mut App) {
         KeyBinding::new("cmd-1", OpenPending, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
-    cx.on_window_closed(|_, _| crate::console::event("ui.window", "closed"))
-        .detach();
+    cx.on_window_closed(|cx, id| {
+        crate::console::event("ui.window", "closed");
+        if cx
+            .global::<Shell>()
+            .settings_window
+            .is_some_and(|w| w.window_id() == id)
+        {
+            let shell = cx.global_mut::<Shell>();
+            shell.settings_window = None;
+            let model = shell.model.clone();
+            // 清除待确认序号；旧窗口的迟到回执也不能点亮新窗口。
+            model.update(cx, |m, cx| {
+                m.save_states.clear();
+                cx.notify();
+            });
+        }
+    })
+    .detach();
     cx.on_action(|_: &Quit, cx| {
         crate::console::event("app.lifecycle", "quit_requested_shortcut_or_menu");
         cx.quit();
@@ -741,6 +744,8 @@ fn show_settings(cx: &mut App) {
     }
     let model = cx.global::<Shell>().model.clone();
     let title = text(model.read(cx).language(), "设置", "Settings").to_owned();
+    // 菜单栏等窗口外操作不继承为新设置会话的保存提示。
+    model.update(cx, |m, _| m.save_states.clear());
     // 控件状态绑定各自 Window；共享后台模型，但绝不复用主窗口正在编辑的表单实体。
     let result = gpui_kit::open_window(
         WindowOptions {

@@ -2,7 +2,50 @@
 use lark2tapd_core::{Snapshot, SyncStatus};
 use std::{collections::HashMap, io::Write};
 
+// worker/UI 事件携带脱敏后的字符串；只解析 bridge::diagnostics 生成的固定头部，
+// 不把后面的恢复建议当成错误原因，也不把任意 CLI 文本直接写入日志。
+struct RequestDiagnostic {
+    category: &'static str,
+    exit: Option<i32>,
+    code: Option<i64>,
+}
+fn request_diagnostic(message: &str) -> Option<RequestDiagnostic> {
+    let header = ["CLI", "Lark", "TAPD"].into_iter().find_map(|provider| {
+        message
+            .split_once(&format!("{provider} request failed ("))
+            .and_then(|(_, rest)| rest.split_once(')').map(|(header, _)| header))
+    })?;
+    let mut fields = header.split(", ");
+    let category = match fields.next()? {
+        "authentication" => "authentication",
+        "authorization" | "policy" => "permission",
+        "network" => "network",
+        "validation" | "config" | "confirmation" => "validation",
+        "api" => "api",
+        "internal" | "unknown" => "unknown",
+        _ => return None,
+    };
+    let mut diagnostic = RequestDiagnostic {
+        category,
+        exit: None,
+        code: None,
+    };
+    for field in fields {
+        if let Some(exit) = field.strip_prefix("exit ") {
+            diagnostic.exit = Some(exit.parse().ok()?);
+        } else if let Some(code) = field.strip_prefix("API code ") {
+            diagnostic.code = Some(code.parse().ok()?);
+        } else {
+            return None;
+        }
+    }
+    Some(diagnostic)
+}
+
 pub fn category(message: &str) -> &'static str {
+    if let Some(diagnostic) = request_diagnostic(message) {
+        return diagnostic.category;
+    }
     let text = message.to_ascii_lowercase();
     if [
         "keychain", "sqlite", "database", "disk", "storage", "persist",
@@ -78,7 +121,16 @@ pub fn event(module: &'static str, action: &'static str) {
     output("INFO", module, action);
 }
 fn failure_text(error: &str) -> String {
-    format!("operation_failed category={}", category(error))
+    let mut text = format!("operation_failed category={}", category(error));
+    if let Some(diagnostic) = request_diagnostic(error) {
+        if let Some(exit) = diagnostic.exit {
+            text.push_str(&format!(" exit_code={exit}"));
+        }
+        if let Some(code) = diagnostic.code {
+            text.push_str(&format!(" api_code={code}"));
+        }
+    }
+    text
 }
 pub fn failure(module: &'static str, error: &str) {
     output("ERROR", module, &failure_text(error));
@@ -340,6 +392,53 @@ mod tests {
         assert!(text.contains("id=7 phase=tapd_identity event=request_timeout"));
         assert!(text.contains("elapsed_ms=31000 remaining_ms=89000"));
         assert_eq!(category("Lark refresh deadline exceeded"), "timeout");
+    }
+    #[test]
+    fn request_categories_use_the_cli_type_not_recovery_advice() {
+        for (kind, expected) in [
+            ("api", "api"),
+            ("unknown", "unknown"),
+            ("authentication", "authentication"),
+            ("authorization", "permission"),
+            ("network", "network"),
+            ("validation", "validation"),
+            ("config", "validation"),
+            ("policy", "permission"),
+            ("internal", "unknown"),
+            ("confirmation", "validation"),
+        ] {
+            let error = format!(
+                "Task refresh request_failed at lark_task_details: CLI request failed ({kind}, exit 1, API code 999); check authentication, configuration and remote service status. Cached tasks unchanged"
+            );
+            assert_eq!(category(&error), expected, "{kind}");
+        }
+    }
+    #[test]
+    fn request_logs_include_only_validated_codes() {
+        let line = failure_text(
+            "CLI request failed (api, exit 8, API code 99991400); token=private-token; body=private-task",
+        );
+        assert!(line.contains("category=api"));
+        assert!(line.contains("exit_code=8"));
+        assert!(line.contains("api_code=99991400"));
+        assert!(!line.contains("private"));
+        for error in [
+            "CLI request failed (api, exit private-token, API code private-task)",
+            "CLI request failed (private-token, exit 8, API code 1)",
+            "CLI request failed (api, exit 99999999999999999999999999, API code 1\\nprivate-task)",
+        ] {
+            let line = failure_text(error);
+            assert!(!line.contains("private"));
+            assert!(!line.contains("exit_code=8"));
+        }
+        assert_eq!(
+            category("Lark request failed (api, API code 42); check authentication"),
+            "api"
+        );
+        assert_eq!(
+            category("TAPD request failed (unknown); check authentication"),
+            "unknown"
+        );
     }
     #[test]
     fn errors_log_category_without_echoing_sensitive_payloads() {
