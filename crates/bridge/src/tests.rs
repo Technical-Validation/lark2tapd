@@ -1,4 +1,6 @@
 use super::*;
+#[path = "refresh_tests.rs"]
+mod refresh;
 use std::{fs, os::unix::fs::PermissionsExt};
 
 // 假可执行文件验证真正的进程边界，不调用用户安装的 CLI。
@@ -769,10 +771,10 @@ else:
         fs::read_to_string(d.path().join("fake.auth")).unwrap(),
         "verify\n"
     );
-    assert_eq!(
-        fs::read_to_string(d.path().join("fake.details")).unwrap(),
-        "creator\nassignee\nboth\nremoved\n"
-    );
+    let details = fs::read_to_string(d.path().join("fake.details")).unwrap();
+    let mut details: Vec<_> = details.lines().collect();
+    details.sort();
+    assert_eq!(details, ["assignee", "both", "creator", "removed"]);
     assert_eq!(tasks[0].metadata.creator.as_ref().unwrap().name, "原生姓名");
     assert_eq!(tasks[1].metadata.assignees[0].name, "负责人");
     assert_eq!(
@@ -851,7 +853,7 @@ else:
 "#,
     );
     let now = Instant::now();
-    let result = g.fetch_tasks_until(now + Duration::from_millis(700));
+    let result = g.fetch_tasks_until(now + Duration::from_millis(300));
     assert!(result.is_err());
     assert!(now.elapsed() < Duration::from_millis(1200));
 }

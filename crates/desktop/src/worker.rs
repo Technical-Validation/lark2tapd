@@ -43,6 +43,22 @@ impl Mode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshTrigger {
+    Startup,
+    Reopen,
+    Polling,
+}
+impl RefreshTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Reopen => "reopen",
+            Self::Polling => "polling",
+        }
+    }
+}
+
 pub enum Job {
     LoadProjects,
     LoadMembers(String),
@@ -65,6 +81,7 @@ pub enum Job {
     Install(CliTool),
     CancelInstall,
     Refresh,
+    RefreshFrom(RefreshTrigger),
     OpenDraft(String, bool, u64),
     CheckTarget {
         guid: String,
@@ -429,7 +446,7 @@ fn attachment_origin(job: &Job, profile: &str) -> Option<AttachmentOrigin> {
 }
 fn read_key(job: &Job) -> Option<String> {
     Some(match job {
-        Job::Refresh => "tasks".into(),
+        Job::Refresh | Job::RefreshFrom(_) => "tasks".into(),
         Job::LoadProjects => "projects".into(),
         Job::LoadMembers(id) => format!("members:{id}"),
         Job::CheckWorkspace(w) => format!("workspace:{}:{}", w.id, w.name),
@@ -474,7 +491,7 @@ fn read_error_field(key: &str) -> &'static str {
 fn field(job: &Job) -> &'static str {
     match job {
         Job::CheckTarget { .. } | Job::AcceptTarget { .. } => "target",
-        Job::Refresh => "tasks",
+        Job::Refresh | Job::RefreshFrom(_) => "tasks",
         Job::LoadProjects => "projects",
         Job::LoadMembers(_) => "members",
         Job::Check(tool) | Job::TestConnection { tool, .. } => connection_key(*tool),
@@ -549,6 +566,7 @@ fn same_content(a: &Snapshot, b: &Snapshot) -> bool {
     a == b
 }
 struct ReadTask {
+    cancelled: Arc<AtomicBool>,
     key: String,
     generation: u64,
     job: Job,
@@ -563,6 +581,7 @@ struct ReadTask {
 }
 fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
     let ReadTask {
+        cancelled,
         key,
         generation,
         job,
@@ -578,6 +597,29 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
     let attachment_origin = attachment_origin(&job, &origin);
     std::thread::spawn(move || {
         let result = (|| -> Result<(String, ReadData)> {
+            let refresh_id = match &job {
+                Job::Refresh => Some(crate::console::refresh_start("manual")),
+                Job::RefreshFrom(trigger) => Some(crate::console::refresh_start(trigger.as_str())),
+                _ => None,
+            };
+            if let Some(id) = refresh_id
+                && !mode.is_mock()
+            {
+                crate::console::refresh_boundary(id, "credential_load", "started");
+                let credentials = match load_credentials() {
+                    Ok(credentials) => credentials,
+                    Err(error) => {
+                        crate::console::refresh_boundary(id, "credential_load", "failed");
+                        return Err(error);
+                    }
+                };
+                crate::console::refresh_boundary(id, "credential_load", "finished");
+                let cli = CliGateway::new(settings, credentials)?;
+                let (profile, tasks) = cli.fetch_account_tasks(&cancelled, |event| {
+                    crate::console::refresh_progress(id, event)
+                })?;
+                return Ok((profile, ReadData::Tasks(tasks)));
+            }
             // 本地附件同样不能占用状态所有者；返回时重新验证账户代数。
             if matches!(job, Job::LocalFile { .. } | Job::PastedImage { .. }) {
                 let root = media_root(&data_root, &origin)?;
@@ -686,7 +728,7 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
                         target: gateway.get_target(&workspace, &target.id, &target.kind)?,
                     }
                 }
-                Job::Refresh => ReadData::Tasks(gateway.fetch_tasks()?),
+                Job::Refresh | Job::RefreshFrom(_) => ReadData::Tasks(gateway.fetch_tasks()?),
                 Job::LoadProjects => ReadData::Projects(gateway.list_workspaces()?),
                 Job::LoadMembers(id) => {
                     let members = gateway.list_members(&id)?;
@@ -1031,7 +1073,7 @@ fn start_with_backend(
                         Err(mpsc::RecvTimeoutError::Timeout) if scheduled.is_some() => {
                             Envelope::Request(Request {
                                 sequence: 0,
-                                job: Job::Refresh,
+                                job: Job::RefreshFrom(RefreshTrigger::Polling),
                                 profile: namespace.clone(),
                             })
                         }
@@ -1169,7 +1211,7 @@ fn start_with_backend(
                             if let Job::LocalFile{guid,..} | Job::PastedImage{guid,..} = &job {
                                 anyhow::ensure!(engine.snapshot().records.iter().any(|r| &r.source.guid==guid), "Task no longer available");
                             }
-                            if matches!(job, Job::Refresh) {
+                            if matches!(job, Job::Refresh | Job::RefreshFrom(_)) {
                                 opened = true;
                                 next_check = Instant::now() + interval(&settings);
                             }
@@ -1196,8 +1238,8 @@ fn start_with_backend(
                                     active: true,
                                 })
                                 .await?;
-                            if matches!(job,Job::Refresh) {crate::console::event("tasks.lark","fetch_started");}
-                            spawn_read(weak.clone(),ReadTask{key,generation,job,mode,settings:settings.clone(),#[cfg(test)] mock:mock.clone(),backend:backend.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
+                            let cancelled=pending[&key].cancelled.clone();
+                            spawn_read(weak.clone(),ReadTask{cancelled,key,generation,job,mode,settings:settings.clone(),#[cfg(test)] mock:mock.clone(),backend:backend.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
                             return Ok(());
                         }
                         if mode.is_mock()
@@ -1605,7 +1647,9 @@ fn profile_file(mode: Mode, profile: Option<&str>) -> Result<String> {
 fn resets_polling(job: &Job, _settings: &Settings) -> bool {
     matches!(
         job,
-        Job::Refresh | Job::SetPreference(Preference::Polling(_) | Preference::PollMinutes(_))
+        Job::Refresh
+            | Job::RefreshFrom(_)
+            | Job::SetPreference(Preference::Polling(_) | Preference::PollMinutes(_))
     )
 }
 
@@ -1671,6 +1715,22 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn refresh_triggers_share_deduplication_and_polling_rules() {
+        for trigger in [
+            RefreshTrigger::Startup,
+            RefreshTrigger::Reopen,
+            RefreshTrigger::Polling,
+        ] {
+            let job = Job::RefreshFrom(trigger);
+            assert_eq!(read_key(&job).as_deref(), Some("tasks"));
+            assert_eq!(field(&job), "tasks");
+            assert!(resets_polling(&job, &Settings::default()));
+        }
+        assert_eq!(RefreshTrigger::Startup.as_str(), "startup");
+        assert_eq!(RefreshTrigger::Reopen.as_str(), "reopen");
+        assert_eq!(RefreshTrigger::Polling.as_str(), "polling");
+    }
     #[test]
     fn editor_and_appearance_jobs_do_not_postpone_polling() {
         let settings = Settings::default();

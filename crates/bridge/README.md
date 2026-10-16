@@ -1,6 +1,6 @@
 # CLI 与凭据边界
 
-所有 API 同步执行；桌面端必须放到串行工作线程，不能阻塞 GPUI。
+入口 API 同步执行；桌面端必须放到后台线程，不能阻塞 GPUI。状态持久化和业务写入仍串行；任务详情读取在桥接内部最多四路并发。
 
 ## 公共接口
 
@@ -38,13 +38,15 @@
 
 ## 安全与边界
 
-进程直接通过 `Command` 启动，不使用 shell。TAPD 凭据只进环境变量；Lark 原生 OAuth 不注入 App ID / Secret / user token，避免切换到拒绝 `auth` 的外部 provider。保存的 App ID 通过 `LARKSUITE_CLI_PROFILE` 选择匹配原生 profile（无 App ID 则使用 CLI 默认），认证及业务读取使用同一选择，并在访问前验证返回的 App ID。手动 user token 仍拒绝。新 profile 密钥仅进 `profile add` 的 stdin。任务内容按 CLI 契约进入 argv（TAPD 不支持 stdin），因此任务内容可能在本机进程参数中可见，绝不放入日志或错误。运行环境清除后只保留 HOME、必要本地化及证书位置等白名单，PATH 保留 GUI 原始值并补充可执行文件目录和常见 Node 安装目录。
+进程直接通过 `Command` 启动，不使用 shell。TAPD 凭据只进环境变量；Lark 原生 OAuth 不注入 App ID / Secret / user token，避免切换到拒绝 `auth` 的外部 provider。保存的 App ID 通过 `LARKSUITE_CLI_PROFILE` 选择匹配原生 profile（无 App ID 则使用 CLI 默认），认证及业务读取使用同一选择，并在访问前验证返回的 App ID。手动 user token 仍拒绝。新 profile 密钥仅进 `profile add` 的 stdin。任务内容按 CLI 契约进入 argv（TAPD 不支持 stdin），因此任务内容可能在本机进程参数中可见，绝不放入日志或错误。运行环境清除后只保留 HOME、必要本地化及证书位置等白名单，PATH 保留 GUI 原始值并补充可执行文件目录和常见 Node 安装目录。标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 及其小写形式按原值传给 CLI，不记录地址或其中的凭证；其他账户 Token、`NODE_OPTIONS` 等变量仍不继承。
 
 单次普通调用 30 秒；每个输出管道最多缓存 4 MiB。超时、失败、超限都会终止进程组并回收直接子进程；非阻塞管道读写共用截止时间，即使后代 `setsid` 后保留管道也不会无限等待。错误不包含 argv、原始 stdout/stderr 或任意服务端 message/hint。非零退出保留退出码；API 失败仅白名单类别、整数 API code、应用需要的 `task:task:read` 和固定恢复建议进入错误。`auth check` 与授权完成允许解析预期非零 JSON，其他非零退出不会转为成功。诊断类型与 begin/finish 返回的错误可直接交 UI；不要再覆盖为泛化“连接失败”。假 CLI 测试在临时目录运行，不读写用户真实认证或业务数据。
 
 飞书任务刷新每次先调用一次 `auth status --json --verify`，只接受已验证的用户 `openId`。使用 `task +get-related-tasks --as user --format json --page-limit 1`，通过 `--page-token` 手动继续读取 `data.items` / `has_more` / `page_token`。`my_tasks` 会漏掉仅由本人创建的任务，因此不作为候选来源。仅保留创建者 ID 为本人或 `role=assignee` 成员 ID 包含本人的候选；只有关注关系、其他人、缺失身份或仅同名均不算。候选在详情读取前按 GUID 去重；原生 `task tasks get` 返回后再验证关系，已移除的任务不进入结果。
 
-认证、所有分页及原生详情共用 120 秒截止时间，最多 40 页、1000 条候选列表项（包括过滤或重复项）。缺失/重复游标、非法 GUID、任务详情失败或超限均整体失败，不返回半份任务。每次原生详情提供创建者和负责人 ID/姓名；未知姓名保留空字符串，不增加通讯录请求。`SourceMetadata` 保留原生 `created_at` / `completed_at` / `due.timestamp` 毫秒字符串，包括完成时间的 `"0"`。快捷命令会把创建/完成时间变成本地格式日期，绝不把这些字符串保存为原始毫秒。
+`fetch_account_tasks(&AtomicBool, observer) -> Result<(String, Vec<SourceTask>)>` 是桌面刷新的入口：加载应用凭证后，飞书身份、TAPD 身份、所有分页及原生详情共同使用一次 120 秒预算，不再前置一轮账号验证后又重复验证飞书身份。`Gateway::fetch_tasks` 保留仅读取飞书的语义。单个 CLI 调用最多 30 秒，详情每页最多四个并发进程；返回任务顺序保持与列表一致，失败或取消会停止并回收在途详情，不返回部分结果。仍最多 40 页、1000 条候选列表项（包括过滤或重复项）。缺失/重复游标、非法 GUID、任务详情失败或超限均整体失败，不返回半份任务。每次原生详情提供创建者和负责人 ID/姓名；未知姓名保留空字符串，不增加通讯录请求。`SourceMetadata` 保留原生 `created_at` / `completed_at` / `due.timestamp` 毫秒字符串，包括完成时间的 `"0"`。快捷命令会把创建/完成时间变成本地格式日期，绝不把这些字符串保存为原始毫秒。
+
+进度回调 `RefreshEvent` 仅携带阶段、页号、已完成/已安排详情数量、耗时和剩余预算。`RefreshFailure` 区分单请求超时、整轮预算耗尽、取消和其他错误。详情编号是当前页内的序号，不是 GUID；进度不含用户身份、任务内容、分页令牌或代理地址。回调在协调线程串行执行，每十条详情或每页完成时报告一次进度。
 
 用于 TAPD 的 `due` 仍按本机时区转换为 `YYYY-MM-DD`，丢弃时分；原始 `metadata.due_at` 独立保留。不能据此恢复任务作者原始时区。
 

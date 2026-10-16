@@ -659,6 +659,7 @@ pub fn show_window(cx: &mut App) {
     if !cx.has_global::<Shell>() {
         return;
     }
+    let reopened = cx.global::<Shell>().window.is_some();
     if let Some(handle) = cx.global::<Shell>().window
         && handle
             .update(cx, |_, window, cx| {
@@ -669,7 +670,9 @@ pub fn show_window(cx: &mut App) {
     {
         feedback::replay(cx);
         let m = cx.global::<Shell>().model.clone();
-        m.update(cx, |m, cx| m.send(Job::Refresh, cx));
+        m.update(cx, |m, cx| {
+            m.send(Job::RefreshFrom(crate::worker::RefreshTrigger::Reopen), cx)
+        });
         return;
     }
     let model = cx.global::<Shell>().model.clone();
@@ -703,7 +706,16 @@ pub fn show_window(cx: &mut App) {
             feedback::replay(cx);
             cx.activate(true);
             let m = cx.global::<Shell>().model.clone();
-            m.update(cx, |m, cx| m.send(Job::Refresh, cx));
+            m.update(cx, |m, cx| {
+                m.send(
+                    Job::RefreshFrom(if reopened {
+                        crate::worker::RefreshTrigger::Reopen
+                    } else {
+                        crate::worker::RefreshTrigger::Startup
+                    }),
+                    cx,
+                )
+            });
         }
         Err(error) => {
             eprintln!("Unable to open application window: {error}");

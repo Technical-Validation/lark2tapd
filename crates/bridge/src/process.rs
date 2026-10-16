@@ -14,6 +14,59 @@ use std::{
 
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) struct CallTimeout;
+impl std::fmt::Display for CallTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CLI timed out; remote result may be uncertain")
+    }
+}
+impl std::error::Error for CallTimeout {}
+#[derive(Debug)]
+pub(crate) struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CLI operation cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
+
+const PROXY_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+fn forwarded_environment(
+    mut get: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "XDG_CONFIG_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ]
+    .into_iter()
+    .chain(PROXY_ENV.iter().copied())
+    .filter_map(|key| get(key).map(|value| (key, value)))
+    .collect()
+}
+/// 仅报告有无代理配置，绝不返回可能带密码的地址。
+pub fn proxy_environment_present() -> bool {
+    PROXY_ENV
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
 // 管道必须非阻塞；逃离进程组的后代即使保留句柄，也不能让 join 永久等待。
 fn nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
     let fd = pipe.as_raw_fd();
@@ -110,7 +163,9 @@ pub(crate) fn run_output_cancellable(
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<ProcessOutput> {
-    anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "CLI operation cancelled");
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(Cancelled.into());
+    }
     let deadline = Instant::now() + timeout;
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<_> = std::env::split_paths(&inherited).collect();
@@ -123,21 +178,8 @@ pub(crate) fn run_output_cancellable(
     let mut cmd = Command::new(path);
     // GUI 启动保留必要运行环境，但不继承其他账户令牌或 NODE_OPTIONS 等注入入口。
     cmd.env_clear();
-    for key in [
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "TMPDIR",
-        "LANG",
-        "LC_ALL",
-        "XDG_CONFIG_HOME",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-    ] {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
+    // 保留用户已有的标准网络代理，不继承其他服务令牌或代码注入变量。
+    cmd.envs(forwarded_environment(|key| std::env::var_os(key)));
     cmd.args(args)
         .env("PATH", path_env)
         .envs(env.iter().cloned())
@@ -188,15 +230,13 @@ pub(crate) fn run_output_cancellable(
     });
     let result = loop {
         if cancelled.load(Ordering::SeqCst) {
-            break Err(anyhow::anyhow!("CLI operation cancelled"));
+            break Err(anyhow::Error::new(Cancelled));
         }
         if overflow.load(Ordering::Relaxed) {
             break Err(anyhow::anyhow!("CLI output exceeded safety limit"));
         }
         if Instant::now() >= deadline {
-            break Err(anyhow::anyhow!(
-                "CLI timed out; remote result may be uncertain"
-            ));
+            break Err(anyhow::Error::new(CallTimeout));
         }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -243,6 +283,27 @@ mod tests {
         fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
         (dir, p)
+    }
+    #[test]
+    fn proxy_environment_is_forwarded_without_inheriting_unrelated_credentials() {
+        let forwarded = forwarded_environment(|key| match key {
+            "HTTPS_PROXY" => Some("http://proxy-user:proxy-secret@127.0.0.1:7890".into()),
+            "https_proxy" => Some("http://127.0.0.1:7891".into()),
+            "NO_PROXY" => Some("localhost,127.0.0.1".into()),
+            "LARKSUITE_CLI_USER_ACCESS_TOKEN" | "TAPD_TOKEN" | "NODE_OPTIONS" => {
+                Some("must-not-inherit".into())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            forwarded.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["HTTPS_PROXY", "NO_PROXY", "https_proxy"]
+        );
+        assert_eq!(
+            forwarded[0].1,
+            "http://proxy-user:proxy-secret@127.0.0.1:7890"
+        );
+        assert!(!forwarded.iter().any(|(_, v)| v == "must-not-inherit"));
     }
     #[test]
     fn cancellation_stops_exchange_before_token_write() {

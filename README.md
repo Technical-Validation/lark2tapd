@@ -89,6 +89,14 @@ open dist/Lark2Tapd.app
 
 每轮任务完整读取且成功更新缓存后，打印一行 `read / unfinished / added / changed / unimported / attention / unsynced` 数量。新增和变化对比上一份缓存；只统计当前范围内任务。`unsynced` 包含未导入、待更新、待核对和附件/正文未完成的任务，不把这些状态当成全部已同步。
 
+刷新额外输出 `[tasks.refresh]` 分阶段日志，每轮有独立 `id` 和触发来源 `startup / reopen / manual / polling`。阶段包括 `credential_load`、`lark_identity`、`tapd_identity`、`lark_list_page`、`lark_task_details`；提供页号、详情进度、耗时和剩余预算，不输出任务 GUID 或分页令牌。`completed / scheduled` 是本轮已完成与截至当前页已安排的详情请求数，不等同于最终保留的任务数。
+
+- `event=request_timeout`：某个 CLI 调用超过单次时间限制，优先检查该阶段的网络、代理或 CLI。
+- `event=refresh_budget_timeout`：整轮 120 秒预算耗尽，可以看到当时已经完成多少详情。
+- `event=cancelled`：配置或账号切换等操作取消了旧读取。
+
+详情读取最多四路并发，分页仍顺序读取；任一详情失败都会保留旧缓存，不会把半份列表写入数据库。标准代理环境变量及大小写形式会原样传给 CLI，但不记录值。`proxy_env_set` 仅表明进程环境里存在代理相关变量，不证明请求实际经过代理；Finder 启动不一定继承终端环境，应用不替你设置代理。
+
 `app.lifecycle` 记录启动、退出请求、退出通知和事件循环返回；`ui.window` 记录窗口关闭。Rust panic 记录代码位置但不输出可能含敏感数据的 payload；需要堆栈时可用 `RUST_BACKTRACE=1`。
 
 `IMKCFRunLoopWakeUpReliable` 来自 macOS 输入法通信层，单独这一行不能证明应用崩溃。其他 GUI 及[原生 AppKit 最小复现](https://github.com/Richy-Z/BUG-IMKCFRunLoopWakeUpReliable)也有同名报告；[Electron 维护者的结论](https://github.com/electron/electron/issues/45002)只适用于其场景，不能直接当作本应用已修复。不要通过禁用输入法或关闭系统日志掩盖它。若伴随输入异常或意外退出，请记录复现操作及退出码：

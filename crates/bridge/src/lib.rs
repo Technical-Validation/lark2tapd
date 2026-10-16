@@ -6,6 +6,7 @@ mod diagnostics;
 pub mod installer;
 mod media;
 mod process;
+mod refresh;
 use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Local, TimeZone, Utc};
 pub use credentials::{
@@ -18,10 +19,13 @@ use lark2tapd_core::{
     TargetTask,
 };
 pub use media::{MAX_INLINE_IMAGE_BYTES, validate_attachment_for_upload};
+pub use process::proxy_environment_present;
+pub use refresh::{RefreshEvent, RefreshFailure, RefreshOutcome, RefreshPhase};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     path::Path,
+    sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
 
@@ -94,12 +98,13 @@ impl CliGateway {
             .map(|(k, v)| (k.into(), v.into()))
             .collect()
     }
-    fn invoke(
+    fn invoke_cancellable(
         &self,
         lark: bool,
         args: Vec<String>,
         input: Value,
         timeout: Duration,
+        cancelled: &AtomicBool,
     ) -> Result<Value> {
         self.validate_provider(lark)?;
         let path = if lark {
@@ -113,12 +118,28 @@ impl CliGateway {
             serde_json::to_vec(&input).map_err(|_| anyhow::anyhow!("Invalid CLI request"))?
         };
         let env = zeroize::Zeroizing::new(self.env(lark));
-        let output =
-            zeroize::Zeroizing::new(process::run(Path::new(path), &args, &env, &bytes, timeout)?);
-        serde_json::from_slice(&output).map_err(|_| anyhow::anyhow!("CLI returned invalid JSON"))
+        let output = process::run_output_cancellable(
+            Path::new(path),
+            &args,
+            &env,
+            &bytes,
+            timeout,
+            cancelled,
+        )?;
+        if !output.status.success() {
+            return Err(output.failure());
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|_| anyhow::anyhow!("CLI returned invalid JSON"))
     }
-    fn lark_until(&self, verb: &str, params: Value, deadline: Instant) -> Result<Value> {
-        let v = self.invoke(
+    fn lark_until(
+        &self,
+        verb: &str,
+        params: Value,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
+        let v = self.invoke_cancellable(
             true,
             [
                 "task", "tasks", verb, "--as", "user", "--format", "json", "--params", "-",
@@ -127,6 +148,7 @@ impl CliGateway {
             .to_vec(),
             params,
             remaining(deadline)?,
+            cancelled,
         )?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(diagnostics::api_failure("Lark", &v, None));
@@ -136,6 +158,22 @@ impl CliGateway {
             .ok_or_else(|| anyhow::anyhow!("Lark response missing data"))
     }
     fn tapd(&self, kind: &str, verb: &str, params: Vec<String>) -> Result<Value> {
+        self.tapd_until(
+            kind,
+            verb,
+            params,
+            Instant::now() + Duration::from_secs(30),
+            &AtomicBool::new(false),
+        )
+    }
+    fn tapd_until(
+        &self,
+        kind: &str,
+        verb: &str,
+        params: Vec<String>,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
         // 不允许回退到 CLI 外部配置中的未知 TAPD 账户。
         ensure!(
             !self.credentials.tapd_token.is_empty(),
@@ -149,7 +187,8 @@ impl CliGateway {
         );
         let mut args = vec![kind.into(), verb.into()];
         args.extend(params);
-        let v = self.invoke(false, args, Value::Null, Duration::from_secs(30))?;
+        let v =
+            self.invoke_cancellable(false, args, Value::Null, remaining(deadline)?, cancelled)?;
         if v.get("status").and_then(Value::as_i64) != Some(1) {
             return Err(diagnostics::api_failure("TAPD", &v, None));
         }
@@ -238,18 +277,26 @@ impl CliGateway {
         self.lark_identity_until(Instant::now() + Duration::from_secs(30))
     }
     fn lark_identity_until(&self, deadline: Instant) -> Result<Value> {
+        self.lark_identity_until_cancellable(deadline, &AtomicBool::new(false))
+    }
+    fn lark_identity_until_cancellable(
+        &self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
         // whoami 只诊断本地保存身份，不能证明注入令牌的主体；未知主体必须拒绝。
         ensure!(
             self.credentials.lark_user_token.is_empty(),
             "Cannot verify manual Lark user token identity; clear saved credentials and use CLI OAuth login"
         );
-        let status = self.invoke(
+        let status = self.invoke_cancellable(
             true,
             ["auth", "status", "--json", "--verify"]
                 .map(String::from)
                 .to_vec(),
             Value::Null,
             remaining(deadline)?,
+            cancelled,
         )?;
         self.validate_lark_profile(&status)?;
         Ok(status)
@@ -288,13 +335,22 @@ impl CliGateway {
             "Configure a TAPD token in the app"
         );
         let status = self.lark_identity()?;
+        let (brand, app, user) = self.account_identity(&status)?;
+        Ok(account_namespace_key(
+            &brand,
+            &app,
+            &user,
+            &self.tapd_user_id()?,
+        ))
+    }
+    fn account_identity(&self, status: &Value) -> Result<(String, String, String)> {
         ensure!(
             status.get("verified").and_then(Value::as_bool) == Some(true)
                 && status.get("identity").and_then(Value::as_str) == Some("user"),
             "Cannot verify Lark account identity; synchronization is locked"
         );
-        let app = required(&status, "appId")?;
-        let brand = required(&status, "brand")?;
+        let app = required(status, "appId")?;
+        let brand = required(status, "brand")?;
         ensure!(
             matches!(brand.as_str(), "feishu" | "lark"),
             "Unknown Lark provider brand"
@@ -308,16 +364,7 @@ impl CliGateway {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Cannot verify Lark user identity"))?;
-        let tapd_user = self.tapd_user_id()?;
-        Ok(credentials::namespace_parts(&[
-            "verified-account-v2",
-            "lark",
-            &brand,
-            &app,
-            user,
-            "https://api.tapd.cn",
-            &tapd_user,
-        ]))
+        Ok((brand, app, user.to_owned()))
     }
     fn write_target(
         &self,
@@ -369,11 +416,20 @@ impl CliGateway {
 }
 impl CliGateway {
     fn source_until(&self, guid: &str, deadline: Instant) -> Result<SourceTask> {
+        self.source_until_cancellable(guid, deadline, &AtomicBool::new(false))
+    }
+    fn source_until_cancellable(
+        &self,
+        guid: &str,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<SourceTask> {
         valid_source_id(guid)?;
         let full = self.lark_until(
             "get",
             json!({"task_guid":guid,"user_id_type":"open_id"}),
             deadline,
+            cancelled,
         )?;
         let task = full
             .get("task")
@@ -405,6 +461,14 @@ impl CliGateway {
         })
     }
     fn related_until(&self, page: &str, deadline: Instant) -> Result<Value> {
+        self.related_until_cancellable(page, deadline, &AtomicBool::new(false))
+    }
+    fn related_until_cancellable(
+        &self,
+        page: &str,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
         let mut args: Vec<String> = [
             "task",
             "+get-related-tasks",
@@ -420,7 +484,8 @@ impl CliGateway {
         if !page.is_empty() {
             args.extend(["--page-token".into(), page.into()]);
         }
-        let response = self.invoke(true, args, Value::Null, remaining(deadline)?)?;
+        let response =
+            self.invoke_cancellable(true, args, Value::Null, remaining(deadline)?, cancelled)?;
         if response.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(diagnostics::api_failure("Lark", &response, None));
         }
@@ -441,49 +506,8 @@ impl CliGateway {
         Ok(data.clone())
     }
     fn fetch_tasks_until(&self, deadline: Instant) -> Result<Vec<SourceTask>> {
-        // 每次刷新只验证一次 OAuth 主体；所有分页和详情共享同一个截止时间。
-        let user = self.verified_self_until(deadline)?;
-        let mut tasks = Vec::new();
-        let mut page = String::new();
-        let mut pages = HashSet::new();
-        let mut ids = HashSet::new();
-        let mut count = 0;
-        for page_index in 0..40 {
-            let data = self.related_until(&page, deadline)?;
-            let items = data["items"]
-                .as_array()
-                .expect("validated related task list");
-            count += items.len();
-            ensure!(
-                count <= 1000,
-                "Lark refresh exceeds 1000 tasks; no partial results accepted"
-            );
-            for item in items {
-                let guid = required(item, "guid")?;
-                valid_source_id(&guid)?;
-                // 快捷命令的日期已格式化，这里只看身份；原生详情才是元数据来源。
-                let (creator, assignees) = source_people(item);
-                let related = creator.as_ref().is_some_and(|p| p.id == user)
-                    || assignees.iter().any(|p| p.id == user);
-                if !related || !ids.insert(guid.clone()) {
-                    continue;
-                }
-                let task = self.source_until(&guid, deadline)?;
-                // 从列表到详情之间关系可能已移除，不能把旧列表关系当作授权。
-                if task.is_related_to(&user) {
-                    tasks.push(task);
-                }
-            }
-            if data["has_more"] == false {
-                return Ok(tasks);
-            }
-            page = required(&data, "page_token")?;
-            ensure!(
-                pages.insert(page.clone()) && page_index < 39,
-                "Lark pagination did not finish within 40 pages; no partial results accepted"
-            );
-        }
-        unreachable!("last page rejects continuation")
+        refresh::read(self, deadline, &AtomicBool::new(false), false, &mut |_| {})
+            .map(|(_, tasks)| tasks)
     }
 }
 impl Gateway for CliGateway {
@@ -557,15 +581,24 @@ impl Gateway for CliGateway {
         self.write_target(Some(old), draft, source)
     }
 }
+fn account_namespace_key(brand: &str, app: &str, user: &str, tapd_user: &str) -> String {
+    credentials::namespace_parts(&[
+        "verified-account-v2",
+        "lark",
+        brand,
+        app,
+        user,
+        "https://api.tapd.cn",
+        tapd_user,
+    ])
+}
 // 普通调用最多 30 秒，整个刷新（含认证）最多 120 秒。
 fn remaining(deadline: Instant) -> Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|d| !d.is_zero())
         .map(|d| d.min(Duration::from_secs(30)))
-        .ok_or_else(|| {
-            anyhow::anyhow!("Lark refresh deadline exceeded; no partial results accepted")
-        })
+        .ok_or_else(|| anyhow::Error::new(refresh::BudgetExceeded))
 }
 fn source_people(task: &Value) -> (Option<SourcePerson>, Vec<SourcePerson>) {
     let person = |v: &Value| {

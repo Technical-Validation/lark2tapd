@@ -13,9 +13,15 @@ pub fn category(message: &str) -> &'static str {
         "storage"
     } else if ["cancel", "取消"].iter().any(|v| text.contains(v)) {
         "cancelled"
-    } else if ["timeout", "timed out", "expired", "过期"]
-        .iter()
-        .any(|v| text.contains(v))
+    } else if [
+        "timeout",
+        "timed out",
+        "deadline exceeded",
+        "expired",
+        "过期",
+    ]
+    .iter()
+    .any(|v| text.contains(v))
     {
         "timeout"
     } else if ["permission", "scope", "consent", "权限"]
@@ -166,6 +172,54 @@ fn counts(before: &Snapshot, after: &Snapshot) -> Counts {
     }
     counts
 }
+static REFRESH_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub fn refresh_start(trigger: &'static str) -> u64 {
+    let id = REFRESH_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    output(
+        "INFO",
+        "tasks.refresh",
+        &format!(
+            "fetch_started id={id} trigger={trigger} proxy_env_set={}",
+            lark2tapd_bridge::proxy_environment_present()
+        ),
+    );
+    id
+}
+pub fn refresh_boundary(id: u64, phase: &'static str, event: &'static str) {
+    output(
+        "INFO",
+        "tasks.refresh",
+        &format!("id={id} phase={phase} event={event}"),
+    );
+}
+fn refresh_text(id: u64, event: lark2tapd_bridge::RefreshEvent) -> String {
+    use lark2tapd_bridge::RefreshOutcome;
+    let outcome = match event.outcome {
+        RefreshOutcome::Started => "started",
+        RefreshOutcome::Progress => "progress",
+        RefreshOutcome::Finished => "finished",
+        RefreshOutcome::Failed(kind) => kind.as_str(),
+    };
+    format!(
+        "id={id} phase={} event={outcome} page={} completed={} scheduled={} detail={} elapsed_ms={} remaining_ms={}",
+        event.phase.as_str(),
+        event.page,
+        event.completed,
+        event.scheduled,
+        event.detail_index.unwrap_or(0),
+        event.elapsed_ms,
+        event.remaining_ms
+    )
+}
+pub fn refresh_progress(id: u64, event: lark2tapd_bridge::RefreshEvent) {
+    let level = if matches!(event.outcome, lark2tapd_bridge::RefreshOutcome::Failed(_)) {
+        "ERROR"
+    } else {
+        "INFO"
+    };
+    output(level, "tasks.refresh", &refresh_text(id, event));
+}
+
 pub fn tasks(before: &Snapshot, after: &Snapshot) {
     let c = counts(before, after);
     output(
@@ -266,6 +320,26 @@ mod tests {
                 unsynced: 2
             }
         );
+    }
+    #[test]
+    fn refresh_trace_identifies_provider_phase_and_timeout_kind() {
+        use lark2tapd_bridge::{RefreshEvent, RefreshFailure, RefreshOutcome, RefreshPhase};
+        let text = refresh_text(
+            7,
+            RefreshEvent {
+                phase: RefreshPhase::TapdIdentity,
+                outcome: RefreshOutcome::Failed(RefreshFailure::RequestTimeout),
+                page: 0,
+                completed: 0,
+                scheduled: 0,
+                detail_index: None,
+                elapsed_ms: 31000,
+                remaining_ms: 89000,
+            },
+        );
+        assert!(text.contains("id=7 phase=tapd_identity event=request_timeout"));
+        assert!(text.contains("elapsed_ms=31000 remaining_ms=89000"));
+        assert_eq!(category("Lark refresh deadline exceeded"), "timeout");
     }
     #[test]
     fn errors_log_category_without_echoing_sensitive_payloads() {
