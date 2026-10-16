@@ -1,5 +1,6 @@
 mod appearance;
 use appearance::apply_theme;
+mod connection_results;
 mod connections;
 use connections::{CredentialChange, ServiceConnection};
 mod editor;
@@ -12,6 +13,7 @@ use editor::DeferredMedia;
 use zorite_editor::EditorState;
 mod selectors;
 mod settings;
+mod settings_navigation;
 use gpui_kit::component::{
     calendar::Date,
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
@@ -119,9 +121,10 @@ impl Model {
             ) => Some("prefixes"),
             Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
             Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
-            Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) | Job::Check(tool) => {
-                Some(connections::field_key(*tool))
-            }
+            Job::SaveAndConnect { tool, .. }
+            | Job::ClearCredentials(tool)
+            | Job::Check(tool)
+            | Job::TestConnection { tool, .. } => Some(connections::field_key(*tool)),
             Job::LoadConnectionStatus => Some("connection-status"),
             Job::ProbeCli(tool) => Some(connections::cli_key(*tool)),
             Job::LocalFile { .. } | Job::PastedImage { .. } => Some("attachments"),
@@ -132,15 +135,13 @@ impl Model {
         }
         if let Job::ProbeCli(tool) = &job {
             let state = self.connection_mut(*tool);
-            state.cli_version = None;
             state.cli_error = None;
-            state.verified = false;
-            state.report = None;
-            self.errors.remove(connections::field_key(*tool));
         }
-        if let Job::Check(tool) = &job {
-            self.connection_mut(*tool).report = None;
-            self.connection_mut(*tool).verified = false;
+        if let Job::Check(tool) | Job::TestConnection { tool, .. } = &job {
+            if self.activities.contains(connections::field_key(*tool)) {
+                return;
+            }
+            self.activities.insert(connections::field_key(*tool).into());
         }
         // 提交即锁定该服务，避免后台 Activity 到达前的重复保存/清除。
         if let Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) = &job {
@@ -150,8 +151,7 @@ impl Model {
                 return;
             }
             self.activities.insert(connections::field_key(*tool).into());
-            self.connection_mut(*tool).verified = false;
-            self.connection_mut(*tool).report = None;
+            self.connection_mut(*tool).invalidate_result();
             if *tool == CliTool::Lark {
                 self.lark_authorization = None;
             }
@@ -206,10 +206,13 @@ impl Model {
                 state.cli_error = error;
                 if state.cli_version.is_none() {
                     state.verified = false;
-                    state.report = None;
                 }
             }
-            Event::ConnectionReport { tool, report } => {
+            Event::ConnectionReport {
+                tool,
+                report,
+                saved_configuration,
+            } => {
                 if let Some(error) = &report.failure {
                     self.errors
                         .insert(connections::field_key(tool), error.clone());
@@ -217,8 +220,13 @@ impl Model {
                     self.errors.remove(connections::field_key(tool));
                 }
                 let state = self.connection_mut(tool);
-                state.verified = report.connected;
+                if saved_configuration {
+                    state.verified = report.connected;
+                }
                 state.report = Some(report);
+                state.tested_at = Some(chrono::Utc::now().to_rfc3339());
+                state.tested_saved_configuration = saved_configuration;
+                cx.defer(move |cx| connection_results::show(tool, cx));
             }
             Event::AuthorizationRequired {
                 verification_url,
@@ -237,7 +245,7 @@ impl Model {
             }
             Event::CredentialsSaved(tool) => {
                 self.connection_mut(tool).saved = true;
-                self.connection_mut(tool).verified = false;
+                self.connection_mut(tool).invalidate_result();
                 cx.emit(CredentialChange {
                     tool,
                     cleared: false,
@@ -246,8 +254,7 @@ impl Model {
             Event::CredentialsCleared(tool) => {
                 let state = self.connection_mut(tool);
                 state.saved = false;
-                state.verified = false;
-                state.report = None;
+                state.invalidate_result();
                 if tool == CliTool::Lark {
                     self.lark_authorization = None;
                 }
@@ -313,8 +320,7 @@ impl Model {
                         let state = self.connection_mut(tool);
                         state.cli_version = None;
                         state.cli_error = None;
-                        state.verified = false;
-                        state.report = None;
+                        state.invalidate_result();
                         let model = cx.entity();
                         cx.defer(move |cx| {
                             model.update(cx, |m, cx| m.send(Job::ProbeCli(tool), cx))
@@ -351,6 +357,12 @@ impl Model {
                     self.busy = false;
                 }
                 self.errors.insert(field, message);
+                for tool in [CliTool::Lark, CliTool::Tapd] {
+                    if field == connections::field_key(tool) {
+                        self.activities.remove(field);
+                        cx.defer(move |cx| connection_results::show(tool, cx));
+                    }
+                }
             }
             Event::WorkspaceChecked(workspace) => {
                 self.checked_workspace = Some(workspace);
@@ -504,6 +516,7 @@ fn configure_actions(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("escape", CloseWindow, Some("ConnectionResult")),
         KeyBinding::new("escape", CancelConfirmation, Some("Settings")),
         KeyBinding::new("cmd-r", Refresh, None),
         KeyBinding::new("cmd-1", OpenPending, None),
@@ -709,6 +722,9 @@ pub struct Workspace {
     is_settings: bool,
     settings_loaded: bool,
     settings_scroll: ScrollHandle,
+    connection_bounds: [std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>; 2],
+    cli_focus: [FocusHandle; 2],
+    settings_target: Option<CliTool>,
     settings_directory_loaded: bool,
     selected: Option<String>,
     edit_source: Option<SourceTask>,
@@ -926,6 +942,12 @@ impl Workspace {
             if this.is_settings && !this.settings_loaded && settings.is_some() {
                 this.load_settings(window, cx);
             }
+            if this.is_settings
+                && this.settings_loaded
+                && let Some(tool) = this.settings_target
+            {
+                this.navigate_connection(tool, window, cx);
+            }
             if this.is_settings {
                 if !this.model.read(cx).tapd_configured() {
                     this.settings_directory_loaded = false;
@@ -1012,6 +1034,11 @@ impl Workspace {
             is_settings: false,
             settings_loaded: false,
             settings_scroll: ScrollHandle::new(),
+            connection_bounds: std::array::from_fn(|_| {
+                std::rc::Rc::new(std::cell::Cell::new(None))
+            }),
+            cli_focus: std::array::from_fn(|_| cx.focus_handle()),
+            settings_target: None,
             settings_directory_loaded: false,
             selected: None,
             edit_source: None,
@@ -1336,6 +1363,7 @@ impl Render for Workspace {
                                     .on_click(|_, _, cx| show_settings(cx)),
                             ),
                     )
+                    .child(settings_navigation::hint(&self.model, cx))
                     .child(
                         div()
                             .flex_1()

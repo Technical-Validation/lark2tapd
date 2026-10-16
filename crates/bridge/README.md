@@ -9,6 +9,8 @@
 - `save_credentials(CliTool, &Credentials) -> Result<()>`：只合并所选服务的非空输入，忽略另一服务的输入，空值保留旧值；一次原子写入同一个 Keychain 项。飞书 App ID / Secret 修改须成对提交，更换 App ID 或已有孤立密钥时须先明确清除，避免混合账户。保存成功后重新加载完整凭据，不能直接用稀疏输入建立连接。调用方应在保存成功后立即作废旧账户代数，不等到后续授权成功才切换。
 - `clear_credentials(CliTool) -> Result<()>`：读取、清零所选服务字段，再原子保存；保留另一服务，不登出外部 CLI。调用方必须先取得用户确认。
 - `credential_presence(&Credentials) -> (bool, bool)`：返回飞书、TAPD 是否存在已保存字段；只是非敏感存在性摘要，不代表凭据完整或连接已验证。
+- `test_credentials(&Credentials, CliTool, &Credentials) -> Result<Credentials>`：仅在内存合并当次测试输入，不保存。TAPD 可测试未保存 Token；飞书 App ID／Secret 与已保存值不同则明确要求先保存授权，防止测试旧原生 profile 却声称新输入有效。
+- `verification_binding(CliTool, &Settings, &Credentials) -> String`：单服务配置指纹，用于历史验证时间失效判断；包含该服务凭证、CLI 路径和相关目标配置，不包含凭证原文，不等同于已验证账户或授权。桌面端只在完成结果仍匹配当前保存配置时记录成功时间。
 - `credentials_namespace(&Credentials) -> String`：带长度分隔的 SHA-256 凭据指纹；包含全部字段，但不再参与账户数据库命名空间。不能把它当作已验证的账户标识。
 - `CliGateway::new(Settings, Credentials) -> Result<CliGateway>`：构造不联网；每次调用只校验该平台的绝对 CLI 路径及凭据。TAPD 调用另校验 endpoint 仅为 `https://api.tapd.cn`，因此可独立诊断其中一个平台而不依赖另一个平台已配置。
 - `check_lark()` / `check_tapd() -> Result<()>`：只读连接检查；飞书先验证 OAuth 用户身份，再读取一页相关任务验证任务权限，不访问 TAPD 可执行文件。TAPD 先执行 `user info`；仅当 workspace 非空时执行 `story list`，因此首次认证不要求已选项目。此检查不证明写权限。

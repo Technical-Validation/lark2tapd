@@ -176,8 +176,16 @@ impl SyncRecord {
         }
     }
 }
+/// 历史验证记录，不是当前授权；binding 仅用于配置变更后失效。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationReceipt {
+    pub at: String,
+    pub binding: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
+    #[serde(default)]
+    pub connection_verifications: BTreeMap<String, VerificationReceipt>,
     #[serde(default)]
     pub workspace_prefixes: BTreeMap<String, Vec<String>>,
     pub language: String,
@@ -196,6 +204,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            connection_verifications: BTreeMap::new(),
             workspace_prefixes: BTreeMap::new(),
             language: "zh-CN".into(),
             theme: "system".into(),

@@ -2,6 +2,107 @@
 use super::*;
 
 #[gpui_kit::test]
+fn repeating_cli_probe_preserves_previous_connection_report(cx: &mut TestAppContext) {
+    let (_dir, _events, model, _, _) = setup(cx);
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::ConnectionReport {
+                saved_configuration: true,
+                tool: CliTool::Tapd,
+                report: ConnectionReport {
+                    connected: true,
+                    ..Default::default()
+                },
+            },
+            cx,
+        );
+        m.send(Job::ProbeCli(CliTool::Tapd), cx);
+        assert!(
+            m.tapd_connection
+                .report
+                .as_ref()
+                .is_some_and(|r| r.connected),
+            "local probe must not erase the account test report"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn tests_open_a_separate_window_next_to_save(cx: &mut TestAppContext) {
+    let (_dir, _events, _model, main, _) = setup(cx);
+    let (settings, _) = open_settings_for_test(cx, main);
+    click(cx, settings, "connect-tapd");
+    cx.update_window(settings, |_, w, cx| {
+        w.render_frame(cx);
+        let save = w.find("save-tapd-connection").bounds();
+        let test = w.find("check-tapd").bounds();
+        assert!((save.center().y - test.center().y).abs() < px(2.));
+    })
+    .unwrap();
+    let count = cx.windows().len();
+    click(cx, settings, "check-tapd");
+    assert_eq!(cx.windows().len(), count + 1);
+    let result = cx.read(|cx| connection_results::handle(CliTool::Tapd, cx).unwrap());
+    cx.update_window(result, |_, w, cx| w.press("cmd-w", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(cx.windows().contains(&settings));
+    assert!(cx.windows().contains(&main));
+    assert!(!cx.windows().contains(&result));
+}
+
+#[gpui_kit::test]
+fn setup_links_reuse_settings_and_reveal_the_correct_section(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (settings, view) = open_settings_for_test(cx, main);
+    cx.simulate_window_resize(settings, size(px(760.), px(720.)));
+    model.update(cx, |m, cx| {
+        m.connections_loaded = true;
+        m.tapd_connection.verified = false;
+        m.tapd_connection.saved = false;
+        cx.notify();
+    });
+    click(cx, main, "setup-tapd");
+    for _ in 0..3 {
+        cx.update_window(settings, |_, w, cx| {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(settings, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(view.read(cx).tapd_form_open);
+        assert!(w.find("tapd-token").visible());
+    })
+    .unwrap();
+    model.update(cx, |m, cx| {
+        m.lark_connection.cli_version = None;
+        cx.notify();
+    });
+    click(cx, main, "setup-lark");
+    for _ in 0..3 {
+        cx.update_window(settings, |_, w, cx| {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(settings, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.find("probe-lark-cli").visible());
+        assert!(w.try_find("lark-app-id").is_none());
+    })
+    .unwrap();
+    assert_eq!(
+        cx.read(|cx| cx.global::<Shell>().settings_window.unwrap()),
+        settings
+    );
+}
+
+#[gpui_kit::test]
 fn cli_must_be_verified_before_configuration(cx: &mut TestAppContext) {
     let (_dir, _events, model, main, _) = setup(cx);
     let (settings, _) = open_settings_for_test(cx, main);
@@ -24,12 +125,13 @@ fn cli_must_be_verified_before_configuration(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn permission_summary_precedes_test_and_failure_is_below_it(cx: &mut TestAppContext) {
+fn results_window_contains_the_report_and_settings_stay_compact(cx: &mut TestAppContext) {
     let (_dir, _events, model, main, _) = setup(cx);
     let (settings, _) = open_settings_for_test(cx, main);
     model.update(cx, |m, cx| {
         m.receive(
             Event::ConnectionReport {
+                saved_configuration: true,
                 tool: CliTool::Lark,
                 report: ConnectionReport {
                     connected: false,
@@ -49,18 +151,26 @@ fn permission_summary_precedes_test_and_failure_is_below_it(cx: &mut TestAppCont
         )
     });
     cx.run_until_parked();
-    let button = cx
-        .update_window(settings, |_, w, cx| {
-            w.render_frame(cx);
-            w.find("check-lark").bounds()
-        })
+    let result = cx.read(|cx| connection_results::handle(CliTool::Lark, cx).unwrap());
+    cx.update_window(result, |_, w, cx| w.render_frame(cx))
         .unwrap();
-    let mut visual = VisualTestContext::from_window(settings, cx);
-    let summary = visual.debug_bounds("lark-permission-summary").unwrap();
-    let error = visual.debug_bounds("lark-operation-error").unwrap();
-    assert!(summary.bottom() <= button.top());
-    assert!(error.top() >= button.bottom());
-    assert!(error.size.height > px(0.));
+    assert!(
+        VisualTestContext::from_window(result, cx)
+            .debug_bounds("lark-permission-summary")
+            .is_some()
+    );
+    cx.update_window(settings, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    assert!(
+        VisualTestContext::from_window(settings, cx)
+            .debug_bounds("lark-permission-summary")
+            .is_none()
+    );
+    cx.update(|cx| connection_results::show(CliTool::Lark, cx));
+    assert_eq!(
+        cx.read(|cx| connection_results::handle(CliTool::Lark, cx).unwrap()),
+        result
+    );
     cx.read(|cx| assert!(model.read(cx).errors["lark-connection"].contains("99991672")));
 }
 
@@ -186,6 +296,7 @@ fn saved_connections_are_distinct_from_verification_and_clear_independently(
         );
         m.receive(
             Event::ConnectionReport {
+                saved_configuration: true,
                 tool: CliTool::Tapd,
                 report: ConnectionReport {
                     connected: true,

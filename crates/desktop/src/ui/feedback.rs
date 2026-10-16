@@ -10,6 +10,19 @@ pub(super) fn present(feedback: Feedback, cx: &mut App) {
         return;
     };
     let model = shell.model.downgrade();
+    let language = shell.model.read(cx).language().to_owned();
+    let setup = if feedback.error {
+        let message = feedback.message.to_lowercase();
+        if message.contains("tapd") {
+            Some(CliTool::Tapd)
+        } else if message.contains("lark") || message.contains("飞书") {
+            Some(CliTool::Lark)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let handles = [shell.window, shell.settings_window];
     // 优先活动窗口，其次主窗口。应用不在前台时仍将提示留在已有窗口里。
     let live: Vec<_> = handles
@@ -44,6 +57,21 @@ pub(super) fn present(feedback: Feedback, cx: &mut App) {
             Notification::success(feedback.message).id1::<Feedback>("success")
         };
         // 留出顶栏齿轮与刷新入口，不让操作提示挡住全局导航。
+        let note = if let Some(tool) = setup {
+            note.action(move |_, _, cx| {
+                Button::new("configure-error-service")
+                    .ghost()
+                    .text_color(cx.theme().primary)
+                    .label(if tool == CliTool::Lark {
+                        text(&language, "配置飞书", "Configure Lark")
+                    } else {
+                        text(&language, "配置 TAPD", "Configure TAPD")
+                    })
+                    .on_click(move |_, _, cx| settings_navigation::open(tool, cx))
+            })
+        } else {
+            note
+        };
         window.push_notification(
             note.placement(Anchor::BottomRight)
                 .delivery(NotificationDelivery::InApp),

@@ -110,6 +110,49 @@ pub fn credential_presence(saved: &Credentials) -> (bool, bool) {
         !saved.tapd_token.is_empty(),
     )
 }
+/// 只在内存中合并测试输入，不保存、不创建原生 profile。
+pub fn test_credentials(
+    saved: &Credentials,
+    tool: CliTool,
+    input: &Credentials,
+) -> Result<Credentials> {
+    if tool == CliTool::Lark {
+        anyhow::ensure!(
+            (input.lark_app_id.is_empty() || input.lark_app_id == saved.lark_app_id)
+                && (input.lark_app_secret.is_empty()
+                    || input.lark_app_secret == saved.lark_app_secret),
+            "Unsaved Lark app credentials cannot be verified against an old native profile; use Save and connect first"
+        );
+    }
+    let mut effective = saved.clone();
+    merge_nonempty(&mut effective, tool, input)?;
+    Ok(effective)
+}
+
+/// 单服务配置指纹不含凭证原文；历史时间绝不作为授权依据。
+pub fn verification_binding(
+    tool: CliTool,
+    settings: &lark2tapd_core::Settings,
+    c: &Credentials,
+) -> String {
+    match tool {
+        CliTool::Lark => namespace_parts(&[
+            "lark",
+            &settings.lark_path,
+            &c.lark_app_id,
+            &c.lark_app_secret,
+            &c.lark_user_token,
+        ]),
+        CliTool::Tapd => namespace_parts(&[
+            "tapd",
+            &settings.tapd_path,
+            &settings.tapd_endpoint,
+            &settings.workspace_id,
+            &c.tapd_token,
+        ]),
+    }
+}
+
 pub fn credentials_namespace(c: &Credentials) -> String {
     namespace_parts(&[
         &c.lark_app_id,
@@ -181,6 +224,35 @@ mod tests {
         merge_nonempty(&mut saved, CliTool::Tapd, &input).unwrap();
         assert_eq!(saved.lark_app_secret, "old-secret");
         assert_eq!(saved.tapd_token, "new-token");
+    }
+    #[test]
+    fn draft_test_does_not_reuse_a_different_lark_profile_or_mutate_saved_tokens() {
+        let mut saved = Credentials::default();
+        saved.lark_app_id = "app".into();
+        saved.lark_app_secret = "old".into();
+        saved.tapd_token = "saved".into();
+        let mut input = Credentials::default();
+        input.tapd_token = "draft".into();
+        let effective = test_credentials(&saved, CliTool::Tapd, &input).unwrap();
+        assert_eq!(effective.tapd_token, "draft");
+        assert_eq!(saved.tapd_token, "saved");
+        input.lark_app_id = "app".into();
+        input.lark_app_secret = "new".into();
+        assert!(
+            test_credentials(&saved, CliTool::Lark, &input)
+                .unwrap_err()
+                .to_string()
+                .contains("Save and connect")
+        );
+        let settings = lark2tapd_core::Settings::default();
+        assert_eq!(
+            verification_binding(CliTool::Lark, &settings, &saved),
+            verification_binding(CliTool::Lark, &settings, &effective)
+        );
+        assert_ne!(
+            verification_binding(CliTool::Tapd, &settings, &saved),
+            verification_binding(CliTool::Tapd, &settings, &effective)
+        );
     }
     #[test]
     fn empty_inputs_preserve_saved_secrets() {

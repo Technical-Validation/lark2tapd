@@ -15,6 +15,8 @@ struct Backend {
     cancellations: AtomicUsize,
     loads: AtomicUsize,
     checks: AtomicUsize,
+    fail_checks: AtomicBool,
+    tested_tokens: Mutex<Vec<String>>,
     fail_probe: bool,
     fail_save: bool,
     fail_auth: bool,
@@ -56,9 +58,20 @@ impl ConnectionBackend for Backend {
         anyhow::ensure!(!self.fail_probe, "CLI is not executable");
         Ok("fake CLI 1.0.0".into())
     }
-    fn check(&self, _: CliTool, _: &Settings, _: Credentials) -> Result<ConnectionReport> {
+    fn check(
+        &self,
+        _: CliTool,
+        _: &Settings,
+        credentials: Credentials,
+    ) -> Result<ConnectionReport> {
         self.checks.fetch_add(1, Ordering::SeqCst);
-        Ok(report(self.fail_auth))
+        self.tested_tokens
+            .lock()
+            .unwrap()
+            .push(credentials.tapd_token.clone());
+        Ok(report(
+            self.fail_auth || self.fail_checks.load(Ordering::SeqCst),
+        ))
     }
     fn connect(
         &self,
@@ -141,6 +154,139 @@ fn credentials() -> Credentials {
     credentials.lark_app_secret = "injected-secret-app-secret".into();
     credentials.tapd_token = "injected-secret-tapd-token".into();
     credentials
+}
+
+fn persisted_verifications(
+    root: &std::path::Path,
+) -> BTreeMap<String, lark2tapd_core::VerificationReceipt> {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Engine::open(&root.join("preferences-live.db"))
+            .await
+            .unwrap()
+            .snapshot()
+            .settings
+            .connection_verifications
+            .clone()
+    })
+}
+
+#[test]
+fn verification_receipts_persist_survive_rechecks_and_bind_to_current_inputs() {
+    let backend = Arc::new(Backend {
+        credentials: Mutex::new(credentials()),
+        ..Default::default()
+    });
+    let (root, worker) = startup(Mode::Live, backend.clone());
+    event(&worker);
+    send(&worker, Job::Check(CliTool::Tapd));
+    until(
+        &worker,
+        |e| matches!(e,Event::State{snapshot,..} if snapshot.settings.connection_verifications.contains_key("tapd-connection")),
+    );
+    let first = persisted_verifications(root.path());
+    assert!(chrono::DateTime::parse_from_rfc3339(&first["tapd-connection"].at).is_ok());
+    assert!(!format!("{first:?}").contains("injected-secret"));
+    // 真正释放并重启 actor，证明记录不是仅留在 UI 或进程内存中。
+    drop(worker);
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("app.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    drop(lock);
+    let worker = start_with_backend(root.path().to_owned(), Mode::Live, backend.clone());
+    match event(&worker) {
+        Event::State { snapshot, .. } => {
+            assert_eq!(snapshot.settings.connection_verifications, first)
+        }
+        _ => panic!("missing startup snapshot"),
+    }
+    event(&worker);
+    backend.fail_checks.store(true, Ordering::SeqCst);
+    send(&worker, Job::Check(CliTool::Tapd));
+    until(
+        &worker,
+        |e| matches!(e,Event::ConnectionReport{report,..} if !report.connected),
+    );
+    assert_eq!(
+        persisted_verifications(root.path()),
+        first,
+        "a failed recheck must not erase prior success"
+    );
+    backend.fail_checks.store(false, Ordering::SeqCst);
+    let mut input = Credentials::default();
+    input.tapd_token = "different-unsaved-token".into();
+    send(
+        &worker,
+        Job::TestConnection {
+            tool: CliTool::Tapd,
+            credentials: input,
+        },
+    );
+    until(
+        &worker,
+        |e| matches!(e,Event::ConnectionReport{saved_configuration:false,report,..} if report.connected),
+    );
+    assert_eq!(
+        backend.tested_tokens.lock().unwrap().last().unwrap(),
+        "different-unsaved-token"
+    );
+    assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.credentials.lock().unwrap().tapd_token,
+        "injected-secret-tapd-token"
+    );
+    assert_eq!(
+        persisted_verifications(root.path()),
+        first,
+        "unsaved test must not stamp saved configuration"
+    );
+    backend.credentials.lock().unwrap().tapd_token = "externally-changed".into();
+    send(&worker, Job::LoadConnectionStatus);
+    until(
+        &worker,
+        |e| matches!(e,Event::State {snapshot,..} if snapshot.settings.connection_verifications.is_empty()),
+    );
+    assert!(!persisted_verifications(root.path()).contains_key("tapd-connection"));
+    send(&worker, Job::Check(CliTool::Tapd));
+    until(
+        &worker,
+        |e| matches!(e,Event::ConnectionReport {report,..} if report.connected),
+    );
+    assert!(persisted_verifications(root.path()).contains_key("tapd-connection"));
+    send(&worker, Job::ClearCredentials(CliTool::Tapd));
+    until(&worker, |e| {
+        matches!(
+            e,
+            Event::State {
+                message: "credentials_cleared",
+                ..
+            }
+        )
+    });
+    assert!(!persisted_verifications(root.path()).contains_key("tapd-connection"));
+}
+
+#[test]
+fn saving_always_revalidates_instead_of_reusing_success() {
+    let backend = Arc::new(Backend::default());
+    let (root, worker) = startup(Mode::Live, backend.clone());
+    event(&worker);
+    for expected in [1, 2] {
+        send(
+            &worker,
+            Job::SaveAndConnect {
+                tool: CliTool::Tapd,
+                credentials: credentials(),
+            },
+        );
+        until(
+            &worker,
+            |e| matches!(e,Event::ConnectionReport{report,..} if report.connected),
+        );
+        assert_eq!(backend.connects.load(Ordering::SeqCst), expected);
+        assert!(persisted_verifications(root.path()).contains_key("tapd-connection"));
+    }
 }
 
 #[test]
@@ -637,6 +783,7 @@ fn replacing_authorization_keeps_new_activity_and_ignores_old_progress() {
             result: Ok((
                 String::new(),
                 ReadData::ConnectionReport {
+                    binding: None,
                     tool: CliTool::Lark,
                     report: report(false),
                     authorization: true,

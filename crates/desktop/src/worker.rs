@@ -83,6 +83,10 @@ pub enum Job {
         credentials: Credentials,
     },
     Check(CliTool),
+    TestConnection {
+        tool: CliTool,
+        credentials: Credentials,
+    },
     ProbeCli(CliTool),
     Recover {
         guid: String,
@@ -119,6 +123,7 @@ pub enum Event {
     ConnectionReport {
         tool: CliTool,
         report: ConnectionReport,
+        saved_configuration: bool,
     },
     AuthorizationRequired {
         verification_url: String,
@@ -289,6 +294,7 @@ enum ReadData {
         tool: CliTool,
         report: ConnectionReport,
         authorization: bool,
+        binding: Option<String>,
     },
     Tasks(Vec<SourceTask>),
     Projects(Vec<TapdWorkspace>),
@@ -433,7 +439,7 @@ fn read_key(job: &Job) -> Option<String> {
             session,
             ..
         } => format!("attachment:{guid}:{session}:{marker}"),
-        Job::Check(tool) => connection_key(*tool).into(),
+        Job::Check(tool) | Job::TestConnection { tool, .. } => connection_key(*tool).into(),
         Job::ProbeCli(tool) => cli_key(*tool).into(),
         _ => return None,
     })
@@ -465,7 +471,7 @@ fn field(job: &Job) -> &'static str {
         Job::Refresh => "tasks",
         Job::LoadProjects => "projects",
         Job::LoadMembers(_) => "members",
-        Job::Check(tool) => connection_key(*tool),
+        Job::Check(tool) | Job::TestConnection { tool, .. } => connection_key(*tool),
         Job::ProbeCli(tool) => cli_key(*tool),
         Job::SetPreference(Preference::PollMinutes(_) | Preference::Polling(_)) => "poll",
         Job::SetPreference(Preference::DefaultDestination { .. }) => "destination",
@@ -618,14 +624,26 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
                     },
                 ));
             }
-            if let Job::Check(tool) = job {
+            if let Job::Check(tool) | Job::TestConnection { tool, .. } = &job {
+                let tool = *tool;
                 anyhow::ensure!(
                     !mode.is_mock(),
                     "Test mode never accesses external accounts"
                 );
+                let mut binding = None;
                 let report = (|| {
                     backend.probe(tool, &settings)?;
-                    backend.check(tool, &settings, backend.load()?)
+                    let saved = backend.load()?;
+                    let effective = match &job {
+                        Job::TestConnection { credentials, .. } => {
+                            lark2tapd_bridge::test_credentials(&saved, tool, credentials)?
+                        }
+                        _ => saved,
+                    };
+                    binding = Some(lark2tapd_bridge::verification_binding(
+                        tool, &settings, &effective,
+                    ));
+                    backend.check(tool, &settings, effective)
                 })()
                 .unwrap_or_else(failed_report);
                 return Ok((
@@ -634,6 +652,7 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
                         tool,
                         report,
                         authorization: false,
+                        binding,
                     },
                 ));
             }
@@ -692,6 +711,21 @@ fn poll_wait(
 ) -> Option<Duration> {
     (opened && settings.poll_enabled && !pending.keys().any(|key| key.ends_with("-connection")))
         .then(|| deadline.saturating_duration_since(now))
+}
+
+fn prune_verifications(settings: &mut Settings, credentials: &Credentials) {
+    for tool in [CliTool::Lark, CliTool::Tapd] {
+        let binding = lark2tapd_bridge::verification_binding(tool, settings, credentials);
+        if settings
+            .connection_verifications
+            .get(connection_key(tool))
+            .is_some_and(|r| r.binding != binding)
+        {
+            settings
+                .connection_verifications
+                .remove(connection_key(tool));
+        }
+    }
 }
 
 fn connection_key(tool: CliTool) -> &'static str {
@@ -815,6 +849,7 @@ fn spawn_connect(
     profile_writes: Arc<Mutex<()>>,
 ) {
     std::thread::spawn(move || {
+        let mut binding = None;
         let report = (|| {
             ensure_auth_active(&cancelled)?;
             // 包住 profile 准备、设备授权及最终落盘；替换操作须等旧进程退出。
@@ -830,6 +865,11 @@ fn spawn_connect(
             ensure_auth_active(&cancelled)?;
             backend.probe(tool, &settings)?;
             let credentials = backend.load()?;
+            binding = Some(lark2tapd_bridge::verification_binding(
+                tool,
+                &settings,
+                &credentials,
+            ));
             anyhow::ensure!(
                 tool != CliTool::Lark || credentials.lark_user_token.is_empty(),
                 "Manual token cannot be verified; use OAuth instead"
@@ -865,6 +905,7 @@ fn spawn_connect(
                         tool,
                         report,
                         authorization: tool == CliTool::Lark,
+                        binding,
                     },
                 )),
             }));
@@ -1039,9 +1080,24 @@ fn start_with_backend(
                                     ReadData::CliProbe { tool, version, error } => {
                                         output.send(Event::CliProbe { tool: *tool, version: version.clone(), error: error.clone() }).await?;
                                     }
-                                    ReadData::ConnectionReport { tool, report, authorization } => {
+                                    ReadData::ConnectionReport { tool, report, authorization, binding } => {
                                         if *authorization { output.send(Event::AuthorizationFinished).await?; }
-                                        output.send(Event::ConnectionReport { tool: *tool, report: report.clone() }).await?;
+                                        let previous = settings.connection_verifications.clone();
+                                        let current = backend.load().ok().map(|c| {
+                                            prune_verifications(&mut settings, &c);
+                                            lark2tapd_bridge::verification_binding(*tool, &settings, &c)
+                                        });
+                                        let saved_configuration = binding.is_some() && *binding == current;
+                                        if saved_configuration && report.connected {
+                                            settings.connection_verifications.insert(connection_key(*tool).into(), lark2tapd_core::VerificationReceipt {
+                                                at: chrono::Utc::now().to_rfc3339(), binding: binding.clone().unwrap(),
+                                            });
+                                        }
+                                        if settings.connection_verifications != previous {
+                                            preferences.save_settings(settings.clone()).await?;
+                                            engine.save_settings(settings.clone()).await?;
+                                        }
+                                        output.send(Event::ConnectionReport { tool: *tool, report: report.clone(), saved_configuration }).await?;
                                         if let Some(failure) = &report.failure {
                                             output.send(Event::FormError { field: connection_key(*tool), message: failure.clone() }).await?;
                                         }
@@ -1140,6 +1196,7 @@ fn start_with_backend(
                                 }
                                 let mut next = settings.clone();
                                 patch(&mut next, p)?;
+                                if next.workspace_id != settings.workspace_id { next.connection_verifications.remove(connection_key(CliTool::Tapd)); }
                                 preferences.save_settings(next.clone()).await?;
                                 engine.save_settings(next.clone()).await?;
                                 settings = next;
@@ -1175,6 +1232,7 @@ fn start_with_backend(
                                     CliTool::Lark => settings.lark_path = path,
                                     CliTool::Tapd => settings.tapd_path = path,
                                 }
+                                settings.connection_verifications.remove(connection_key(tool));
                                 preferences.save_settings(settings.clone()).await?;
                                 engine.save_settings(settings.clone()).await?;
                                 generation += 1;
@@ -1182,6 +1240,11 @@ fn start_with_backend(
                                 message="installed";
                             }
                             Job::LoadConnectionStatus => {
+                                if !mode.is_mock() && let Ok(c) = backend.load() {
+                                    prune_verifications(&mut settings, &c);
+                                    preferences.save_settings(settings.clone()).await?;
+                                    engine.save_settings(settings.clone()).await?;
+                                }
                                 emit_connection_status(mode, backend.as_ref(), &output)?;
                             }
                             Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => {
@@ -1204,6 +1267,9 @@ fn start_with_backend(
                                     }
                                     _ => unreachable!(),
                                 }
+                                // 凭证/路径变更使历史失效；飞书重新授权还可能切换同应用下的用户。
+                                if let Ok(c) = backend.load() { prune_verifications(&mut settings, &c); }
+                                if !saving || tool == CliTool::Lark { settings.connection_verifications.remove(connection_key(tool)); }
                                 // 保存成功即作废旧账户与在途读取，不能等待后续 OAuth 成功。
                                 output.send(Event::AuthorizationFinished).await?;
                                 namespace.clear();

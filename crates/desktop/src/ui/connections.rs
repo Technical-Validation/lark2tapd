@@ -8,6 +8,17 @@ pub(super) struct ServiceConnection {
     pub cli_version: Option<String>,
     pub cli_error: Option<String>,
     pub report: Option<ConnectionReport>,
+    pub tested_at: Option<String>,
+    pub tested_saved_configuration: bool,
+}
+
+impl ServiceConnection {
+    pub(super) fn invalidate_result(&mut self) {
+        self.verified = false;
+        self.report = None;
+        self.tested_at = None;
+        self.tested_saved_configuration = false;
+    }
 }
 
 pub(super) struct CredentialChange {
@@ -65,7 +76,12 @@ impl Workspace {
             CliTool::Tapd => set(&self.tapd_token, String::new(), window, cx),
         }
     }
-    fn open_connection_form(&mut self, tool: CliTool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_connection_form(
+        &mut self,
+        tool: CliTool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.model.read(cx).connection(tool).cli_version.is_none() {
             return;
         }
@@ -88,7 +104,9 @@ impl Workspace {
         } else {
             &self.tapd_path
         };
-        div().p_4().border_1().border_color(cx.theme().border).rounded_md().flex().flex_col().gap_3()
+        let bounds = self.connection_bounds[if lark { 0 } else { 1 }].clone();
+        div().on_children_prepainted(move |children,_,_|bounds.set(children.first().copied()))
+            .p_4().border_1().border_color(cx.theme().border).rounded_md().flex().flex_col().gap_3()
             .child(section(if lark { self.tr(cx,"飞书 CLI","Lark CLI") } else { "TAPD CLI" }))
             .child(self.help_field(self.tr(cx,"可执行文件","Executable"),
                 if lark { "lark-cli-help" } else { "tapd-cli-help" },
@@ -98,6 +116,7 @@ impl Workspace {
             .when_some(state.cli_version.clone(), |d,v| d.child(div().text_sm().text_color(cx.theme().success).child(v)))
             .child(div().flex().gap_2()
                 .child(self.focus_region(if lark { "probe-lark-cli" } else { "probe-tapd-cli" }, Button::new(if lark { "probe-lark-cli" } else { "probe-tapd-cli" })
+                    .track_focus(&self.cli_focus[if lark {0} else {1}])
                     .label(if probing { self.tr(cx,"检测中…","Checking…") } else { self.tr(cx,"检测 CLI","Check CLI") })
                     .disabled(probing).on_click(cx.listener(move |this,_,_,cx| this.send(Job::ProbeCli(tool),cx)))))
                 .when(!ready, |d| d.child(self.focus_region(if lark { "install-lark" } else { "install-tapd" }, Button::new(if lark { "install-lark" } else { "install-tapd" })
@@ -106,6 +125,7 @@ impl Workspace {
             .when_some(state.cli_error.clone(), |d,e| d.child(div().text_sm().text_color(cx.theme().danger).child(e)))
             .child(self.inline_error(cli_key(tool),cx))
             .when_some(model.install_plan.clone().filter(|p| p.tool==tool), |d,p| d.child(self.install_confirmation(p,cx)))
+            .when_some(last_verified(model,tool), |d,time| d.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{}: {time}",self.tr(cx,"已保存配置上次通过","Saved configuration last verified")))))
             .when(ready, |d| d.child(self.account_section(tool,cx)))
             .into_any_element()
     }
@@ -127,7 +147,7 @@ impl Workspace {
         } else {
             None
         };
-        let active = state.saved || open || authorization.is_some() || state.report.is_some();
+
         div().mt_2().pt_3().border_t_1().border_color(cx.theme().border).flex().flex_col().gap_3()
             .child(div().font_semibold().child(if lark { self.tr(cx,"飞书连接","Lark connection") } else { self.tr(cx,"TAPD 连接","TAPD connection") }))
             .when(state.saved || state.verified, |d| d.child(div().text_sm().text_color(cx.theme().muted_foreground).child(if state.verified {
@@ -137,6 +157,7 @@ impl Workspace {
                 .child(self.focus_region(if lark { "connect-lark" } else { "connect-tapd" }, Button::new(if lark { "connect-lark" } else { "connect-tapd" })
                     .label(if state.saved { self.tr(cx,"编辑配置","Edit configuration") } else if lark { self.tr(cx,"配置飞书","Configure Lark") } else { self.tr(cx,"配置 TAPD","Configure TAPD") })
                     .disabled(busy || open).on_click(cx.listener(move |this,_,w,cx| this.open_connection_form(tool,w,cx)))))
+                .when(!open && (state.saved || state.verified || state.report.is_some()), |d| d.child(self.test_button(tool,false,cx)))
                 .when(state.saved, |d| d.child(self.focus_region(if lark { "clear-lark" } else { "clear-tapd" }, Button::new(if lark { "clear-lark" } else { "clear-tapd" })
                     .label(self.tr(cx,"清除凭证并重新连接","Clear credentials and reconnect")).ghost().disabled(model.busy)
                     .on_click(cx.listener(move |this,_,_,cx| { this.clear_confirmation=Some(tool); cx.notify(); }))))))
@@ -154,96 +175,53 @@ impl Workspace {
                 .child(self.focus_region("open-lark-authorization",Button::new("open-lark-authorization").primary()
                     .label(self.tr(cx,"打开飞书授权页面","Open Lark authorization"))
                     .on_click(move |_,_,cx| open_safe_url(&url,cx))))))
-            .when(active, |d| d
-                .child(self.permission_summary(tool,cx))
-                .child(self.focus_region(if lark { "check-lark" } else { "check-tapd" }, Button::new(if lark { "check-lark" } else { "check-tapd" })
-                    .label(self.tr(cx,"测试连接与权限","Test connection and permissions")).disabled(model.activities.contains(field_key(tool)))
-                    .on_click(cx.listener(move |this,_,_,cx| this.send(Job::Check(tool),cx))))))
             .child(div().debug_selector(move || if lark { "lark-operation-error".into() } else { "tapd-operation-error".into() }).child(self.inline_error(field_key(tool),cx)))
     }
 
-    fn permission_summary(&self, tool: CliTool, cx: &Context<Self>) -> AnyElement {
-        let state = self.model.read(cx).connection(tool);
-        let lark = tool == CliTool::Lark;
-        let mut content = div()
-            .debug_selector(move || {
-                if lark {
-                    "lark-permission-summary".into()
-                } else {
-                    "tapd-permission-summary".into()
-                }
-            })
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_sm()
-            .child(div().font_semibold().child(self.tr(
-                cx,
-                "权限与能力摘要",
-                "Permissions and capabilities",
-            )));
-        let Some(report) = &state.report else {
-            return content
-                .child(self.tr(
-                    cx,
-                    "尚未测试；保存信息不代表权限已验证。",
-                    "Not tested. Saved credentials do not establish permissions.",
-                ))
-                .into_any_element();
+    fn test_button(&self, tool: CliTool, draft: bool, cx: &Context<Self>) -> impl IntoElement {
+        let id = if tool == CliTool::Lark {
+            "check-lark"
+        } else {
+            "check-tapd"
         };
-        for check in &report.checks {
-            let (label, color) = match check.state {
-                PermissionState::Granted => (self.tr(cx, "已核验", "Verified"), cx.theme().success),
-                PermissionState::Missing => (self.tr(cx, "缺失", "Missing"), cx.theme().danger),
-                PermissionState::Unknown => (
-                    self.tr(cx, "未核验", "Unverified"),
-                    cx.theme().muted_foreground,
-                ),
-            };
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_color(color)
-                            .child(format!("{label} · {}", check.name)),
-                    )
-                    .when(!check.detail.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(check.detail.clone()),
-                        )
-                    }),
-            );
-        }
-        for (label, scopes) in [
-            (
-                self.tr(cx, "用户授权记录", "Stored user grants"),
-                &report.user_scopes,
-            ),
-            (
-                self.tr(cx, "应用已开通权限", "App-enabled scopes"),
-                &report.app_scopes,
-            ),
-        ] {
-            if let Some(scopes) = scopes {
-                content = content.child(div().text_xs().child(format!(
-                    "{label}: {}",
-                    if scopes.is_empty() {
-                        self.tr(cx, "无", "None").to_owned()
+        self.focus_region(
+            id,
+            Button::new(id)
+                .label(self.tr(cx, "测试连接", "Test connection"))
+                .disabled(self.model.read(cx).activities.contains(field_key(tool)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if draft {
+                        this.send(
+                            Job::TestConnection {
+                                tool,
+                                credentials: this.connection_inputs(tool, cx),
+                            },
+                            cx,
+                        );
                     } else {
-                        scopes.join(", ")
+                        this.send(Job::Check(tool), cx);
                     }
-                )));
+                    cx.defer(move |cx| connection_results::show(tool, cx));
+                })),
+        )
+    }
+    fn connection_inputs(&self, tool: CliTool, cx: &App) -> Credentials {
+        if tool == CliTool::Lark {
+            Credentials {
+                lark_app_id: self.app_id.read(cx).value().to_string(),
+                lark_app_secret: self.app_secret.read(cx).value().to_string(),
+                lark_user_token: self.lark_token.read(cx).value().to_string(),
+                tapd_token: String::new(),
+            }
+        } else {
+            Credentials {
+                tapd_token: self.tapd_token.read(cx).value().to_string(),
+                lark_app_id: String::new(),
+                lark_app_secret: String::new(),
+                lark_user_token: String::new(),
             }
         }
-        content.into_any_element()
     }
-
     fn connection_form(
         &self,
         tool: CliTool,
@@ -266,6 +244,7 @@ impl Workspace {
                     } else { Credentials { tapd_token:this.tapd_token.read(cx).value().to_string(), lark_app_id:String::new(), lark_app_secret:String::new(), lark_user_token:String::new() } };
                     this.send(Job::SaveAndConnect { tool, credentials },cx);
                 }))))
+                .child(self.test_button(tool,true,cx))
                 .child(self.focus_region(if lark { "cancel-lark-form" } else { "cancel-tapd-form" }, Button::new(if lark { "cancel-lark-form" } else { "cancel-tapd-form" }).label(self.tr(cx,"取消","Cancel")).disabled(self.model.read(cx).activities.contains(field_key(tool))).on_click(cx.listener(move |this,_,window,cx| {
                     this.clear_connection_inputs(tool,window,cx); this.set_connection_form(tool,false); this.focus_handle.focus(window,cx); cx.notify();
                 })))))
@@ -295,4 +274,109 @@ impl Workspace {
                 ),
             )
     }
+}
+
+pub(super) fn permission_summary(model: &Model, tool: CliTool, cx: &App) -> AnyElement {
+    let state = model.connection(tool);
+    let lark = tool == CliTool::Lark;
+    let mut content = div()
+        .debug_selector(move || {
+            if lark {
+                "lark-permission-summary".into()
+            } else {
+                "tapd-permission-summary".into()
+            }
+        })
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_sm()
+        .child(div().font_semibold().child(text(
+            model.language(),
+            "权限与能力摘要",
+            "Permissions and capabilities",
+        )));
+    let Some(report) = &state.report else {
+        return content
+            .child(text(
+                model.language(),
+                "尚未测试；保存信息不代表权限已验证。",
+                "Not tested. Saved credentials do not establish permissions.",
+            ))
+            .into_any_element();
+    };
+    for check in &report.checks {
+        let (label, color) = match check.state {
+            PermissionState::Granted => (
+                text(model.language(), "已核验", "Verified"),
+                cx.theme().success,
+            ),
+            PermissionState::Missing => {
+                (text(model.language(), "缺失", "Missing"), cx.theme().danger)
+            }
+            PermissionState::Unknown => (
+                text(model.language(), "未核验", "Unverified"),
+                cx.theme().muted_foreground,
+            ),
+        };
+        content = content.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(color)
+                        .child(format!("{label} · {}", check.name)),
+                )
+                .when(!check.detail.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(check.detail.clone()),
+                    )
+                }),
+        );
+    }
+    for (label, scopes) in [
+        (
+            text(model.language(), "用户授权记录", "Stored user grants"),
+            &report.user_scopes,
+        ),
+        (
+            text(model.language(), "应用已开通权限", "App-enabled scopes"),
+            &report.app_scopes,
+        ),
+    ] {
+        if let Some(scopes) = scopes {
+            content = content.child(div().text_xs().child(format!(
+                "{label}: {}",
+                if scopes.is_empty() {
+                    text(model.language(), "无", "None").to_owned()
+                } else {
+                    scopes.join(", ")
+                }
+            )));
+        }
+    }
+    content.into_any_element()
+}
+
+pub(super) fn last_verified(model: &Model, tool: CliTool) -> Option<String> {
+    let value = &model
+        .snapshot
+        .as_ref()?
+        .settings
+        .connection_verifications
+        .get(field_key(tool))?
+        .at;
+    local_timestamp(value)
+}
+pub(super) fn local_timestamp(value: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(value).ok().map(|t| {
+        t.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    })
 }
