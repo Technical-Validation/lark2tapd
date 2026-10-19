@@ -50,7 +50,15 @@ pub fn category(message: &str) -> &'static str {
     if let Some(diagnostic) = request_diagnostic(message) {
         return diagnostic.category;
     }
-    let text = message.to_ascii_lowercase();
+    // request_failed 的阶段名不是原因：lark_identity 下也可能只是本地路径错误。
+    let reason = if message.starts_with("Task refresh request_failed ") {
+        message
+            .split_once("): ")
+            .map_or(message, |(_, reason)| reason)
+    } else {
+        message
+    };
+    let text = reason.to_ascii_lowercase();
     if [
         "keychain", "sqlite", "database", "disk", "storage", "persist",
     ]
@@ -450,6 +458,24 @@ mod tests {
         assert!(line.contains("id=9 phase=lark_task_details event=rate_limit_wait"));
         assert!(line.contains("detail=5"));
         assert!(line.contains("retry=2 wait_ms=2000"));
+    }
+    #[test]
+    fn refresh_phase_is_not_the_error_category() {
+        for (reason, expected) in [
+            ("Configure an absolute CLI executable path", "validation"),
+            ("CLI executable not found; check installation", "validation"),
+            (
+                "Cannot launch CLI; install it and configure an absolute executable path",
+                "validation",
+            ),
+            ("Network connection refused", "network"),
+            ("Lark user OAuth is not verified", "authentication"),
+        ] {
+            let error = format!(
+                "Task refresh request_failed at lark_identity (page=0, detail=0, completed=0, scheduled=0, elapsed_ms=0): {reason}. Cached tasks unchanged"
+            );
+            assert_eq!(category(&error), expected, "{reason}");
+        }
     }
     #[test]
     fn lark_rate_limit_code_has_actionable_category() {

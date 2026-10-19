@@ -53,10 +53,7 @@ impl CliGateway {
         } else {
             &self.settings.tapd_path
         };
-        ensure!(
-            Path::new(path).is_absolute(),
-            "Configure an absolute CLI executable path"
-        );
+        ensure!(Path::new(path).is_absolute(), installer::CLI_PATH_ERROR);
         if lark {
             ensure!(
                 (self.credentials.lark_app_secret.is_empty()

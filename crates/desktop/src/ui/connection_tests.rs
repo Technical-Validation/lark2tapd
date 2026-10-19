@@ -2,6 +2,39 @@
 use super::*;
 
 #[gpui_kit::test]
+fn rediscovered_cli_path_updates_the_open_settings_window(cx: &mut TestAppContext) {
+    let (_dir, _events, model, main, _) = setup(cx);
+    let (_, settings) = open_settings_for_test(cx, main);
+    let mut snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
+    snapshot.settings.lark_path = "/newly-discovered/lark-cli".into();
+    let sequence = cx.read(|cx| model.read(cx).next_request_sequence);
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::State {
+                mode: Mode::Mock,
+                snapshot,
+                profile: "mock".into(),
+                message: "cli_path_updated",
+                new_count: 0,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert_eq!(
+            settings.read(cx).lark_path.read(cx).value().as_ref(),
+            "/newly-discovered/lark-cli"
+        );
+        assert_eq!(
+            model.read(cx).next_request_sequence,
+            sequence,
+            "path update must not enqueue a duplicate probe"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn loading_saved_configuration_does_not_claim_a_new_save(cx: &mut TestAppContext) {
     let (_dir, _events, model, main, _) = setup(cx);
     let (settings, _) = open_settings_for_test(cx, main);

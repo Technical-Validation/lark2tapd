@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const CLI_PATH_ERROR: &str =
+    "CLI executable not found at a usable absolute path; restore its installation and check again";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CliTool {
     Lark,
@@ -107,10 +110,7 @@ pub fn install_cli(tool: CliTool, tools_dir: &Path) -> Result<PathBuf> {
 /// 版本诊断不是身份认证或远程连接测试；不返回未经筛选的 CLI 输出。
 /// TAPD 自身可能查询更新并写入版本缓存，因此也必须由用户主动触发。
 pub fn probe_cli(tool: CliTool, path: &Path) -> Result<String> {
-    ensure!(
-        path.is_absolute() && path.is_file(),
-        "Configure an absolute CLI executable path"
-    );
+    ensure!(path.is_absolute() && path.is_file(), CLI_PATH_ERROR);
     probe_with(tool, path, &[], &mut crate::process::run)
 }
 

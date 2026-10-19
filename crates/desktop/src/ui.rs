@@ -371,10 +371,13 @@ impl Model {
                         state.cli_version = None;
                         state.cli_error = None;
                         state.invalidate_result();
-                        let model = cx.entity();
-                        cx.defer(move |cx| {
-                            model.update(cx, |m, cx| m.send(Job::ProbeCli(tool), cx))
-                        });
+                        // 显式检测已在后台使用新路径探测，避免收到路径快照后再重复排队。
+                        if message != "cli_path_updated" {
+                            let model = cx.entity();
+                            cx.defer(move |cx| {
+                                model.update(cx, |m, cx| m.send(Job::ProbeCli(tool), cx))
+                            });
+                        }
                     }
                 }
                 if matches!(message, "installed" | "install_cancelled") {
@@ -1027,7 +1030,7 @@ impl Workspace {
             };
             if this.seen_state_revision != revision {
                 this.seen_state_revision = revision;
-                if action == "installed"
+                if matches!(action, "installed" | "cli_path_updated")
                     && let Some(s) = &settings
                 {
                     set(&this.lark_path, s.lark_path.clone(), window, cx);
@@ -1564,6 +1567,11 @@ fn message_text<'a>(language: &str, key: &'a str) -> &'a str {
             language,
             "CLI 已安装，路径已保存",
             "CLI installed and executable path saved",
+        ),
+        "cli_path_updated" => text(
+            language,
+            "已找到 CLI 并保存路径，正在检查版本",
+            "CLI found and path saved; checking its version",
         ),
         "diagnosed" => text(
             language,

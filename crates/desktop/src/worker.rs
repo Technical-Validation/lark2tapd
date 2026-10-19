@@ -1,5 +1,8 @@
 //! 串行 actor 拥有数据库与写入日志；只读任务并行取回数据，按账户/配置代数合并。
+#[path = "worker_cli_paths.rs"]
+mod cli_paths;
 use anyhow::{Result, bail};
+use cli_paths::discover_executable;
 use lark2tapd_bridge::installer::{
     CliTool, InstallationPlan, install_cli, installation_plan, probe_supported_cli,
 };
@@ -1036,9 +1039,14 @@ fn start_with_backend(
                 if mode.is_mock() && settings.workspace_id.is_empty() {
                     settings.workspace_id = "demo".into();
                 }
-                settings.lark_path = discover_executable(&settings.lark_path, "lark-cli", &root.join("tools"));
-                settings.tapd_path = discover_executable(&settings.tapd_path, "tapd-cli", &root.join("tools"));
+                for tool in [CliTool::Lark, CliTool::Tapd] {
+                    rediscover_cli(&mut settings, tool, &root.join("tools"));
+                }
                 settings.tapd_endpoint = Settings::default().tapd_endpoint;
+                // 下次启动从全局偏好读取；不能只把发现的路径保存在当前账号缓存。
+                if preferences.snapshot().settings != settings {
+                    preferences.save_settings(settings.clone()).await?;
+                }
                 engine.save_settings(settings.clone()).await?;
                 #[cfg(test)]
                 let mock = MockGateway::from_snapshot(engine.snapshot());
@@ -1201,6 +1209,25 @@ fn start_with_backend(
                         };
                         error_field = field(&job);
                         if let Some(key) = read_key(&job) {
+                            if let Job::ProbeCli(tool) = &job {
+                                let mut next = settings.clone();
+                                if rediscover_cli(&mut next, *tool, &root.join("tools")) {
+                                    anyhow::ensure!(
+                                        !pending.keys().any(|key| key.ends_with("-connection")),
+                                        "Connection in progress; finish authorization before changing the CLI path"
+                                    );
+                                    preferences.save_settings(next.clone()).await?;
+                                    engine.save_settings(next.clone()).await?;
+                                    settings = next;
+                                    // 路径改变后，旧进程的完成结果不能合并进新配置。
+                                    generation += 1;
+                                    checked.clear();
+                                    for event in cancel_stale_reads(&mut pending, generation) {
+                                        output.send(event).await?;
+                                    }
+                                    message = "cli_path_updated";
+                                }
+                            }
                             // Account reads may otherwise adopt the old native profile and cancel OAuth itself.
                             anyhow::ensure!(
                                 matches!(job, Job::ProbeCli(_))
@@ -1223,7 +1250,7 @@ fn start_with_backend(
                                     mode,
                                     snapshot: engine.snapshot().clone(),
                                     profile: namespace.clone(),
-                                    message: "cached",
+                                    message: if message.is_empty() { "cached" } else { message },
                                     new_count: 0,
                                 })
                                 .await?;
@@ -1661,48 +1688,20 @@ fn interval(settings: &Settings) -> Duration {
     Duration::from_secs(u64::from(settings.poll_minutes.clamp(1, 1440)) * 60)
 }
 
-fn discover_executable(configured: &str, fallback: &str, tools: &std::path::Path) -> String {
-    fn executable(path: &std::path::Path) -> bool {
-        let Ok(metadata) = path.metadata() else {
-            return false;
-        };
-        if !metadata.is_file() {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode() & 0o111 != 0
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
+fn rediscover_cli(settings: &mut Settings, tool: CliTool, tools: &std::path::Path) -> bool {
+    let (path, name) = match tool {
+        CliTool::Lark => (&mut settings.lark_path, "lark-cli"),
+        CliTool::Tapd => (&mut settings.tapd_path, "tapd-cli"),
+    };
+    let discovered = discover_executable(path, name, tools);
+    if *path == discovered {
+        return false;
     }
-    if std::path::Path::new(configured).is_absolute()
-        && executable(std::path::Path::new(configured))
-    {
-        return configured.into();
-    }
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|p| p.join(fallback))
-                .find(|p| executable(p))
-        })
-        .or_else(|| {
-            let tool = if fallback == "lark-cli" {
-                CliTool::Lark
-            } else {
-                CliTool::Tapd
-            };
-            installation_plan(tool, tools)
-                .ok()
-                .map(|plan| plan.destination)
-                .filter(|path| executable(path))
-        })
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fallback.into())
+    *path = discovered;
+    settings
+        .connection_verifications
+        .remove(connection_key(tool));
+    true
 }
 
 #[cfg(test)]

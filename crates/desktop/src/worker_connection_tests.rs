@@ -17,6 +17,7 @@ struct Backend {
     checks: AtomicUsize,
     fail_checks: AtomicBool,
     tested_tokens: Mutex<Vec<String>>,
+    probed_paths: Mutex<Vec<String>>,
     fail_probe: bool,
     fail_save: bool,
     fail_auth: bool,
@@ -54,7 +55,11 @@ impl ConnectionBackend for Backend {
         }
         Ok(())
     }
-    fn probe(&self, _: CliTool, _: &Settings) -> Result<String> {
+    fn probe(&self, tool: CliTool, settings: &Settings) -> Result<String> {
+        self.probed_paths.lock().unwrap().push(match tool {
+            CliTool::Lark => settings.lark_path.clone(),
+            CliTool::Tapd => settings.tapd_path.clone(),
+        });
         anyhow::ensure!(!self.fail_probe, "CLI is not executable");
         Ok("fake CLI 1.0.0".into())
     }
@@ -169,6 +174,134 @@ fn persisted_verifications(
             .connection_verifications
             .clone()
     })
+}
+
+fn private_cli(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let plan =
+        installation_plan(CliTool::Lark, &root.canonicalize().unwrap().join("tools")).unwrap();
+    std::fs::create_dir_all(&plan.destination).unwrap();
+    let binary = plan.destination.join("lark-cli");
+    std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    binary
+}
+
+// 固定初始路径，避免测试依赖开发机 PATH 中是否安装了真实 CLI。
+fn startup_with_configured_cli(
+    backend: Arc<Backend>,
+) -> (tempfile::TempDir, WorkerHandle, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let configured = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("previous-lark-cli");
+    std::fs::rename(private_cli(root.path()), &configured).unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut engine = Engine::open(&root.path().join("preferences-live.db"))
+            .await
+            .unwrap();
+        engine
+            .save_settings(Settings {
+                lark_path: configured.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    });
+    let worker = start_with_backend(root.path().to_owned(), Mode::Live, backend);
+    assert!(matches!(
+        event(&worker),
+        Event::State {
+            message: "ready",
+            ..
+        }
+    ));
+    (root, worker, configured)
+}
+
+fn persisted_lark_path(root: &std::path::Path) -> String {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Engine::open(&root.join("preferences-live.db"))
+            .await
+            .unwrap()
+            .snapshot()
+            .settings
+            .lark_path
+            .clone()
+    })
+}
+
+#[test]
+fn startup_recovers_private_cli_and_persists_its_absolute_path() {
+    let root = tempfile::tempdir().unwrap();
+    let binary = private_cli(root.path());
+    let backend = Arc::new(Backend::default());
+    let worker = start_with_backend(root.path().to_owned(), Mode::Live, backend.clone());
+    match event(&worker) {
+        Event::State {
+            snapshot,
+            message: "ready",
+            ..
+        } => assert_eq!(snapshot.settings.lark_path, binary.to_str().unwrap()),
+        _ => panic!("missing startup snapshot"),
+    }
+    assert_eq!(persisted_lark_path(root.path()), binary.to_str().unwrap());
+    drop(worker);
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("app.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    drop(lock);
+    let worker = start_with_backend(root.path().to_owned(), Mode::Live, backend.clone());
+    match event(&worker) {
+        Event::State { snapshot, .. } => {
+            assert_eq!(snapshot.settings.lark_path, binary.to_str().unwrap())
+        }
+        _ => panic!("missing reopened snapshot"),
+    }
+    assert!(
+        binary.exists(),
+        "discovery must never remove an installation"
+    );
+    assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.connects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn probe_rediscovers_cli_created_after_startup_without_reauthorizing() {
+    let backend = Arc::new(Backend::default());
+    let (root, worker, previous) = startup_with_configured_cli(backend.clone());
+    event(&worker);
+    let loads = backend.loads.load(Ordering::SeqCst);
+    std::fs::remove_file(previous).unwrap();
+    let binary = private_cli(root.path());
+    send(&worker, Job::ProbeCli(CliTool::Lark));
+    until(&worker, |e| {
+        matches!(
+            e,
+            Event::CliProbe {
+                tool: CliTool::Lark,
+                version: Some(_),
+                error: None
+            }
+        )
+    });
+    assert_eq!(
+        backend.probed_paths.lock().unwrap().last().unwrap(),
+        binary.to_str().unwrap()
+    );
+    assert_eq!(persisted_lark_path(root.path()), binary.to_str().unwrap());
+    assert_eq!(
+        backend.loads.load(Ordering::SeqCst),
+        loads,
+        "local discovery must not read credentials"
+    );
+    assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.clears.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.connects.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -905,6 +1038,39 @@ fn expired_poll_deadline_is_suspended_until_authorization_finishes() {
         Some(Duration::ZERO)
     );
     assert_eq!(poll_wait(&settings, false, deadline, now, &pending), None);
+}
+
+#[test]
+fn rediscovery_during_authorization_keeps_the_current_cli_and_login() {
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let backend = Arc::new(Backend {
+        wait_for_auth: Some(barrier.clone()),
+        ..Default::default()
+    });
+    let (root, worker, previous) = startup_with_configured_cli(backend.clone());
+    event(&worker);
+    send(
+        &worker,
+        Job::SaveAndConnect {
+            tool: CliTool::Lark,
+            credentials: credentials(),
+        },
+    );
+    until(&worker, |e| {
+        matches!(e, Event::AuthorizationRequired { .. })
+    });
+    let before = persisted_lark_path(root.path());
+    std::fs::remove_file(previous).unwrap();
+    let binary = private_cli(root.path());
+    send(&worker, Job::ProbeCli(CliTool::Lark));
+    let events = until(&worker, |e| matches!(e, Event::Error(_)));
+    barrier.wait();
+    until(&worker, |e| matches!(e, Event::ConnectionReport { .. }));
+    assert!(events.iter().any(|e| matches!(e, Event::FormError { field: "lark-cli", message } if message.contains("Connection in progress"))));
+    assert_eq!(persisted_lark_path(root.path()), before);
+    assert_eq!(backend.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.mutations.load(Ordering::SeqCst), 1);
+    assert!(binary.exists());
 }
 
 #[test]
