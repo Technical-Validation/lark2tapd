@@ -22,6 +22,7 @@ fn request_diagnostic(message: &str) -> Option<RequestDiagnostic> {
         "network" => "network",
         "validation" | "config" | "confirmation" => "validation",
         "api" => "api",
+        "rate_limit" => "rate_limit",
         "internal" | "unknown" => "unknown",
         _ => return None,
     };
@@ -38,6 +39,9 @@ fn request_diagnostic(message: &str) -> Option<RequestDiagnostic> {
         } else {
             return None;
         }
+    }
+    if diagnostic.code == Some(99991400) {
+        diagnostic.category = "rate_limit";
     }
     Some(diagnostic)
 }
@@ -250,10 +254,17 @@ fn refresh_text(id: u64, event: lark2tapd_bridge::RefreshEvent) -> String {
         RefreshOutcome::Started => "started",
         RefreshOutcome::Progress => "progress",
         RefreshOutcome::Finished => "finished",
+        RefreshOutcome::RateLimited { .. } => "rate_limit_wait",
         RefreshOutcome::Failed(kind) => kind.as_str(),
     };
+    let retry = match event.outcome {
+        RefreshOutcome::RateLimited { attempt, wait_ms } => {
+            format!(" retry={attempt} wait_ms={wait_ms}")
+        }
+        _ => String::new(),
+    };
     format!(
-        "id={id} phase={} event={outcome} page={} completed={} scheduled={} detail={} elapsed_ms={} remaining_ms={}",
+        "id={id} phase={} event={outcome} page={} completed={} scheduled={} detail={} elapsed_ms={} remaining_ms={}{retry}",
         event.phase.as_str(),
         event.page,
         event.completed,
@@ -266,6 +277,11 @@ fn refresh_text(id: u64, event: lark2tapd_bridge::RefreshEvent) -> String {
 pub fn refresh_progress(id: u64, event: lark2tapd_bridge::RefreshEvent) {
     let level = if matches!(event.outcome, lark2tapd_bridge::RefreshOutcome::Failed(_)) {
         "ERROR"
+    } else if matches!(
+        event.outcome,
+        lark2tapd_bridge::RefreshOutcome::RateLimited { .. }
+    ) {
+        "WARN"
     } else {
         "INFO"
     };
@@ -414,13 +430,52 @@ mod tests {
         }
     }
     #[test]
+    fn refresh_trace_reports_rate_limit_wait_without_payloads() {
+        let line = refresh_text(
+            9,
+            lark2tapd_bridge::RefreshEvent {
+                phase: lark2tapd_bridge::RefreshPhase::TaskDetails,
+                outcome: lark2tapd_bridge::RefreshOutcome::RateLimited {
+                    attempt: 2,
+                    wait_ms: 2000,
+                },
+                page: 3,
+                completed: 90,
+                scheduled: 110,
+                detail_index: Some(5),
+                elapsed_ms: 20000,
+                remaining_ms: 100000,
+            },
+        );
+        assert!(line.contains("id=9 phase=lark_task_details event=rate_limit_wait"));
+        assert!(line.contains("detail=5"));
+        assert!(line.contains("retry=2 wait_ms=2000"));
+    }
+    #[test]
+    fn lark_rate_limit_code_has_actionable_category() {
+        assert_eq!(
+            category("CLI request failed (api, exit 1, API code 99991400); inspect API code"),
+            "rate_limit"
+        );
+        assert_eq!(
+            category(
+                "CLI request failed (rate_limit, exit 1, API code 99991400); wait before retrying"
+            ),
+            "rate_limit"
+        );
+        assert_eq!(
+            category("CLI request failed (api, exit 1, API code 99991672); token expired"),
+            "api"
+        );
+    }
+    #[test]
     fn request_logs_include_only_validated_codes() {
         let line = failure_text(
-            "CLI request failed (api, exit 8, API code 99991400); token=private-token; body=private-task",
+            "CLI request failed (api, exit 8, API code 42); token=private-token; body=private-task",
         );
         assert!(line.contains("category=api"));
         assert!(line.contains("exit_code=8"));
-        assert!(line.contains("api_code=99991400"));
+        assert!(line.contains("api_code=42"));
         assert!(!line.contains("private"));
         for error in [
             "CLI request failed (api, exit private-token, API code private-task)",

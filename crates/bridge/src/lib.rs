@@ -6,6 +6,7 @@ mod diagnostics;
 pub mod installer;
 mod media;
 mod process;
+mod read_pacing;
 mod refresh;
 use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Local, TimeZone, Utc};

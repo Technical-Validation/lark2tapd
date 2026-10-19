@@ -3,6 +3,219 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
+fn cancelling_during_rate_limit_cooldown_stops_without_retrying() {
+    let (dir, g) = oauth_gateway(
+        r#"
+if a[:2]==['task','+get-related-tasks']:
+ print(json.dumps({'ok':True,'data':{'items':[{'guid':'g0','creator':{'id':'self'}}],'has_more':False}}))
+else:
+ with open(__file__+'.attempts','a') as f: f.write('attempt\n')
+ print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_seconds':10}}));sys.exit(1)
+"#,
+    );
+    let cancelled = AtomicBool::new(false);
+    let mut saw_cooldown = false;
+    let now = Instant::now();
+    let error = crate::refresh::read(
+        &g,
+        now + Duration::from_secs(30),
+        &cancelled,
+        false,
+        &mut |e| {
+            if matches!(e.outcome, RefreshOutcome::RateLimited { .. }) {
+                saw_cooldown = true;
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(saw_cooldown && error.contains("cancelled"), "{error}");
+    assert!(now.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.attempts")).unwrap(),
+        "attempt\n"
+    );
+}
+
+#[test]
+fn other_api_errors_are_not_retried_even_when_marked_retryable() {
+    let (dir, g) = oauth_gateway(
+        r#"
+with open(__file__+'.attempts','a') as f: f.write('attempt\n')
+print(json.dumps({'ok':False,'error':{'type':'authorization','code':99991672,'retryable':True,'retry_after_seconds':1,'message':'99991400'}}));sys.exit(1)
+"#,
+    );
+    assert!(
+        g.fetch_tasks()
+            .unwrap_err()
+            .to_string()
+            .contains("99991672")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.attempts")).unwrap(),
+        "attempt\n"
+    );
+}
+
+#[test]
+fn tapd_writes_are_never_retried_by_read_rate_limiting() {
+    let (dir, g) = gateway(
+        r#"
+assert a[:2]==['task','add']
+with open(__file__+'.attempts','a') as f: f.write('attempt\n')
+print(json.dumps({'status':0,'error':{'type':'api','code':99991400,'retry_after_seconds':1}}));sys.exit(1)
+"#,
+    );
+    assert!(g.create_target(&draft(), &source()).is_err());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.attempts")).unwrap(),
+        "attempt\n"
+    );
+}
+
+#[test]
+fn rate_limited_detail_recovers_without_restarting_successful_reads() {
+    let (dir, g) = oauth_gateway(
+        r#"
+import time
+if a[:2]==['task','+get-related-tasks']:
+ with open(__file__+'.pages','a') as f: f.write('page\n')
+ print(json.dumps({'ok':True,'data':{'items':[{'guid':g,'creator':{'id':'self'}} for g in ['g0','g1']],'has_more':False}}))
+else:
+ p=json.load(sys.stdin);guid=p['task_guid'];path=__file__+'.'+guid
+ previous=open(path).readlines() if os.path.exists(path) else []
+ with open(path,'a') as f: f.write(str(time.time())+'\n')
+ if guid=='g0' and not previous:
+  print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_seconds':2,'message':'private-secret'}}));sys.exit(1)
+ print(json.dumps({'ok':True,'data':{'task':{'guid':guid,'summary':'private-title','creator':{'id':'self'}}}}))
+"#,
+    );
+    let mut events = Vec::new();
+    let (_, tasks) = crate::refresh::read(
+        &g,
+        Instant::now() + Duration::from_secs(10),
+        &AtomicBool::new(false),
+        false,
+        &mut |e| events.push(e),
+    )
+    .unwrap();
+    assert_eq!(
+        tasks.iter().map(|t| t.guid.as_str()).collect::<Vec<_>>(),
+        ["g0", "g1"]
+    );
+    let attempts: Vec<f64> = fs::read_to_string(dir.path().join("fake.g0"))
+        .unwrap()
+        .lines()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[1] - attempts[0] >= 2.0, "respect server cooldown");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.g1"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.pages")).unwrap(),
+        "page\n"
+    );
+    assert!(format!("{events:?}").contains("RateLimited"));
+    assert!(!format!("{events:?}").contains("private"));
+}
+
+#[test]
+fn rate_limited_page_retries_are_bounded_and_never_return_partial_tasks() {
+    let (dir, g) = oauth_gateway(
+        r#"
+assert a[:2]==['task','+get-related-tasks']
+with open(__file__+'.attempts','a') as f: f.write('attempt\n')
+print(json.dumps({'ok':False,'error':{'type':'api','code':99991400}}))
+"#,
+    );
+    let mut events = Vec::new();
+    let error = crate::refresh::read(
+        &g,
+        Instant::now() + Duration::from_secs(20),
+        &AtomicBool::new(false),
+        false,
+        &mut |e| events.push(e),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("99991400") && error.contains("Cached tasks unchanged"));
+    let waits = events
+        .iter()
+        .filter_map(|e| match e.outcome {
+            RefreshOutcome::RateLimited { attempt, wait_ms } => Some((attempt, wait_ms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(waits, [(1, 1000), (2, 2000), (3, 4000)]);
+    assert_eq!(
+        events.last().unwrap().outcome,
+        RefreshOutcome::Failed(RefreshFailure::RateLimited)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        4,
+        "initial attempt and at most three retries"
+    );
+}
+
+#[test]
+fn rate_limit_wait_respects_refresh_budget() {
+    let (dir, g) = oauth_gateway(
+        r#"
+with open(__file__+'.attempts','a') as f: f.write('attempt\n')
+print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_seconds':120}}));sys.exit(1)
+"#,
+    );
+    let now = Instant::now();
+    let error = g
+        .fetch_tasks_until(now + Duration::from_secs(2))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refresh_budget_timeout"), "{error}");
+    assert!(now.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.attempts")).unwrap(),
+        "attempt\n"
+    );
+}
+
+#[test]
+fn detail_starts_are_paced_across_page_boundaries() {
+    let (dir, g) = oauth_gateway(
+        r#"
+import time
+if a[:2]==['task','+get-related-tasks']:
+ page=1 if '--page-token' not in a else 2
+ print(json.dumps({'ok':True,'data':{'items':[{'guid':'g'+str(i),'creator':{'id':'self'}} for i in range((page-1)*4,page*4)],'has_more':page==1,'page_token':'next'}}))
+else:
+ p=json.load(sys.stdin)
+ with open(__file__+'.starts','a') as f: f.write(str(time.time())+'\n')
+ print(json.dumps({'ok':True,'data':{'task':{'guid':p['task_guid'],'summary':'title','creator':{'id':'self'}}}}))
+"#,
+    );
+    assert_eq!(g.fetch_tasks().unwrap().len(), 8);
+    let mut times: Vec<f64> = fs::read_to_string(dir.path().join("fake.starts"))
+        .unwrap()
+        .lines()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    times.sort_by(f64::total_cmp);
+    assert_eq!(times.len(), 8);
+    // 进程启动有调度抖动；仍必须消除同页及跨页的四连发。
+    assert!(times.windows(2).all(|w| w[1] - w[0] >= 0.08), "{times:?}");
+}
+
+#[test]
 fn account_refresh_reports_stages_and_reuses_verified_identity() {
     let (dir, mut g) = gateway(
         r#"

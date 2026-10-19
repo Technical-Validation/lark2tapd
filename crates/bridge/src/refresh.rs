@@ -26,6 +26,7 @@ impl RefreshPhase {
 pub enum RefreshFailure {
     RequestTimeout,
     BudgetExceeded,
+    RateLimited,
     Cancelled,
     Other,
 }
@@ -34,6 +35,7 @@ impl RefreshFailure {
         match self {
             Self::RequestTimeout => "request_timeout",
             Self::BudgetExceeded => "refresh_budget_timeout",
+            Self::RateLimited => "rate_limited",
             Self::Cancelled => "cancelled",
             Self::Other => "request_failed",
         }
@@ -44,6 +46,7 @@ pub enum RefreshOutcome {
     Started,
     Progress,
     Finished,
+    RateLimited { attempt: u32, wait_ms: u64 },
     Failed(RefreshFailure),
 }
 #[derive(Clone, Copy, Debug)]
@@ -123,6 +126,11 @@ impl Trace<'_> {
             RefreshFailure::RequestTimeout
         } else if error.is::<process::Cancelled>() {
             RefreshFailure::Cancelled
+        } else if error
+            .downcast_ref::<diagnostics::ApiFailure>()
+            .is_some_and(|e| e.code == Some(99991400))
+        {
+            RefreshFailure::RateLimited
         } else {
             RefreshFailure::Other
         };
@@ -130,10 +138,10 @@ impl Trace<'_> {
         let reason = match kind {
             RefreshFailure::RequestTimeout => "one CLI request exceeded its time limit".to_owned(),
             RefreshFailure::BudgetExceeded => {
-                "the shared refresh time budget was exhausted".to_owned()
+                "the shared refresh time budget was exhausted or cannot fit the required rate-limit cooldown".to_owned()
             }
             RefreshFailure::Cancelled => "the refresh was cancelled".to_owned(),
-            RefreshFailure::Other => error.to_string(),
+            RefreshFailure::Other | RefreshFailure::RateLimited => error.to_string(),
         };
         anyhow::anyhow!(
             "Task refresh {} at {} (page={}, detail={}, completed={}, scheduled={}, elapsed_ms={}): {}. Cached tasks unchanged",
@@ -147,11 +155,15 @@ impl Trace<'_> {
             reason
         )
     }
-    fn call<T>(&mut self, phase: RefreshPhase, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    fn call<T>(
+        &mut self,
+        phase: RefreshPhase,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         self.emit(phase, RefreshOutcome::Started, None);
         let result = self
             .checkpoint()
-            .and_then(|_| operation())
+            .and_then(|_| operation(self))
             .and_then(|value| {
                 self.checkpoint()?;
                 Ok(value)
@@ -202,7 +214,7 @@ pub(super) fn read(
         completed: 0,
         scheduled: 0,
     };
-    let (user, identity) = trace.call(RefreshPhase::LarkIdentity, || {
+    let (user, identity) = trace.call(RefreshPhase::LarkIdentity, |_| {
         let status = gateway.lark_identity_until_cancellable(deadline, cancelled)?;
         ensure!(
             status.get("verified").and_then(Value::as_bool) == Some(true)
@@ -223,7 +235,7 @@ pub(super) fn read(
         Ok((user, identity))
     })?;
     let namespace = if let Some((brand, app, account_user)) = identity {
-        Some(trace.call(RefreshPhase::TapdIdentity, || {
+        Some(trace.call(RefreshPhase::TapdIdentity, |_| {
             let result = gateway.tapd_until("user", "info", Vec::new(), deadline, cancelled)?;
             let tapd_user = required(&result, "id")?;
             valid_id(&tapd_user)?;
@@ -237,6 +249,8 @@ pub(super) fn read(
     } else {
         None
     };
+    // 跨分页共享速率与冷却，避免每页重置后突发请求。
+    let pacer = read_pacing::ReadPacer::new();
     let mut tasks = Vec::new();
     let mut page = String::new();
     let mut pages = HashSet::new();
@@ -244,8 +258,22 @@ pub(super) fn read(
     let mut count = 0;
     for page_index in 0..40 {
         trace.page = page_index + 1;
-        let (data, jobs) = trace.call(RefreshPhase::ListPage, || {
-            let data = gateway.related_until_cancellable(&page, deadline, cancelled)?;
+        let (data, jobs) = trace.call(RefreshPhase::ListPage, |trace| {
+            let data = pacer.read(
+                deadline,
+                cancelled,
+                || gateway.related_until_cancellable(&page, deadline, cancelled),
+                |attempt, delay| {
+                    trace.emit(
+                        RefreshPhase::ListPage,
+                        RefreshOutcome::RateLimited {
+                            attempt,
+                            wait_ms: delay.as_millis() as u64,
+                        },
+                        None,
+                    )
+                },
+            )?;
             let items = data["items"]
                 .as_array()
                 .expect("validated related task list");
@@ -268,7 +296,7 @@ pub(super) fn read(
             Ok((data, jobs))
         })?;
         trace.scheduled += jobs.len();
-        let details = read_details(gateway, &jobs, &mut trace)?;
+        let details = read_details(gateway, &jobs, &pacer, &mut trace)?;
         // 列表与详情之间关系可能改变；仅接受详情仍证明属于已验证主体的任务。
         tasks.extend(details.into_iter().filter(|task| task.is_related_to(&user)));
         if data["has_more"] == false {
@@ -288,9 +316,23 @@ pub(super) fn read(
     unreachable!("last page rejects continuation")
 }
 
+enum DetailEvent {
+    Retry {
+        index: usize,
+        attempt: u32,
+        delay: Duration,
+    },
+    Done {
+        index: usize,
+        finished_at: Instant,
+        result: Result<Box<SourceTask>>,
+    },
+}
+
 fn read_details(
     gateway: &CliGateway,
     jobs: &[String],
+    pacer: &read_pacing::ReadPacer,
     trace: &mut Trace<'_>,
 ) -> Result<Vec<SourceTask>> {
     trace.emit(RefreshPhase::TaskDetails, RefreshOutcome::Started, None);
@@ -316,11 +358,28 @@ fn read_details(
                     if index >= jobs.len() {
                         break;
                     }
-                    let result =
-                        gateway.source_until_cancellable(&jobs[index], deadline, cancelled);
+                    let result = pacer.read(
+                        deadline,
+                        cancelled,
+                        || gateway.source_until_cancellable(&jobs[index], deadline, cancelled),
+                        |attempt, delay| {
+                            let _ = send.send(DetailEvent::Retry {
+                                index,
+                                attempt,
+                                delay,
+                            });
+                        },
+                    );
                     let failed = result.is_err();
                     // 先发送原始失败，随后取消兄弟进程，防止取消错误掩盖真正的超时/权限错误。
-                    if send.send((index, Instant::now(), result)).is_err() {
+                    if send
+                        .send(DetailEvent::Done {
+                            index,
+                            finished_at: Instant::now(),
+                            result: result.map(Box::new),
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                     if failed {
@@ -331,10 +390,34 @@ fn read_details(
             });
         }
         drop(send);
-        for (index, finished_at, result) in recv {
+        for event in recv {
+            let (index, finished_at, result) = match event {
+                DetailEvent::Retry {
+                    index,
+                    attempt,
+                    delay,
+                } => {
+                    if failure.is_none() {
+                        trace.emit(
+                            RefreshPhase::TaskDetails,
+                            RefreshOutcome::RateLimited {
+                                attempt,
+                                wait_ms: delay.as_millis() as u64,
+                            },
+                            Some(index + 1),
+                        );
+                    }
+                    continue;
+                }
+                DetailEvent::Done {
+                    index,
+                    finished_at,
+                    result,
+                } => (index, finished_at, result),
+            };
             match result {
                 Ok(task) => {
-                    results[index] = Some(task);
+                    results[index] = Some(*task);
                     trace.completed += 1;
                     if failure.is_none() && trace.completed.is_multiple_of(10) {
                         trace.emit(RefreshPhase::TaskDetails, RefreshOutcome::Progress, None);
@@ -420,7 +503,7 @@ mod tests {
                     scheduled: 15,
                 };
                 trace
-                    .call::<()>(RefreshPhase::ListPage, || Err(process::CallTimeout.into()))
+                    .call::<()>(RefreshPhase::ListPage, |_| Err(process::CallTimeout.into()))
                     .unwrap_err()
             };
             let message = error.to_string();
