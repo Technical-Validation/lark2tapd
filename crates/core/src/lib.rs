@@ -553,6 +553,23 @@ impl Engine {
         Ok(())
     }
     pub async fn save_settings(&mut self, settings: Settings) -> Result<()> {
+        Self::validate_settings(&settings)?;
+        let mut state = self.state.clone();
+        state.snapshot.settings = settings;
+        self.persist(state).await
+    }
+
+    /// 应用已由全局 preferences 提交的权威配置，仅更新运行时副本，不写 profile 库。
+    /// 与 save_settings 使用相同校验；不可代替业务数据或日志的持久化。
+    /// 后续业务 persist 可携带此副本落盘，但启动/切换 profile 必须重新应用全局配置。
+    /// 凭据已被外部存储修改时，也用于立即应用身份失效；不能因偏好保存失败恢复旧授权。
+    pub fn apply_committed_settings(&mut self, settings: Settings) -> Result<()> {
+        Self::validate_settings(&settings)?;
+        self.state.snapshot.settings = settings;
+        Ok(())
+    }
+
+    fn validate_settings(settings: &Settings) -> Result<()> {
         ensure!(
             ["zh-CN", "en"].contains(&settings.language.as_str()),
             "Unsupported language"
@@ -581,9 +598,7 @@ impl Engine {
                 ensure!(seen.insert(prefix), "Duplicate title prefix");
             }
         }
-        let mut state = self.state.clone();
-        state.snapshot.settings = settings;
-        self.persist(state).await
+        Ok(())
     }
     /// 兼容旧调用方；已有过期草稿必须显式丢弃或携带来源重新保存。
     pub async fn save_draft(&mut self, guid: &str, draft: &Draft) -> Result<()> {

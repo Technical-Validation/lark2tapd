@@ -20,7 +20,7 @@ use lark2tapd_core::{
     TargetTask,
 };
 pub use media::{MAX_INLINE_IMAGE_BYTES, validate_attachment_for_upload};
-pub use process::proxy_environment_present;
+pub use process::{proxy_environment_present, with_process_cancellation};
 pub use refresh::{RefreshEvent, RefreshFailure, RefreshOutcome, RefreshPhase};
 use serde_json::{Value, json};
 use std::{

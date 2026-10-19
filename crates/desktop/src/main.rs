@@ -5,6 +5,7 @@ compile_error!("Lark → TAPD currently supports macOS only.");
 mod console;
 mod i18n;
 mod native;
+mod shutdown_exit;
 mod startup;
 mod ui;
 mod worker;
@@ -43,6 +44,14 @@ fn main() {
             .join("Library/Application Support/Lark2Tapd")
     });
     let worker = worker::start(root, mode);
+    let shutdown = worker.jobs.clone();
+    if let Err(error) = shutdown_exit::install(shutdown.clone()) {
+        console::event("app.lifecycle", "exit_barrier_registration_failed");
+        console::failure("app.lifecycle", &error.to_string());
+        let _ = shutdown.shutdown().recv_blocking();
+        return;
+    }
+    let quit_worker = shutdown.clone();
     let app = application()
         .with_assets(assets::Assets)
         .with_quit_mode(QuitMode::Explicit);
@@ -50,12 +59,18 @@ fn main() {
     console::event("app.lifecycle", "event_loop_enter");
     app.run(move |cx| {
         gpui_kit::init(cx);
-        cx.on_app_quit(|_| {
+        cx.on_app_quit(move |_| {
             console::event("app.lifecycle", "quitting");
-            async {}
+            let done = quit_worker.shutdown();
+            async move {
+                let _ = done.recv().await;
+            }
         })
         .detach();
         ui::start(worker, mode, cx);
     });
     console::event("app.lifecycle", "event_loop_returned");
+    // GPUI 的退出等待有固定超时；事件循环结束后仍不能遗留原生授权子进程。
+    let _ = shutdown.shutdown().recv_blocking();
+    console::event("app.lifecycle", "worker_reaped");
 }

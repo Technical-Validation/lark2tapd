@@ -280,17 +280,29 @@ impl Gateway for Connection {
     }
 }
 
-// UI 持有唯一强发送端；后台任务只保留弱引用，最后一个窗口关闭即可释放锁。
+// 前台与退出屏障持有强发送端；后台任务只保留弱引用，不妨碍 sender drop 退出。
 #[derive(Clone)]
-pub struct WorkerSender(Arc<mpsc::Sender<Envelope>>);
+pub struct WorkerSender(
+    Arc<mpsc::Sender<Envelope>>,
+    Arc<AtomicBool>,
+    async_channel::Receiver<()>,
+);
 impl WorkerSender {
     pub fn send(&self, request: Request) -> Result<()> {
+        anyhow::ensure!(!self.1.load(Ordering::SeqCst), "Worker stopped");
         self.0
             .send(Envelope::Request(request))
             .map_err(|_| anyhow::anyhow!("Worker stopped"))
     }
+    // 立即关闭业务闸门；ack 以关闭通道广播，多个等待者不会争抢单个消息。
+    pub fn shutdown(&self) -> async_channel::Receiver<()> {
+        self.1.store(true, Ordering::SeqCst);
+        let _ = self.0.send(Envelope::Shutdown);
+        self.2.clone()
+    }
 }
 enum Envelope {
+    Shutdown,
     Authorization {
         generation: u64,
         verification_url: String,
@@ -583,7 +595,42 @@ struct ReadTask {
     origin: String,
     target_identity: Option<(String, TargetTask)>,
 }
-fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
+// 与 pending 的 UI 去重生命周期独立：旧代取消后仍须持有 join handle。
+#[derive(Default)]
+struct ReadThreads(Vec<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>);
+impl ReadThreads {
+    fn track(&mut self, cancelled: Arc<AtomicBool>, handle: std::thread::JoinHandle<()>) {
+        let mut i = 0;
+        while i < self.0.len() {
+            if self.0[i].1.is_finished() {
+                let (_, handle) = self.0.swap_remove(i);
+                let _ = handle.join();
+            } else {
+                i += 1;
+            }
+        }
+        self.0.push((cancelled, handle));
+    }
+}
+impl Drop for ReadThreads {
+    fn drop(&mut self) {
+        for (cancelled, _) in &self.0 {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+        for (_, handle) in self.0.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_cancellable_thread(
+    cancelled: Arc<AtomicBool>,
+    action: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || lark2tapd_bridge::with_process_cancellation(cancelled, action))
+}
+
+fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) -> std::thread::JoinHandle<()> {
     let ReadTask {
         cancelled,
         key,
@@ -599,7 +646,8 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
         target_identity,
     } = task;
     let attachment_origin = attachment_origin(&job, &origin);
-    std::thread::spawn(move || {
+    let task_cancelled = cancelled.clone();
+    spawn_cancellable_thread(task_cancelled, move || {
         let result = (|| -> Result<(String, ReadData)> {
             let refresh_id = match &job {
                 Job::Refresh => Some(crate::console::refresh_start("manual")),
@@ -609,8 +657,9 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
             if let Some(id) = refresh_id
                 && !mode.is_mock()
             {
+                probe_account_cli(backend.as_ref(), &settings)?;
                 crate::console::refresh_boundary(id, "credential_load", "started");
-                let credentials = match load_credentials() {
+                let credentials = match backend.load() {
                     Ok(credentials) => credentials,
                     Err(error) => {
                         crate::console::refresh_boundary(id, "credential_load", "failed");
@@ -719,6 +768,7 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
             let (profile, gateway) = connection(
                 mode,
                 settings,
+                backend.as_ref(),
                 #[cfg(test)]
                 mock,
             )?;
@@ -758,7 +808,7 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) {
                 attachment_origin,
             }));
         }
-    });
+    })
 }
 
 // 授权等待时暂停定时器而非重复拒绝过期刷新；请求通道仍即时响应用户操作。
@@ -881,9 +931,18 @@ fn failed_report(error: anyhow::Error) -> ConnectionReport {
         failure: Some(error.to_string()),
     }
 }
+// 账号命名空间会验证两端身份；每个业务请求只在入口检查一次，不在详情循环中检查。
+// 独立连接测试走上方的单服务 probe，不要求另一端已经安装。
+fn probe_account_cli(backend: &dyn ConnectionBackend, settings: &Settings) -> Result<()> {
+    backend.probe(CliTool::Lark, settings)?;
+    backend.probe(CliTool::Tapd, settings)?;
+    Ok(())
+}
+
 fn connection(
     mode: Mode,
     settings: Settings,
+    backend: &dyn ConnectionBackend,
     #[cfg(test)] mock: MockGateway,
 ) -> Result<(String, Connection)> {
     #[cfg(test)]
@@ -891,7 +950,8 @@ fn connection(
         return Ok(("mock".into(), Connection::Mock(mock)));
     }
     let _ = mode;
-    let cli = CliGateway::new(settings, load_credentials()?)?;
+    probe_account_cli(backend, &settings)?;
+    let cli = CliGateway::new(settings, backend.load()?)?;
     Ok((cli.account_namespace()?, Connection::Live(Box::new(cli))))
 }
 // 授权等待不占用串行 actor；进度与最终报告都必须通过同一代数检查。
@@ -907,8 +967,9 @@ fn spawn_connect(
     generation: u64,
     cancelled: Arc<AtomicBool>,
     profile_writes: Arc<Mutex<()>>,
-) {
-    std::thread::spawn(move || {
+) -> std::thread::JoinHandle<()> {
+    let task_cancelled = cancelled.clone();
+    spawn_cancellable_thread(task_cancelled, move || {
         let mut binding = None;
         let report = (|| {
             ensure_auth_active(&cancelled)?;
@@ -970,7 +1031,7 @@ fn spawn_connect(
                 )),
             }));
         }
-    });
+    })
 }
 
 fn emit_connection_status(
@@ -992,6 +1053,19 @@ fn emit_connection_status(
     })?;
     Ok(())
 }
+// 全局 preferences 是唯一配置提交点；成功后仅同步 profile 和 actor 的运行时副本。
+async fn commit_settings(
+    preferences: &mut Engine,
+    engine: &mut Engine,
+    settings: &mut Settings,
+    next: Settings,
+) -> Result<()> {
+    preferences.save_settings(next.clone()).await?;
+    engine.apply_committed_settings(next.clone())?;
+    *settings = next;
+    Ok(())
+}
+
 pub fn start(root: PathBuf, mode: Mode) -> WorkerHandle {
     start_with_backend(root, mode, Arc::new(SystemConnectionBackend))
 }
@@ -1001,7 +1075,9 @@ fn start_with_backend(
     backend: Arc<dyn ConnectionBackend>,
 ) -> WorkerHandle {
     let (sender, input) = mpsc::channel();
-    let jobs = WorkerSender(Arc::new(sender));
+    let (shutdown_ack, shutdown_done) = async_channel::unbounded();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let jobs = WorkerSender(Arc::new(sender), stopping.clone(), shutdown_done);
     let weak = Arc::downgrade(&jobs.0);
     let (output, events) = async_channel::unbounded();
     // 提前规范化共享根路径，UI 与 actor 必须解析到同一个附件目录。
@@ -1047,7 +1123,7 @@ fn start_with_backend(
                 if preferences.snapshot().settings != settings {
                     preferences.save_settings(settings.clone()).await?;
                 }
-                engine.save_settings(settings.clone()).await?;
+                engine.apply_committed_settings(settings.clone())?;
                 #[cfg(test)]
                 let mock = MockGateway::from_snapshot(engine.snapshot());
                 let mut namespace = if mode.is_mock() {
@@ -1058,6 +1134,8 @@ fn start_with_backend(
                 let profile_writes = Arc::new(Mutex::new(()));
                 let mut generation = 0;
                 let mut pending = BTreeMap::<String, PendingRead>::new();
+                // 在 lock 的作用域内析构；错误退出和 sender drop 同样取消并回收。
+                let mut reads = ReadThreads::default();
                 let mut checked = Vec::<TapdWorkspace>::new();
                 let mut pending_install = None;
                 let mut next_check = Instant::now() + interval(&settings);
@@ -1089,6 +1167,9 @@ fn start_with_backend(
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    if stopping.load(Ordering::SeqCst) || matches!(envelope, Envelope::Shutdown) {
+                        break;
+                    }
                     let preference_operation = matches!(&envelope, Envelope::Request(Request { job: Job::SetPreference(_), .. }));
                     let setting_operation = match &envelope {
                         Envelope::Request(Request {sequence,job:Job::SetPreference(p),..}) => Some((*sequence,setting_field(p))),
@@ -1112,6 +1193,7 @@ fn start_with_backend(
                     let mut error_field = "submit";
                     let result: Result<()> = async {
                         let Request { job, profile, .. } = match envelope {
+                            Envelope::Shutdown => unreachable!(),
                             Envelope::Authorization { generation: current, verification_url, expires_in } => {
                                 if current == generation && pending.get("lark-connection").is_some_and(|read| read.generation == current) {
                                     output.send(Event::AuthorizationRequired { verification_url, expires_in }).await?;
@@ -1140,14 +1222,15 @@ fn start_with_backend(
                                 if !matches!(data, ReadData::CliProbe { .. } | ReadData::ConnectionReport { .. })
                                     && current != namespace
                                 {
-                                    engine = Engine::open(
+                                    let mut next_engine = Engine::open(
                                         &root.join(profile_file(mode, Some(&current))?),
                                     )
                                     .await?;
+                                    let mut next = settings.clone();
+                                    next.last_profile = Some(current.clone());
+                                    commit_settings(&mut preferences, &mut next_engine, &mut settings, next).await?;
+                                    engine = next_engine;
                                     namespace = current;
-                                    settings.last_profile = Some(namespace.clone());
-                                    engine.save_settings(settings.clone()).await?;
-                                    preferences.save_settings(settings.clone()).await?;
                                     generation += 1;
                                     checked.clear();
                                     for event in cancel_stale_reads(&mut pending,generation) { output.send(event).await?; }
@@ -1159,20 +1242,19 @@ fn start_with_backend(
                                     }
                                     ReadData::ConnectionReport { tool, report, authorization, binding } => {
                                         if *authorization { output.send(Event::AuthorizationFinished).await?; }
-                                        let previous = settings.connection_verifications.clone();
+                                        let mut next = settings.clone();
                                         let current = backend.load().ok().map(|c| {
-                                            prune_verifications(&mut settings, &c);
-                                            lark2tapd_bridge::verification_binding(*tool, &settings, &c)
+                                            prune_verifications(&mut next, &c);
+                                            lark2tapd_bridge::verification_binding(*tool, &next, &c)
                                         });
                                         let saved_configuration = binding.is_some() && *binding == current;
                                         if saved_configuration && report.connected {
-                                            settings.connection_verifications.insert(connection_key(*tool).into(), lark2tapd_core::VerificationReceipt {
+                                            next.connection_verifications.insert(connection_key(*tool).into(), lark2tapd_core::VerificationReceipt {
                                                 at: chrono::Utc::now().to_rfc3339(), binding: binding.clone().unwrap(),
                                             });
                                         }
-                                        if settings.connection_verifications != previous {
-                                            preferences.save_settings(settings.clone()).await?;
-                                            engine.save_settings(settings.clone()).await?;
+                                        if next.connection_verifications != settings.connection_verifications {
+                                            commit_settings(&mut preferences, &mut engine, &mut settings, next).await?;
                                         }
                                         output.send(Event::ConnectionReport { tool: *tool, report: report.clone(), saved_configuration }).await?;
                                         if let Some(failure) = &report.failure {
@@ -1216,9 +1298,7 @@ fn start_with_backend(
                                         !pending.keys().any(|key| key.ends_with("-connection")),
                                         "Connection in progress; finish authorization before changing the CLI path"
                                     );
-                                    preferences.save_settings(next.clone()).await?;
-                                    engine.save_settings(next.clone()).await?;
-                                    settings = next;
+                                    commit_settings(&mut preferences, &mut engine, &mut settings, next).await?;
                                     // 路径改变后，旧进程的完成结果不能合并进新配置。
                                     generation += 1;
                                     checked.clear();
@@ -1268,7 +1348,8 @@ fn start_with_backend(
                                 })
                                 .await?;
                             let cancelled=pending[&key].cancelled.clone();
-                            spawn_read(weak.clone(),ReadTask{cancelled,key,generation,job,mode,settings:settings.clone(),#[cfg(test)] mock:mock.clone(),backend:backend.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
+                            let handle = spawn_read(weak.clone(),ReadTask{cancelled:cancelled.clone(),key,generation,job,mode,settings:settings.clone(),#[cfg(test)] mock:mock.clone(),backend:backend.clone(),data_root:root.clone(),origin:namespace.clone(),target_identity});
+                            reads.track(cancelled, handle);
                             return Ok(());
                         }
                         if mode.is_mock()
@@ -1297,9 +1378,7 @@ fn start_with_backend(
                                 let mut next = settings.clone();
                                 patch(&mut next, p)?;
                                 if next.workspace_id != settings.workspace_id { next.connection_verifications.remove(connection_key(CliTool::Tapd)); }
-                                preferences.save_settings(next.clone()).await?;
-                                engine.save_settings(next.clone()).await?;
-                                settings = next;
+                                commit_settings(&mut preferences, &mut engine, &mut settings, next).await?;
                                 // 偏好不改变连接身份；不能取消窗口打开时已经发出的读取。
                                 message = "settings_saved";
                             }
@@ -1319,7 +1398,7 @@ fn start_with_backend(
                             }
                             Job::Install(tool) => {
                                 anyhow::ensure!(
-                                    pending_install.take() == Some(tool),
+                                    pending_install == Some(tool),
                                     "Review installation before confirming"
                                 );
                                 for read in pending.values() {
@@ -1328,27 +1407,30 @@ fn start_with_backend(
                                 let path = install_cli(tool, &root.join("tools"))?
                                     .to_string_lossy()
                                     .into_owned();
+                                let mut next = settings.clone();
                                 match tool {
-                                    CliTool::Lark => settings.lark_path = path,
-                                    CliTool::Tapd => settings.tapd_path = path,
+                                    CliTool::Lark => next.lark_path = path,
+                                    CliTool::Tapd => next.tapd_path = path,
                                 }
-                                settings.connection_verifications.remove(connection_key(tool));
-                                preferences.save_settings(settings.clone()).await?;
-                                engine.save_settings(settings.clone()).await?;
+                                next.connection_verifications.remove(connection_key(tool));
+                                commit_settings(&mut preferences, &mut engine, &mut settings, next).await?;
                                 generation += 1;
                                 checked.clear();
+                                pending_install = None;
                                 message="installed";
                             }
                             Job::LoadConnectionStatus => {
                                 if !mode.is_mock() && let Ok(c) = backend.load() {
-                                    prune_verifications(&mut settings, &c);
-                                    preferences.save_settings(settings.clone()).await?;
-                                    engine.save_settings(settings.clone()).await?;
+                                    let mut next = settings.clone();
+                                    prune_verifications(&mut next, &c);
+                                    commit_settings(&mut preferences, &mut engine, &mut settings, next).await?;
                                 }
                                 emit_connection_status(mode, backend.as_ref(), &output)?;
                             }
                             Job::SaveAndConnect { tool, .. } | Job::ClearCredentials(tool) => {
                                 let saving = matches!(&job, Job::SaveAndConnect { .. });
+                                // 先准备可用的断开库；失败时尚未改动凭据，不能给旧账号数据贴上空身份。
+                                let disconnected = Engine::open(&root.join("disconnected.db")).await?;
                                 // 请求旧授权停止；后台写入锁确保新原生操作等待旧进程退出。
                                 for read in pending.values() {
                                     read.cancelled.store(true, Ordering::SeqCst);
@@ -1368,19 +1450,21 @@ fn start_with_backend(
                                     }
                                     _ => unreachable!(),
                                 }
-                                // 凭证/路径变更使历史失效；飞书重新授权还可能切换同应用下的用户。
-                                if let Ok(c) = backend.load() { prune_verifications(&mut settings, &c); }
-                                if !saving || tool == CliTool::Lark { settings.connection_verifications.remove(connection_key(tool)); }
-                                // 保存成功即作废旧账户与在途读取，不能等待后续 OAuth 成功。
+                                // 凭据写入已发生，必须先单向作废旧身份；偏好落盘失败不能恢复旧代回执。
                                 output.send(Event::AuthorizationFinished).await?;
                                 namespace.clear();
-                                settings.last_profile = None;
                                 generation += 1;
                                 checked.clear();
                                 for event in cancel_stale_reads(&mut pending, generation) { output.send(event).await?; }
-                                engine = Engine::open(&root.join("disconnected.db")).await?;
-                                engine.save_settings(settings.clone()).await?;
-                                preferences.save_settings(settings.clone()).await?;
+                                let mut next = settings.clone();
+                                if let Ok(c) = backend.load() { prune_verifications(&mut next, &c); }
+                                if !saving || tool == CliTool::Lark { next.connection_verifications.remove(connection_key(tool)); }
+                                next.last_profile = None;
+                                engine = disconnected;
+                                // 普通偏好只在全局提交后生效；此处是已改变凭据后的必要 fail-closed 失效。
+                                engine.apply_committed_settings(next.clone())?;
+                                settings = next.clone();
+                                preferences.save_settings(next).await?;
                                 emit_connection_status(mode, backend.as_ref(), &output)?;
                                 output.send(Event::State { mode, snapshot: engine.snapshot().clone(), profile: namespace.clone(), message, new_count: 0 }).await?;
                                 if saving {
@@ -1389,7 +1473,9 @@ fn start_with_backend(
                                     output.send(Event::Activity { key: connection_key(tool).into(), active: true }).await?;
                                     // 本次保存的活动状态由后台完成或代数失效负责释放。
                                     activity = None;
-                                    spawn_connect(weak.clone(), backend.clone(), tool, settings.clone(), generation, pending[connection_key(tool)].cancelled.clone(), profile_writes.clone());
+                                    let cancelled = pending[connection_key(tool)].cancelled.clone();
+                                    let handle = spawn_connect(weak.clone(), backend.clone(), tool, settings.clone(), generation, cancelled.clone(), profile_writes.clone());
+                                    reads.track(cancelled, handle);
                                 }
 
                             }
@@ -1442,7 +1528,7 @@ fn start_with_backend(
                                     profile == namespace,
                                     "Account changed; reopen this task"
                                 );
-                                let (current, gateway) = connection(mode, settings.clone(), #[cfg(test)] mock.clone())?;
+                                let (current, gateway) = connection(mode, settings.clone(), backend.as_ref(), #[cfg(test)] mock.clone())?;
                                 anyhow::ensure!(current == namespace, "Account changed; refresh tasks first");
                                 match job {
                                     Job::AcceptTarget{guid,target}=>{
@@ -1540,6 +1626,8 @@ fn start_with_backend(
             crate::console::failure("worker", &error.to_string());
             let _ = output.send_blocking(Event::Error(error.to_string()));
         }
+        crate::console::event("worker", "shutdown_complete");
+        drop(shutdown_ack);
     });
     WorkerHandle {
         jobs,
@@ -1703,6 +1791,10 @@ fn rediscover_cli(settings: &mut Settings, tool: CliTool, tools: &std::path::Pat
         .remove(connection_key(tool));
     true
 }
+
+#[cfg(test)]
+#[path = "worker_settings_tests.rs"]
+mod settings_tests;
 
 #[cfg(test)]
 mod tests {

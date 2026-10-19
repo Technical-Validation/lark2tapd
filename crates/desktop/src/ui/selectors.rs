@@ -280,6 +280,7 @@ impl Workspace {
     }
     pub(super) fn load_prefix_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 切换项目或确认保存后重新开始；已有前缀只从持久化列表展示。
+        self.pending_prefix = None;
         self.new_prefix_open = false;
         self.prefix_options
             .update(cx, |s, cx| s.set_value("", window, cx));

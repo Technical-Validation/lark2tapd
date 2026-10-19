@@ -19,6 +19,7 @@ struct Backend {
     tested_tokens: Mutex<Vec<String>>,
     probed_paths: Mutex<Vec<String>>,
     fail_probe: bool,
+    native_probe: bool,
     fail_save: bool,
     fail_auth: bool,
     wait_for_auth: Option<Arc<std::sync::Barrier>>,
@@ -60,6 +61,13 @@ impl ConnectionBackend for Backend {
             CliTool::Lark => settings.lark_path.clone(),
             CliTool::Tapd => settings.tapd_path.clone(),
         });
+        if self.native_probe {
+            let path = match tool {
+                CliTool::Lark => &settings.lark_path,
+                CliTool::Tapd => &settings.tapd_path,
+            };
+            return probe_supported_cli(tool, std::path::Path::new(path));
+        }
         anyhow::ensure!(!self.fail_probe, "CLI is not executable");
         Ok("fake CLI 1.0.0".into())
     }
@@ -1071,6 +1079,411 @@ fn rediscovery_during_authorization_keeps_the_current_cli_and_login() {
     assert_eq!(backend.cancellations.load(Ordering::SeqCst), 0);
     assert_eq!(backend.mutations.load(Ordering::SeqCst), 1);
     assert!(binary.exists());
+}
+
+#[test]
+fn failed_install_retains_reviewed_plan_for_explicit_retry() {
+    let backend = Arc::new(Backend::default());
+    let (root, worker) = startup(Mode::Live, backend);
+    event(&worker);
+    send(&worker, Job::PlanInstall(CliTool::Lark));
+    until(&worker, |e| matches!(e, Event::InstallPlan(_)));
+    // 使安全目录检查直接失败，不调用下载器或安装命令。
+    std::fs::write(root.path().join("tools"), "not a directory").unwrap();
+    for _ in 0..2 {
+        send(&worker, Job::Install(CliTool::Lark));
+        let events = until(&worker, |e| matches!(e, Event::SettingResult { .. }));
+        assert!(events.iter().any(|e| matches!(e, Event::SettingResult { error: Some(message), .. } if message.contains("Installation directory"))), "retry lost reviewed plan");
+    }
+}
+
+// 子进程仅使用本模块内存后端，绝不启动真实 UI 或触碰 Keychain。
+#[test]
+fn exit_barrier_child() {
+    let Some(root) = std::env::var_os("LARK2TAPD_EXIT_TEST_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let backend = Arc::new(Backend {
+        native_probe: true,
+        ..Default::default()
+    });
+    let worker = start_with_backend(root.clone(), Mode::Live, backend);
+    until(&worker, |e| matches!(e, Event::ConnectionStatus { .. }));
+    crate::shutdown_exit::install(worker.jobs.clone()).unwrap();
+    send(&worker, Job::ProbeCli(CliTool::Lark));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("ready").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if std::env::var_os("LARK2TAPD_EXIT_TEST_RETURN").is_some() {
+        // 正常返回路径仍允许已显式请求退出；重复请求不可消耗掉唯一 ack。
+        worker.jobs.shutdown();
+        worker.jobs.shutdown();
+        return;
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn process_exit_and_normal_return_wait_for_cli_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+    for normal_return in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fake-lark-cli");
+        std::fs::write(&path, format!("#!/bin/sh\nprintf ready > '{}'\nsleep 1\nprintf token > '{}'\necho 'lark-cli version 1.0.96'\n", root.path().join("ready").display(), root.path().join("late-token").display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            Engine::open(&root.path().join("preferences-live.db"))
+                .await
+                .unwrap()
+                .save_settings(Settings {
+                    lark_path: path.display().to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        });
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "worker::connection_tests::exit_barrier_child",
+                "--nocapture",
+            ])
+            .env("LARK2TAPD_EXIT_TEST_ROOT", root.path());
+        if normal_return {
+            command.env("LARK2TAPD_EXIT_TEST_RETURN", "1");
+        } else {
+            command.env_remove("LARK2TAPD_EXIT_TEST_RETURN");
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("exit barrier deadlocked");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(status.success());
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !root.path().join("late-token").exists(),
+            "exit returned before CLI was cancelled and reaped"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join("app.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+    }
+}
+
+#[test]
+fn shutdown_cancels_probe_process_before_ack() {
+    use std::os::unix::fs::PermissionsExt;
+    let backend = Arc::new(Backend {
+        native_probe: true,
+        ..Default::default()
+    });
+    let (root, worker, path) = startup_with_configured_cli(backend);
+    event(&worker);
+    let ready = root.path().join("probe-ready");
+    let marker = root.path().join("late-write");
+    std::fs::write(&path, format!("#!/bin/sh\nprintf ready > '{}'\nsleep 1\nprintf token > '{}'\necho 'lark-cli version 1.0.96'\n", ready.display(), marker.display())).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    send(&worker, Job::ProbeCli(CliTool::Lark));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let done = worker.jobs.shutdown();
+    while !done.is_closed() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        !marker.exists(),
+        "shutdown allowed in-flight CLI to write after cancellation"
+    );
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("app.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+}
+
+#[test]
+fn shutdown_ack_waits_for_native_exit_and_rejects_new_writes() {
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let backend = Arc::new(Backend {
+        wait_for_auth: Some(barrier.clone()),
+        ..Default::default()
+    });
+    let (root, worker) = startup(Mode::Live, backend.clone());
+    event(&worker);
+    send(
+        &worker,
+        Job::SaveAndConnect {
+            tool: CliTool::Lark,
+            credentials: credentials(),
+        },
+    );
+    until(&worker, |e| {
+        matches!(e, Event::AuthorizationRequired { .. })
+    });
+    let done = worker.jobs.shutdown();
+    assert!(
+        worker
+            .jobs
+            .send(Request {
+                sequence: 0,
+                profile: String::new(),
+                job: Job::ClearCredentials(CliTool::Lark)
+            })
+            .is_err()
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("app.lock"))
+        .unwrap();
+    let held = lock.try_lock().is_err();
+    let early_ack = done.is_closed();
+    if !held {
+        lock.unlock().unwrap();
+    }
+    barrier.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done.is_closed() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        held && !early_ack,
+        "shutdown acknowledged before native task exited"
+    );
+    assert_eq!(backend.cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.mutations.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.clears.load(Ordering::SeqCst), 0);
+    lock.try_lock().unwrap();
+}
+
+#[test]
+fn tapd_check_does_not_probe_missing_lark_cli() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let tapd = root.path().join("tapd-cli");
+    std::fs::write(&tapd, "#!/bin/sh\ncase \"$1\" in --version) echo 1.8.1;; --help) echo 'Usage: tapd-cli [options] [command]';; *) exit 9;; esac\n").unwrap();
+    std::fs::set_permissions(&tapd, std::fs::Permissions::from_mode(0o700)).unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Engine::open(&root.path().join("preferences-live.db"))
+            .await
+            .unwrap()
+            .save_settings(Settings {
+                lark_path: root.path().join("missing-lark-cli").display().to_string(),
+                tapd_path: tapd.display().to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    });
+    let backend = Arc::new(Backend {
+        native_probe: true,
+        ..Default::default()
+    });
+    let worker = start_with_backend(root.path().into(), Mode::Live, backend.clone());
+    until(&worker, |e| matches!(e, Event::ConnectionStatus { .. }));
+    send(
+        &worker,
+        Job::TestConnection {
+            tool: CliTool::Tapd,
+            credentials: credentials(),
+        },
+    );
+    let events = finished(&worker, CliTool::Tapd);
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::ConnectionReport { report, .. } if report.failure.is_none())
+        )
+    );
+    assert_eq!(backend.checks.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *backend.probed_paths.lock().unwrap(),
+        [tapd.display().to_string()]
+    );
+    assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
+}
+
+// CLI 的业务命令能成功返回也不能绕过协议门禁，更不能先访问凭据。
+#[test]
+fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    for bad_tool in [CliTool::Lark, CliTool::Tapd] {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("business-called");
+        let mut settings = Settings {
+            last_profile: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        for tool in [CliTool::Lark, CliTool::Tapd] {
+            let path = root.path().join(format!("{tool:?}-cli"));
+            let version = if tool == bad_tool {
+                "99.0.0"
+            } else if tool == CliTool::Lark {
+                "1.0.96"
+            } else {
+                "1.15.0"
+            };
+            let version = if tool == CliTool::Lark {
+                format!("lark-cli version {version}")
+            } else {
+                version.to_string()
+            };
+            std::fs::write(&path, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\nif [ \"$1\" = --help ]; then echo 'Usage: tapd-cli [options] [command]'; exit 0; fi\nprintf called >> '{}'\nif [ \"$1\" = auth ]; then echo '{{\"appId\":\"injected-secret-app-id\",\"brand\":\"feishu\",\"identity\":\"user\",\"verified\":true,\"identities\":{{\"user\":{{\"openId\":\"user\"}}}}}}'; else echo '{{\"status\":1,\"data\":{{\"id\":\"1\"}}}}'; fi\n", marker.display())).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            match tool {
+                CliTool::Lark => settings.lark_path = path.display().to_string(),
+                CliTool::Tapd => settings.tapd_path = path.display().to_string(),
+            }
+        }
+        // 正对照：不经过应用门禁时，未知版本确实能成功执行身份业务命令。
+        let mut business_credentials = credentials();
+        business_credentials.lark_user_token.clear();
+        assert!(
+            CliGateway::new(settings.clone(), business_credentials)
+                .unwrap()
+                .account_namespace()
+                .is_ok()
+        );
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            Engine::open(&root.path().join("preferences-live.db"))
+                .await
+                .unwrap()
+                .save_settings(settings)
+                .await
+                .unwrap();
+        });
+        let backend = Arc::new(Backend {
+            native_probe: true,
+            credentials: Mutex::new(credentials()),
+            ..Default::default()
+        });
+        let worker = start_with_backend(root.path().into(), Mode::Live, backend.clone());
+        until(&worker, |e| matches!(e, Event::ConnectionStatus { .. }));
+        let loads = backend.loads.load(Ordering::SeqCst);
+        let source = SourceTask {
+            guid: "task".into(),
+            title: "title".into(),
+            description: String::new(),
+            url: String::new(),
+            due: None,
+            completed: false,
+            metadata: Default::default(),
+        };
+        let draft = Draft {
+            title: "title".into(),
+            title_prefix: String::new(),
+            attachments: vec![],
+            description: String::new(),
+            workspace_id: "1".into(),
+            owner: String::new(),
+            due: None,
+        };
+        for job in [
+            Job::Refresh,
+            Job::LoadProjects,
+            Job::LoadMembers("1".into()),
+            Job::Submit("task".into(), draft, source),
+            Job::Recover {
+                guid: "task".into(),
+                workspace: "1".into(),
+                id: "2".into(),
+                kind: "story".into(),
+            },
+        ] {
+            worker
+                .jobs
+                .send(Request {
+                    sequence: 0,
+                    profile: "a".repeat(64),
+                    job,
+                })
+                .unwrap();
+            let events = until(&worker, |e| matches!(e, Event::Error(_)));
+            assert!(events.iter().any(|e| matches!(e, Event::Error(message) if message.contains("supported") || message.contains("Unsupported"))), "missing version error");
+            assert_eq!(
+                backend.loads.load(Ordering::SeqCst),
+                loads,
+                "credentials accessed before compatibility gate"
+            );
+            assert!(
+                !marker.exists(),
+                "business CLI called before compatibility gate"
+            );
+        }
+        assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.clears.load(Ordering::SeqCst), 0);
+    }
+}
+
+// 删除最后一个 sender 时，也必须等已从 pending 移除的原生任务真正退出。
+#[test]
+fn sender_drop_holds_lock_until_cancelled_native_task_exits() {
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let backend = Arc::new(Backend {
+        wait_for_auth: Some(barrier.clone()),
+        ..Default::default()
+    });
+    let (root, worker) = startup(Mode::Live, backend.clone());
+    event(&worker);
+    send(
+        &worker,
+        Job::SaveAndConnect {
+            tool: CliTool::Lark,
+            credentials: credentials(),
+        },
+    );
+    until(&worker, |event| {
+        matches!(event, Event::AuthorizationRequired { .. })
+    });
+    send(&worker, Job::ClearCredentials(CliTool::Lark));
+    until(&worker, |event| {
+        matches!(event, Event::AuthorizationFinished)
+    });
+    drop(worker);
+    std::thread::sleep(Duration::from_millis(100));
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.path().join("app.lock"))
+        .unwrap();
+    let held = lock.try_lock().is_err();
+    if !held {
+        lock.unlock().unwrap();
+    }
+    barrier.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.cancellations.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        held,
+        "actor released app.lock while cancelled native operation was still alive"
+    );
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]

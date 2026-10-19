@@ -596,7 +596,7 @@ fn configure_actions(cx: &mut App) {
     .detach();
     cx.on_action(|_: &Quit, cx| {
         crate::console::event("app.lifecycle", "quit_requested_shortcut_or_menu");
-        cx.quit();
+        request_quit(cx);
     });
     cx.on_action(|_: &Refresh, cx| {
         let m = cx.global::<Shell>().model.clone();
@@ -615,7 +615,7 @@ fn handle_native_action(action: NativeAction, cx: &mut App) {
         NativeAction::Settings => show_settings(cx),
         NativeAction::Quit => {
             crate::console::event("app.lifecycle", "quit_requested_tray");
-            cx.quit();
+            request_quit(cx);
         }
         NativeAction::Refresh => {
             let model = cx.global::<Shell>().model.clone();
@@ -631,6 +631,39 @@ fn handle_native_action(action: NativeAction, cx: &mut App) {
             });
         }
     }
+}
+
+// 所有正常退出入口先询问主窗口；退出确认通过后才进入应用 shutdown hook。
+fn request_quit(cx: &mut App) {
+    // 全局 action 分发期间当前窗口仍被借用，延后再访问主窗口。
+    cx.defer(guard_quit);
+}
+fn guard_quit(cx: &mut App) {
+    let main = cx.try_global::<Shell>().and_then(|shell| shell.window);
+    if let Some(main) = main
+        && main
+            .update(cx, |root, window, cx| {
+                let view = root
+                    .downcast::<gpui_kit::base::Root>()
+                    .unwrap()
+                    .read(cx)
+                    .view()
+                    .clone()
+                    .downcast::<Workspace>()
+                    .unwrap();
+                view.update(cx, |this, cx| {
+                    if this.has_unsaved_draft(cx) {
+                        this.confirm_discard(DiscardAction::Quit, window, cx);
+                    } else {
+                        cx.quit();
+                    }
+                });
+            })
+            .is_ok()
+    {
+        return;
+    }
+    cx.quit();
 }
 
 fn set_app_menu(language: &str, cx: &mut App) {
@@ -806,6 +839,12 @@ impl Filter {
     }
 }
 
+enum DiscardAction {
+    Select(String),
+    Close,
+    Quit,
+}
+
 pub struct Workspace {
     model: Entity<Model>,
     focus_handle: FocusHandle,
@@ -821,6 +860,9 @@ pub struct Workspace {
     settings_directory_loaded: bool,
     selected: Option<String>,
     edit_source: Option<SourceTask>,
+    draft_baseline: Option<Draft>,
+    discard_prompt_open: bool,
+    pending_prefix: Option<(String, String)>,
     edit_profile: String,
     editor_session: u64,
     remote_target: Option<lark2tapd_core::TargetTask>,
@@ -972,6 +1014,7 @@ impl Workspace {
             this.images.clear();
             this.refresh_editor_images(cx);
             this.loading_images.clear();
+            this.draft_baseline = Some(this.draft(cx));
             this.load_images(window, cx);
             let workspace = d.workspace_id.clone();
             if !workspace.is_empty() {
@@ -1036,6 +1079,28 @@ impl Workspace {
                     set(&this.lark_path, s.lark_path.clone(), window, cx);
                     set(&this.tapd_path, s.tapd_path.clone(), window, cx);
                 }
+                // 保存回执只推进比较基线，不覆盖回执到达前继续输入的内容。
+                if matches!(action, "draft_saved" | "imported")
+                    && let Some(saved) = this
+                        .model
+                        .read(cx)
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| {
+                            s.records
+                                .iter()
+                                .find(|r| Some(&r.source.guid) == this.selected.as_ref())
+                        })
+                        .and_then(|r| {
+                            if action == "draft_saved" {
+                                r.draft.clone()
+                            } else {
+                                r.last_draft.clone()
+                            }
+                        })
+                {
+                    this.draft_baseline = Some(saved);
+                }
                 if action == "target_accepted" {
                     this.remote_target = None;
                 }
@@ -1071,6 +1136,13 @@ impl Workspace {
                 this.last_prefixes = settings.workspace_prefixes;
                 let prefix = selected(&this.prefix, cx);
                 this.fill_prefixes(&prefix, window, cx);
+            }
+            // 仅本次新增成功且输入未被用户修改才结束表单；删除回执不碰新增内容。
+            if this.model.read(cx).save_states.get("prefixes") == Some(&SaveState::Saved)
+                && let Some((workspace, prefix)) = this.pending_prefix.take()
+                && workspace == selected(&this.prefix_workspace, cx)
+                && prefix == this.prefix_options.read(cx).value().as_str()
+            {
                 this.load_prefix_form(window, cx);
             }
             if (!this.edit_profile.is_empty() && this.edit_profile != this.model.read(cx).profile)
@@ -1080,6 +1152,9 @@ impl Workspace {
                     })
                 })
             {
+                // 身份/范围失效同时结束确认会话，旧 prompt 不得操作新账号的编辑器。
+                this.editor_session = editor_session();
+                this.draft_baseline = None;
                 this.selected = None;
                 this.edit_source = None;
                 this.edit_profile.clear();
@@ -1147,6 +1222,9 @@ impl Workspace {
             settings_directory_loaded: false,
             selected: None,
             edit_source: None,
+            draft_baseline: None,
+            discard_prompt_open: false,
+            pending_prefix: None,
             edit_profile: String::new(),
             source_open: false,
             editor_session: editor_session(),
@@ -1207,6 +1285,9 @@ impl Workspace {
                 &input,
                 move |this, _, event: &gpui_kit::component::input::InputEvent, cx| {
                     if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                        if key == "prefixes" {
+                            this.pending_prefix = None;
+                        }
                         this.model.update(cx, |m, cx| {
                             m.dirty_field(key);
                             cx.notify();
@@ -1217,6 +1298,11 @@ impl Workspace {
             .detach();
         }
         this.sync_directory(window, cx);
+        let view = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            view.update(cx, |this, cx| this.allow_close(window, cx))
+                .unwrap_or(true)
+        });
         this
     }
     fn tr<'a>(&self, cx: &App, zh: &'a str, en: &'a str) -> &'a str {
@@ -1254,9 +1340,32 @@ impl Workspace {
         }
     }
     fn select(&mut self, record: SyncRecord, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.read(cx).busy || !self.pending_pastes.is_empty() || self.pending_files > 0 {
+        if self.selected.as_ref() == Some(&record.source.guid) || self.model.read(cx).busy {
             return;
         }
+        if self.has_unsaved_draft(cx) {
+            self.confirm_discard(DiscardAction::Select(record.source.guid), window, cx);
+            return;
+        }
+        self.open_record(record.source.guid, window, cx);
+    }
+    fn open_record(&mut self, guid: String, window: &mut Window, cx: &mut Context<Self>) {
+        // 确认框等待期间任务可能离开范围或开始提交；执行切换时重新检查。
+        let model = self.model.read(cx);
+        if model.busy
+            || !model.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .records
+                    .iter()
+                    .any(|r| r.in_scope && r.source.guid == guid)
+            })
+        {
+            return;
+        }
+        self.draft_baseline = None;
+        self.pending_pastes.clear();
+        self.pending_files = 0;
+        self.pending_file_paths.clear();
         self.source_open = false;
         self.editor_session = editor_session();
         self.remote_target = None;
@@ -1267,18 +1376,82 @@ impl Workspace {
         set(&self.title, String::new(), window, cx);
         self.description.update(cx, |s, cx| s.set_text("", cx));
         self.deferred_media.clear();
-        self.selected = Some(record.source.guid.clone());
+        self.selected = Some(guid.clone());
         self.edit_source = None;
         self.edit_profile = self.model.read(cx).profile.clone();
-        self.send(
-            Job::OpenDraft(record.source.guid, false, self.editor_session),
-            cx,
-        );
+        self.send(Job::OpenDraft(guid, false, self.editor_session), cx);
         self.send(Job::LoadProjects, cx);
         if !selected(&self.workspace, cx).is_empty() {
             self.send(Job::LoadMembers(selected(&self.workspace, cx)), cx);
         }
         cx.notify();
+    }
+    fn has_unsaved_draft(&self, cx: &App) -> bool {
+        !self.is_settings
+            && (!self.pending_pastes.is_empty()
+                || self.pending_files > 0
+                || !self.deferred_media.is_empty()
+                || self
+                    .draft_baseline
+                    .as_ref()
+                    .is_some_and(|baseline| *baseline != self.draft(cx)))
+    }
+    fn allow_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.has_unsaved_draft(cx) {
+            self.confirm_discard(DiscardAction::Close, window, cx);
+            false
+        } else {
+            true
+        }
+    }
+    fn confirm_discard(
+        &mut self,
+        next: DiscardAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.discard_prompt_open {
+            return;
+        }
+        self.discard_prompt_open = true;
+        let session = self.editor_session;
+        let profile = self.model.read(cx).profile.clone();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            self.tr(
+                cx,
+                "丢弃未保存的任务修改？",
+                "Discard unsaved task changes?",
+            ),
+            Some(self.tr(
+                cx,
+                "取消后可点击“保存草稿”。尚未完成的附件也会被丢弃。",
+                "Cancel to save your draft. Unfinished attachments will also be discarded.",
+            )),
+            &[
+                self.tr(cx, "取消", "Cancel"),
+                self.tr(cx, "丢弃并继续", "Discard and continue"),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let discard = answer.await == Ok(1);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.discard_prompt_open = false;
+                // 旧会话的确认不能丢弃后来打开的编辑器。
+                if discard
+                    && this.editor_session == session
+                    && this.model.read(cx).profile == profile
+                {
+                    match next {
+                        DiscardAction::Select(record) => this.open_record(record, window, cx),
+                        DiscardAction::Close => window.remove_window(),
+                        DiscardAction::Quit => cx.quit(),
+                    }
+                }
+            });
+        })
+        .detach();
     }
     fn reload_source(&mut self, guid: String, cx: &mut Context<Self>) {
         self.editor_session = editor_session();
@@ -1397,7 +1570,11 @@ impl Render for Workspace {
         let checking = model.activities.contains("tasks");
         div()
             .track_focus(&self.focus_handle)
-            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
+                if this.allow_close(window, cx) {
+                    window.remove_window();
+                }
+            }))
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)

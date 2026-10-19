@@ -240,29 +240,35 @@ print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_
 }
 
 #[test]
-fn detail_starts_are_paced_across_page_boundaries() {
+fn detail_reads_across_pages_are_complete_and_keep_list_order() {
     let (dir, g) = oauth_gateway(
         r#"
-import time
 if a[:2]==['task','+get-related-tasks']:
  page=1 if '--page-token' not in a else 2
+ if page==2: assert a[a.index('--page-token')+1]=='next'
+ with open(__file__+'.pages','a') as f: f.write(str(page)+'\n')
  print(json.dumps({'ok':True,'data':{'items':[{'guid':'g'+str(i),'creator':{'id':'self'}} for i in range((page-1)*4,page*4)],'has_more':page==1,'page_token':'next'}}))
 else:
  p=json.load(sys.stdin)
- with open(__file__+'.starts','a') as f: f.write(str(time.time())+'\n')
+ with open(__file__+'.details','a') as f: f.write(p['task_guid']+'\n')
  print(json.dumps({'ok':True,'data':{'task':{'guid':p['task_guid'],'summary':'title','creator':{'id':'self'}}}}))
 "#,
     );
-    assert_eq!(g.fetch_tasks().unwrap().len(), 8);
-    let mut times: Vec<f64> = fs::read_to_string(dir.path().join("fake.starts"))
-        .unwrap()
-        .lines()
-        .map(|v| v.parse().unwrap())
-        .collect();
-    times.sort_by(f64::total_cmp);
-    assert_eq!(times.len(), 8);
-    // 进程启动有调度抖动；仍必须消除同页及跨页的四连发。
-    assert!(times.windows(2).all(|w| w[1] - w[0] >= 0.08), "{times:?}");
+    let tasks = g.fetch_tasks().unwrap();
+    let expected = ["g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7"];
+    assert_eq!(
+        tasks.iter().map(|t| t.guid.as_str()).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.pages")).unwrap(),
+        "1\n2\n"
+    );
+    // 子进程入口时刻不是 Rust 许可时刻；严格限速由 read_pacing 模块测试验证。
+    let details = fs::read_to_string(dir.path().join("fake.details")).unwrap();
+    let mut guids = details.lines().collect::<Vec<_>>();
+    guids.sort_unstable();
+    assert_eq!(guids, expected);
 }
 
 #[test]

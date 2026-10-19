@@ -170,6 +170,7 @@ fn prefixes_add_one_verbatim_value_only_after_confirmation(cx: &mut TestAppConte
             .get("demo")
             .is_some_and(|v| v == &["  [原样] "])
     });
+    pump(&events, &model, cx, |cx| !view.read(cx).new_prefix_open);
     cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.try_find("workspace-prefixes").is_none());
@@ -205,6 +206,54 @@ fn prefixes_add_one_verbatim_value_only_after_confirmation(cx: &mut TestAppConte
             .get("demo")
             .is_some_and(Vec::is_empty)
     });
+}
+
+#[gpui_kit::test]
+fn prefix_receipts_preserve_new_input(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    let (handle, view) = open_settings_for_test(cx, handle);
+    cx.update_window(handle, |_, w, cx| {
+        w.scroll(
+            "lark-cli-help",
+            ScrollDelta::Pixels(point(px(0.), px(-1100.))),
+            cx,
+        );
+    })
+    .unwrap();
+    click(cx, handle, "add-prefix");
+    cx.update_window(handle, |_, w, cx| {
+        w.click("workspace-prefixes", cx);
+        w.input(" A ", cx);
+    })
+    .unwrap();
+    click(cx, handle, "confirm-prefixes");
+    cx.update_window(handle, |_, w, cx| {
+        w.click("workspace-prefixes", cx);
+        w.press("cmd-a", cx);
+        w.input(" B ", cx);
+    })
+    .unwrap();
+    wait_for_prefix_saves(&events, &model, 1, cx);
+    assert_eq!(
+        cx.read(|cx| view.read(cx).prefix_options.read(cx).value().to_string()),
+        " B "
+    );
+    model.update(cx, |m, cx| {
+        m.send(
+            Job::SetPreference(Preference::RemoveWorkspacePrefix {
+                workspace: "demo".into(),
+                prefix: " A ".into(),
+            }),
+            cx,
+        )
+    });
+    wait_for_prefix_saves(&events, &model, 1, cx);
+    assert_eq!(
+        cx.read(|cx| view.read(cx).prefix_options.read(cx).value().to_string()),
+        " B "
+    );
+    assert!(cx.read(|cx| view.read(cx).new_prefix_open));
 }
 
 #[gpui_kit::test]

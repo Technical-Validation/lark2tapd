@@ -14,6 +14,34 @@ use std::{
 
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
+thread_local! {
+    static TASK_CANCELLATION: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 为一个后台任务内所有 CLI 调用设置取消边界（包括版本探测和原生 profile 准备）。
+/// 不传播到新线程；显式并行读取仍须传递自己的 cancelled 参数。
+pub fn with_process_cancellation<T>(cancelled: Arc<AtomicBool>, action: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<AtomicBool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TASK_CANCELLATION.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(TASK_CANCELLATION.with(|slot| slot.replace(Some(cancelled))));
+    action()
+}
+
+fn is_cancelled(explicit: &AtomicBool) -> bool {
+    explicit.load(Ordering::SeqCst)
+        || TASK_CANCELLATION.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        })
+}
+
 #[derive(Debug)]
 pub(crate) struct CallTimeout;
 impl std::fmt::Display for CallTimeout {
@@ -81,6 +109,14 @@ fn before_deadline(deadline: Instant) -> std::io::Result<()> {
         return Err(std::io::ErrorKind::TimedOut.into());
     }
     Ok(())
+}
+// 进程已退出不代表管道读取已完成；管道截止时间也属于同一次 CLI 超时。
+fn pipe_failure(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        CallTimeout.into()
+    } else {
+        anyhow::anyhow!("CLI I/O failed")
+    }
 }
 fn drain(
     mut pipe: impl Read,
@@ -163,7 +199,7 @@ pub(crate) fn run_output_cancellable(
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<ProcessOutput> {
-    if cancelled.load(Ordering::SeqCst) {
+    if is_cancelled(cancelled) {
         return Err(Cancelled.into());
     }
     let deadline = Instant::now() + timeout;
@@ -229,7 +265,7 @@ pub(crate) fn run_output_cancellable(
         Ok(())
     });
     let result = loop {
-        if cancelled.load(Ordering::SeqCst) {
+        if is_cancelled(cancelled) {
             break Err(anyhow::Error::new(Cancelled));
         }
         if overflow.load(Ordering::Relaxed) {
@@ -257,15 +293,17 @@ pub(crate) fn run_output_cancellable(
     if overflow.load(Ordering::Relaxed) {
         bail!("CLI output exceeded safety limit");
     }
-    if status.success() && !matches!(write_result, Ok(Ok(()))) {
-        bail!("CLI I/O failed");
+    if status.success() {
+        write_result
+            .map_err(|_| anyhow::anyhow!("CLI writer failed"))?
+            .map_err(pipe_failure)?;
     }
     let stdout = output
         .map_err(|_| anyhow::anyhow!("CLI reader failed"))?
-        .map_err(|_| anyhow::anyhow!("CLI I/O failed"))?;
+        .map_err(pipe_failure)?;
     let stderr = errors
         .map_err(|_| anyhow::anyhow!("CLI reader failed"))?
-        .map_err(|_| anyhow::anyhow!("CLI I/O failed"))?;
+        .map_err(pipe_failure)?;
     Ok(ProcessOutput {
         status,
         stdout: zeroize::Zeroizing::new(stdout),
@@ -351,7 +389,8 @@ mod tests {
             &["$(echo unsafe)".into()],
             &[("TOKEN".into(), "secret".into())],
             b"json",
-            Duration::from_secs(2),
+            // 此测试断言内容与参数契约；短截止时间另由专用超时测试覆盖。
+            Duration::from_secs(5),
         )
         .unwrap();
         assert_eq!(out, b"secret|json$(echo unsafe)");
@@ -372,7 +411,11 @@ mod tests {
         let now = Instant::now();
         let result = run(&p, &[], &[], b"", Duration::from_millis(700));
         assert!(now.elapsed() < Duration::from_millis(1500));
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error.is::<CallTimeout>(),
+            "pipe deadline must retain timeout classification: {error}"
+        );
     }
     #[test]
     fn error_never_contains_output_or_arguments() {

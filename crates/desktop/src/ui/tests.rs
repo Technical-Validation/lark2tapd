@@ -199,6 +199,326 @@ fn load_task(
 }
 
 #[gpui_kit::test]
+fn same_task_keeps_unsaved_edit(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx);
+    })
+    .unwrap();
+    click(cx, handle, &format!("select-{guid}"));
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+}
+
+#[gpui_kit::test]
+fn dirty_native_close_is_cancelable(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx);
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(handle, cx);
+    assert!(!visual.simulate_close());
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+}
+
+#[gpui_kit::test]
+fn dirty_switch_requires_explicit_discard(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    let next = cx.read(|cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .records
+            .iter()
+            .find(|r| r.source.guid != guid)
+            .unwrap()
+            .source
+            .guid
+            .clone()
+    });
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx)
+    })
+    .unwrap();
+    click(cx, handle, &format!("select-{next}"));
+    assert_eq!(
+        cx.read(|cx| view.read(cx).selected.clone()),
+        Some(guid.clone())
+    );
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+    click(cx, handle, &format!("select-{next}"));
+    cx.simulate_prompt_answer("丢弃并继续");
+    cx.run_until_parked();
+    pump(&events, &model, cx, |cx| {
+        view.read(cx)
+            .edit_source
+            .as_ref()
+            .is_some_and(|s| s.guid == next)
+    });
+    assert_eq!(cx.read(|cx| view.read(cx).selected.clone()), Some(next));
+}
+
+#[gpui_kit::test]
+fn invalidated_editor_drops_old_discard_prompt_and_dirty_baseline(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    let session = cx.read(|cx| view.read(cx).editor_session);
+    view.update(cx, |v, _| {
+        let attachment = DraftAttachment {
+            id: "test".into(),
+            name: "test.txt".into(),
+            path: "unused".into(),
+            size: 1,
+            is_image: false,
+            remote_id: None,
+            remote_url: None,
+            uncertain: false,
+        };
+        v.attachments.push(attachment.clone());
+        v.draft_baseline
+            .as_mut()
+            .unwrap()
+            .attachments
+            .push(attachment);
+    });
+    assert!(!cx.read(|cx| view.read(cx).has_unsaved_draft(cx)));
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx)
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle, "cmd-w");
+    let snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
+    model.update(cx, |m, cx| {
+        m.receive(
+            Event::State {
+                mode: Mode::Mock,
+                snapshot,
+                profile: "new-account".into(),
+                message: "refreshed",
+                new_count: 0,
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert!(view.read(cx).selected.is_none());
+        assert!(!view.read(cx).has_unsaved_draft(cx));
+        assert_ne!(view.read(cx).editor_session, session);
+    });
+    cx.simulate_prompt_answer("丢弃并继续");
+    cx.run_until_parked();
+    assert!(
+        cx.windows().contains(&handle),
+        "old account's prompt must not close the new session"
+    );
+}
+
+fn stale_switch_prompt(cx: &mut TestAppContext, busy: bool) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    let guid = load_task(&events, &model, &view, handle, cx);
+    let mut snapshot = cx.read(|cx| model.read(cx).snapshot.clone().unwrap());
+    let target = snapshot
+        .records
+        .iter()
+        .find(|r| r.source.guid != guid)
+        .unwrap()
+        .source
+        .guid
+        .clone();
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx)
+    })
+    .unwrap();
+    click(cx, handle, &format!("select-{target}"));
+    if busy {
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::Activity {
+                    key: "submit".into(),
+                    active: true,
+                },
+                cx,
+            )
+        });
+    } else {
+        snapshot
+            .records
+            .iter_mut()
+            .find(|r| r.source.guid == target)
+            .unwrap()
+            .in_scope = false;
+        model.update(cx, |m, cx| {
+            m.receive(
+                Event::State {
+                    mode: Mode::Mock,
+                    snapshot,
+                    profile: "mock".into(),
+                    message: "refreshed",
+                    new_count: 0,
+                },
+                cx,
+            )
+        });
+    }
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("丢弃并继续");
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| view.read(cx).selected.clone()), Some(guid));
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+}
+
+#[gpui_kit::test]
+fn discard_switch_rechecks_target_scope(cx: &mut TestAppContext) {
+    stale_switch_prompt(cx, false);
+}
+
+#[gpui_kit::test]
+fn discard_switch_rechecks_busy_state(cx: &mut TestAppContext) {
+    stale_switch_prompt(cx, true);
+}
+
+#[gpui_kit::test]
+fn dirty_command_w_cancel_then_discard_closes(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx)
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle, "cmd-w");
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert!(cx.windows().contains(&handle));
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+    cx.simulate_keystrokes(handle, "cmd-w");
+    cx.simulate_prompt_answer("丢弃并继续");
+    cx.run_until_parked();
+    assert!(!cx.windows().contains(&handle));
+}
+
+#[gpui_kit::test]
+fn saved_draft_is_clean_but_late_save_does_not_cover_new_edits(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    assert!(!cx.read(|cx| view.read(cx).has_unsaved_draft(cx)));
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "saved A".into(), w, cx)
+    })
+    .unwrap();
+    click(cx, handle, "save-draft");
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "new B".into(), w, cx)
+    })
+    .unwrap();
+    pump(&events, &model, cx, |cx| {
+        model.read(cx).last_action == "draft_saved"
+    });
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "new B"
+    );
+    assert!(cx.read(|cx| view.read(cx).has_unsaved_draft(cx)));
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "saved A".into(), w, cx)
+    })
+    .unwrap();
+    assert!(!cx.read(|cx| view.read(cx).has_unsaved_draft(cx)));
+    let mut visual = VisualTestContext::from_window(handle, cx);
+    assert!(visual.simulate_close());
+}
+
+#[gpui_kit::test]
+fn pending_media_close_requires_discard_and_cannot_save(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    view.update(cx, |v, cx| {
+        v.pending_pastes.insert("pending-test".into());
+        cx.notify();
+    });
+    click(cx, handle, "save-draft");
+    assert!(cx.read(|cx| view.read(cx).has_unsaved_draft(cx)));
+    assert!(cx.read(|cx| {
+        model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .records
+            .iter()
+            .all(|r| r.last_draft.is_none())
+    }));
+    let mut visual = VisualTestContext::from_window(handle, cx);
+    assert!(!visual.simulate_close());
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| view.read(cx).pending_pastes.contains("pending-test")));
+    assert!(!visual.simulate_close());
+    cx.simulate_prompt_answer("丢弃并继续");
+    cx.run_until_parked();
+    assert!(!cx.windows().contains(&handle));
+}
+
+#[gpui_kit::test]
+fn dirty_quit_entries_require_confirmation(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    cx.update_window(handle, |_, w, cx| {
+        set(&view.read(cx).title.clone(), "unsaved".into(), w, cx)
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle, "cmd-q");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| view.read(cx).discard_prompt_open));
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert!(!cx.read(|cx| view.read(cx).discard_prompt_open));
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+    // 菜单与快捷键共享 action；单独分发菜单 action 防止路由遗漏。
+    cx.dispatch_action(handle, Quit);
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| view.read(cx).title.read(cx).value().to_string()),
+        "unsaved"
+    );
+    cx.update(|cx| handle_native_action(NativeAction::Quit, cx));
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("丢弃并继续");
+    cx.run_until_parked();
+    // GPUI test platform 的 quit() 是空操作；这里只验证退出入口的确认分支。
+    assert!(!cx.read(|cx| view.read(cx).discard_prompt_open));
+}
+
+#[gpui_kit::test]
 fn opening_main_window_checks_automatically(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, _) = setup(cx);
     cx.update(|cx| {

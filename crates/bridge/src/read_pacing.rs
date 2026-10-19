@@ -4,11 +4,15 @@ use std::sync::{Mutex, atomic::Ordering};
 
 pub(super) struct ReadPacer {
     next: Mutex<Instant>,
+    #[cfg(test)]
+    admissions: Mutex<Vec<Instant>>,
 }
 impl ReadPacer {
     pub fn new() -> Self {
         Self {
             next: Mutex::new(Instant::now()),
+            #[cfg(test)]
+            admissions: Mutex::new(Vec::new()),
         }
     }
 
@@ -24,6 +28,9 @@ impl ReadPacer {
                 if now >= *next {
                     // 不预订多个未来时隙，避免服务端冷却期间仍有旧预约越过暂停。
                     *next = now + Duration::from_millis(125);
+                    // 在同一把锁内记录许可时刻，避免线程或子进程入口的调度抖动。
+                    #[cfg(test)]
+                    self.admissions.lock().unwrap().push(now);
                     return Ok(());
                 }
                 next.saturating_duration_since(now)
@@ -76,6 +83,39 @@ impl ReadPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admissions_are_paced_across_concurrent_batches() {
+        let pacer = ReadPacer::new();
+        let cancelled = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // 模拟两页：列表读取和每页四个竞争的详情读取共享同一个限速器。
+        for _ in 0..2 {
+            pacer
+                .read(deadline, &cancelled, || Ok(()), |_, _| panic!("no failure"))
+                .unwrap();
+            let ready = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        ready.wait();
+                        pacer
+                            .read(deadline, &cancelled, || Ok(()), |_, _| panic!("no failure"))
+                            .unwrap();
+                    });
+                }
+            });
+        }
+        let admissions = pacer.admissions.lock().unwrap();
+        assert_eq!(admissions.len(), 10);
+        // 不给调度误差留宽限：采样是锁内实际许可时间，含两批之间的边界。
+        for pair in admissions.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) >= Duration::from_millis(125),
+                "admissions must not burst: {admissions:?}"
+            );
+        }
+    }
 
     #[test]
     fn one_readers_cooldown_also_pauses_other_readers() {

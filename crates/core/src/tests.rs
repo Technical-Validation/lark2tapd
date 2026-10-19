@@ -344,12 +344,14 @@ async fn settings_validation_and_invalid_draft_block_writes() -> Result<()> {
     for minutes in [0, 1441] {
         let mut settings = original.clone();
         settings.poll_minutes = minutes;
+        assert!(engine.apply_committed_settings(settings.clone()).is_err());
         assert!(engine.save_settings(settings).await.is_err());
     }
     for (language, theme) in [("fr", "system"), ("zh-CN", "blue")] {
         let mut settings = original.clone();
         settings.language = language.into();
         settings.theme = theme.into();
+        assert!(engine.apply_committed_settings(settings.clone()).is_err());
         assert!(engine.save_settings(settings).await.is_err());
     }
     assert_eq!(&engine.snapshot().settings, &original);
@@ -1293,5 +1295,37 @@ async fn restored_mock_titles_do_not_keep_legacy_repeated_update_markers() -> Re
     snapshot.records[0].source.title = "任务 · 已更新 · 已更新 · 已更新".into();
     let restored = MockGateway::from_snapshot(&snapshot);
     assert_eq!(restored.fetch_tasks()?[0].title, "任务 · 已更新");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_settings_do_not_weaken_persistent_settings_or_business_writes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("runtime.sqlite");
+    let gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let original = engine.snapshot().clone();
+    let mut next = original.settings.clone();
+    next.theme = "dark".into();
+    engine.apply_committed_settings(next.clone())?;
+    assert_eq!(engine.snapshot().settings, next);
+    assert_eq!(Engine::open(&path).await?.snapshot(), &original);
+    // 受控故障只破坏临时库；设置保存、草稿保存仍必须失败且不发布内存变更。
+    toasty::sql::query("DROP TABLE stored_states")
+        .exec(&mut engine.db)
+        .await?;
+    let mut invalid = next.clone();
+    invalid.theme = "invalid".into();
+    assert!(engine.apply_committed_settings(invalid).is_err());
+    let mut other = next.clone();
+    other.theme = "light".into();
+    assert!(engine.save_settings(other).await.is_err());
+    assert_eq!(engine.snapshot().settings, next);
+    let before = engine.snapshot().clone();
+    let guid = &before.records[0].source.guid;
+    let mut draft = engine.prepare(guid)?;
+    draft.title = "not committed".into();
+    assert!(engine.save_draft(guid, &draft).await.is_err());
+    assert_eq!(engine.snapshot(), &before);
     Ok(())
 }

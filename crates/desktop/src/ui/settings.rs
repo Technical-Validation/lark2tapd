@@ -137,6 +137,7 @@ impl Workspace {
                     .child(div().flex_1().child(prefix.clone()))
                     .child(self.focus_region(SharedString::from(format!("remove-prefix-{index}")), Button::new(SharedString::from(format!("remove-prefix-{index}"))).ghost().label(self.tr(cx,"删除","Remove")).disabled(busy).on_click(cx.listener(move |this,_,_,cx|{
                         let workspace=selected(&this.prefix_workspace,cx);
+                        this.pending_prefix = None;
                         this.preference(Preference::RemoveWorkspacePrefix{workspace,prefix:prefix.clone()},cx);
                     }))))))
                 .when(!self.new_prefix_open,|d|d.child(self.field_feedback("prefixes",cx)))
@@ -150,6 +151,7 @@ impl Workspace {
                         .child(self.focus_region("confirm-prefixes", Button::new("confirm-prefixes").primary().label(self.tr(cx,"确认添加","Confirm add")).disabled(busy).on_click(cx.listener(|this,_,_,cx|{
                             let workspace=selected(&this.prefix_workspace,cx);
                             let prefix=this.prefix_options.read(cx).value().to_string();
+                            this.pending_prefix = Some((workspace.clone(), prefix.clone()));
                             this.preference(Preference::AddWorkspacePrefix{workspace,prefix},cx);
                         }))))
                         .child(self.focus_region("cancel-prefix", Button::new("cancel-prefix").label(self.tr(cx,"取消","Cancel")).disabled(busy).on_click(cx.listener(|this,_,window,cx|this.load_prefix_form(window,cx)))))))))
