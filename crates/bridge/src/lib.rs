@@ -479,6 +479,8 @@ impl CliGateway {
             "json",
             "--page-limit",
             "1",
+            // CLI 将此条件传给服务端；避免枚举已完成历史任务再逐条取详情。
+            "--include-complete=false",
         ]
         .map(String::from)
         .to_vec();

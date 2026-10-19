@@ -42,7 +42,7 @@
 
 单次普通调用 30 秒；每个输出管道最多缓存 4 MiB。超时、失败、超限都会终止进程组并回收直接子进程；非阻塞管道读写共用截止时间，即使后代 `setsid` 后保留管道也不会无限等待。错误不包含 argv、原始 stdout/stderr 或任意服务端 message/hint。非零退出保留退出码；API 失败仅白名单类别、整数 API code、应用需要的 `task:task:read` 和固定恢复建议进入错误。`auth check` 与授权完成允许解析预期非零 JSON，其他非零退出不会转为成功。诊断类型与 begin/finish 返回的错误可直接交 UI；不要再覆盖为泛化“连接失败”。假 CLI 测试在临时目录运行，不读写用户真实认证或业务数据。
 
-飞书任务刷新每次先调用一次 `auth status --json --verify`，只接受已验证的用户 `openId`。使用 `task +get-related-tasks --as user --format json --page-limit 1`，通过 `--page-token` 手动继续读取 `data.items` / `has_more` / `page_token`。`my_tasks` 会漏掉仅由本人创建的任务，因此不作为候选来源。仅保留创建者 ID 为本人或 `role=assignee` 成员 ID 包含本人的候选；只有关注关系、其他人、缺失身份或仅同名均不算。候选在详情读取前按 GUID 去重；原生 `task tasks get` 返回后再验证关系，已移除的任务不进入结果。
+飞书任务刷新每次先调用一次 `auth status --json --verify`，只接受已验证的用户 `openId`。使用 `task +get-related-tasks --as user --format json --page-limit 1 --include-complete=false`，CLI 将完成状态作为 `completed=false` 传给服务端，避免逐条读取已完成历史任务。每页都保留该过滤参数，通过 `--page-token` 手动继续读取 `data.items` / `has_more` / `page_token`；即使当前页为空，仍根据 `has_more` 继续分页。`my_tasks` 会漏掉仅由本人创建的任务，因此不作为候选来源。仅保留创建者 ID 为本人或 `role=assignee` 成员 ID 包含本人的候选；只有关注关系、其他人、缺失身份或仅同名均不算。候选在详情读取前按 GUID 去重；原生 `task tasks get` 返回后再验证关系和完成状态，已移交或已完成的任务不进入结果；逾期但尚未完成不受影响。
 
 `fetch_account_tasks(&AtomicBool, observer) -> Result<(String, Vec<SourceTask>)>` 是桌面刷新的入口：加载应用凭证后，飞书身份、TAPD 身份、所有分页及原生详情共同使用一次 120 秒预算，不再前置一轮账号验证后又重复验证飞书身份。`Gateway::fetch_tasks` 保留仅读取飞书的语义。单个 CLI 调用最多 30 秒，详情每页最多四个并发进程；返回任务顺序保持与列表一致，失败或取消会停止并回收在途详情，不返回部分结果。仍最多 40 页、1000 条候选列表项（包括过滤或重复项）。缺失/重复游标、非法 GUID、任务详情失败或超限均整体失败，不返回半份任务。每次原生详情提供创建者和负责人 ID/姓名；未知姓名保留空字符串，不增加通讯录请求。`SourceMetadata` 保留原生 `created_at` / `completed_at` / `due.timestamp` 毫秒字符串，包括完成时间的 `"0"`。快捷命令会把创建/完成时间变成本地格式日期，绝不把这些字符串保存为原始毫秒。
 

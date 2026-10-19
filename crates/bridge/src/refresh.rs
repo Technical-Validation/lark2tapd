@@ -297,8 +297,12 @@ pub(super) fn read(
         })?;
         trace.scheduled += jobs.len();
         let details = read_details(gateway, &jobs, &pacer, &mut trace)?;
-        // 列表与详情之间关系可能改变；仅接受详情仍证明属于已验证主体的任务。
-        tasks.extend(details.into_iter().filter(|task| task.is_related_to(&user)));
+        // 列表与详情之间可能已完成或移交；只接受仍未完成且属于已验证主体的任务。
+        tasks.extend(
+            details
+                .into_iter()
+                .filter(|task| !task.completed && task.is_related_to(&user)),
+        );
         if data["has_more"] == false {
             return Ok((namespace, tasks));
         }

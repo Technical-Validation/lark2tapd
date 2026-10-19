@@ -71,7 +71,7 @@ assert os.environ.get('LARKSUITE_CLI_PROFILE')=='app'
 if a==['auth','status','--json','--verify']:
  print(json.dumps({'appId':'app','identity':'user','verified':True,'identities':{'user':{'openId':'self'}}}))
 else:
- assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']
+ assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1','--include-complete=false']
  print(json.dumps({'ok':True,'data':{'items':[],'has_more':False}}))
 "#,
     );
@@ -139,7 +139,7 @@ elif a==['auth','check','--scope','task:task:read','--json']:
 elif a==['auth','scopes','--json']:
  print(json.dumps({'ok':False,'error':{'type':'network','code':503,'message':'secret-content'}})); sys.exit(2)
 else:
- assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']
+ assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1','--include-complete=false']
  print(json.dumps({'ok':True,'data':{'items':[],'has_more':False}}))
 "#,
     );
@@ -739,9 +739,9 @@ fn related_union_paginates_filters_and_deduplicates_before_details() {
     let (d, g) = oauth_gateway(
         r#"
 if a[:2]==['task','+get-related-tasks']:
- assert a[:8]==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']
+ assert a[:9]==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1','--include-complete=false']
  second='--page-token' in a
- if second: assert a[8:]==['--page-token','next']
+ if second: assert a[9:]==['--page-token','next']
  own={'id':'self','name':'快捷姓名'}
  items=([{'guid':'both','creator':own,'members':[dict(own,role='assignee')]},{'guid':'removed','creator':own}] if second else [
   {'guid':'creator','creator':own},
@@ -1127,7 +1127,7 @@ fn related_pagination_never_returns_partial_results() {
 #[test]
 fn lark_connection_verifies_oauth_and_related_permission_without_tapd() {
     let (_d, mut g) = oauth_gateway(
-        "assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1']; print('{\"ok\":true,\"data\":{\"items\":[],\"has_more\":false}}')",
+        "assert a==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1','--include-complete=false']; print('{\"ok\":true,\"data\":{\"items\":[],\"has_more\":false}}')",
     );
     g.settings.tapd_path = "/does/not/exist/tapd".into();
     g.check_lark().unwrap();

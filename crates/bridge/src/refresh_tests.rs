@@ -3,6 +3,56 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
+fn incomplete_filter_is_sent_on_every_page_including_after_an_empty_page() {
+    let (dir, g) = oauth_gateway(
+        r#"
+if a[:2]==['task','+get-related-tasks']:
+ assert '--include-complete=false' in a
+ second='--page-token' in a
+ if second: assert a[a.index('--page-token')+1]=='next'
+ with open(__file__+'.pages','a') as f: f.write(('second' if second else 'first')+'\n')
+ items=[{'guid':'open','creator':{'id':'self'}}] if second else []
+ print(json.dumps({'ok':True,'data':{'items':items,'has_more':not second,'page_token':'next' if not second else ''}}))
+else:
+ p=json.load(sys.stdin);assert p['task_guid']=='open'
+ print(json.dumps({'ok':True,'data':{'task':{'guid':'open','summary':'Open','completed_at':'0','creator':{'id':'self'}}}}))
+"#,
+    );
+    let tasks = g.fetch_tasks().unwrap();
+    assert_eq!(
+        tasks.iter().map(|t| t.guid.as_str()).collect::<Vec<_>>(),
+        ["open"]
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.pages")).unwrap(),
+        "first\nsecond\n"
+    );
+}
+
+#[test]
+fn tasks_completed_after_listing_are_excluded_but_overdue_open_tasks_remain() {
+    let (_dir, g) = oauth_gateway(
+        r#"
+if a[:2]==['task','+get-related-tasks']:
+ print(json.dumps({'ok':True,'data':{'items':[{'guid':g,'creator':{'id':'self'},'completed_at':'0'} for g in ['overdue','just-completed','done-status']],'has_more':False}}))
+else:
+ p=json.load(sys.stdin);guid=p['task_guid']
+ task={'guid':guid,'summary':'Task','creator':{'id':'self'},'completed_at':'0','due':{'timestamp':'1577836800000'}}
+ if guid=='just-completed': task['completed_at']='1735689600000'
+ if guid=='done-status': task['status']='done'
+ print(json.dumps({'ok':True,'data':{'task':task}}))
+"#,
+    );
+    let tasks = g.fetch_tasks().unwrap();
+    assert_eq!(
+        tasks.iter().map(|t| t.guid.as_str()).collect::<Vec<_>>(),
+        ["overdue"]
+    );
+    assert!(!tasks[0].completed);
+    assert!(tasks[0].due.is_some());
+}
+
+#[test]
 fn cancelling_during_rate_limit_cooldown_stops_without_retrying() {
     let (dir, g) = oauth_gateway(
         r#"
