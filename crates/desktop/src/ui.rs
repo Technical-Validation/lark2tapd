@@ -2,6 +2,7 @@ mod appearance;
 use appearance::apply_theme;
 mod connection_results;
 mod connections;
+mod conversation;
 use connections::{CredentialChange, ServiceConnection};
 mod editor;
 mod feedback;
@@ -24,18 +25,22 @@ use gpui_kit::component::{
 use gpui_kit::component::{collapsible::Collapsible, switch::Switch};
 use lark2tapd_bridge::installer::{CliTool, InstallationPlan};
 use lark2tapd_core::{DirectoryCache, DraftAttachment, TapdWorkspace};
-use selectors::{ChoiceList, ChoiceState, selected};
+use selectors::{ChoiceList, ChoiceState, selected, type_key};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::Arc,
 };
+mod submission;
 mod tasks;
 // 主界面只管理视图和输入；同步、认证和持久化通过工作队列执行。
 use crate::{
     i18n::text,
     native::{self, NativeAction, StatusMenu},
-    worker::{Editor, Event, Job, Mode, Preference, Request, WorkerHandle, WorkerSender},
+    worker::{
+        ConversationResult, Editor, Event, Job, Mode, Preference, Request, WorkerHandle,
+        WorkerSender,
+    },
 };
 use gpui_kit::base::Disableable;
 use gpui_kit::component::{
@@ -108,6 +113,7 @@ pub struct Model {
     tray: Option<StatusMenu>,
 }
 impl EventEmitter<Editor> for Model {}
+impl EventEmitter<ConversationResult> for Model {}
 impl EventEmitter<MediaReady> for Model {}
 impl EventEmitter<MediaFailure> for Model {}
 impl EventEmitter<RemoteContext> for Model {}
@@ -117,10 +123,15 @@ impl Model {
         self.send_at(job, self.profile.clone(), cx);
     }
     fn send_at(&mut self, job: Job, profile: String, cx: &mut Context<Self>) {
+        // 点击即显示检查中；自动/后台检查仍通过同一个 tasks activity 更新。
+        let refresh = matches!(&job, Job::Refresh | Job::RefreshFrom(_));
+        if refresh && !self.activities.insert("tasks".into()) {
+            return;
+        }
         let field = match &job {
             Job::SetPreference(p) => Some(crate::worker::setting_field(p)),
             Job::CheckWorkspace(_) | Job::AddWorkspace(_) => Some("new-workspace"),
-            Job::Submit(..) | Job::CheckTarget { .. } | Job::AcceptTarget { .. } => Some("submit"),
+            Job::Submit(..) | Job::PrepareSubmit { .. } => Some("submit"),
             Job::SaveAndConnect { tool, .. }
             | Job::ClearCredentials(tool)
             | Job::Check(tool)
@@ -128,6 +139,7 @@ impl Model {
             Job::LoadConnectionStatus => Some("connection-status"),
             Job::ProbeCli(tool) => Some(connections::cli_key(*tool)),
             Job::LocalFile { .. } | Job::PastedImage { .. } => Some("attachments"),
+            Job::LoadWorkitemTypes(_) => Some("workitem-types"),
             _ => None,
         };
         if let Some(field) = field {
@@ -197,6 +209,9 @@ impl Model {
                 self.save_states.insert(key, SaveState::Dirty);
                 self.errors.insert(key, self.notice.clone());
             }
+            if refresh {
+                self.errors.insert("tasks", self.notice.clone());
+            }
             crate::console::failure("worker", "Worker stopped");
             self.queue_feedback(cx);
         }
@@ -213,7 +228,6 @@ impl Model {
                         | "credentials_cleared"
                         | "recovered"
                         | "authorized"
-                        | "target_accepted"
                         | "installed",
                     ..
                 }
@@ -328,6 +342,7 @@ impl Model {
                         .is_none_or(|s| s.last_checked.is_none());
                 if changed {
                     self.checked_workspace = None;
+                    self.errors.remove("tasks");
                     self.errors.remove("submit");
                     self.errors.remove("attachments");
                 }
@@ -382,6 +397,12 @@ impl Model {
                 }
                 if matches!(message, "installed" | "install_cancelled") {
                     self.install_plan = None;
+                }
+                if message == "types_loaded" {
+                    self.errors.remove("workitem-types");
+                }
+                if message == "refreshed" {
+                    self.errors.remove("tasks");
                 }
                 if !message.is_empty() {
                     self.notice = message_text(&snapshot.settings.language, message).into();
@@ -456,6 +477,7 @@ impl Model {
                 session,
                 target,
             }),
+            Event::Conversation(result) => cx.emit(result),
             Event::Editor(editor) => {
                 self.errors.remove("submit");
                 self.errors.remove("attachments");
@@ -865,8 +887,9 @@ pub struct Workspace {
     pending_prefix: Option<(String, String)>,
     edit_profile: String,
     editor_session: u64,
-    remote_target: Option<lark2tapd_core::TargetTask>,
-    source_open: bool,
+    include_source_link: bool,
+    pending_submission: Option<(Draft, SourceTask)>,
+    conversation_error: Option<String>,
     new_workspace_open: bool,
     clear_confirmation: Option<CliTool>,
     lark_form_open: bool,
@@ -882,6 +905,7 @@ pub struct Workspace {
     description_scroll: ScrollHandle,
     deferred_media: Vec<DeferredMedia>,
     workspace: Entity<ChoiceState>,
+    workitem_type: Entity<ChoiceState>,
     owner: Entity<ChoiceState>,
     prefix: Entity<ChoiceState>,
     due: Entity<DatePickerState>,
@@ -943,6 +967,11 @@ impl Workspace {
         )
         .detach();
         let workspace = choice_state(window, cx);
+        let workitem_type = choice_state(window, cx);
+        cx.subscribe(&workitem_type, |_, _, _: &SelectEvent<ChoiceList>, cx| {
+            cx.notify()
+        })
+        .detach();
         let settings_workspace = choice_state(window, cx);
         let settings_owner = choice_state(window, cx);
         let prefix_workspace = choice_state(window, cx);
@@ -992,9 +1021,11 @@ impl Workspace {
             this.edit_profile = editor.profile.clone();
             this.selected = Some(editor.source.guid.clone());
             let d = &editor.draft;
+            this.include_source_link = d.include_source_link;
             set(&this.title, d.title.clone(), window, cx);
             this.fill_projects(false, &d.workspace_id, window, cx);
             this.fill_members(false, &d.owner, window, cx);
+            this.fill_workitem_types(&type_key(&d.workitem_kind, &d.workitem_type_id), window, cx);
             this.fill_prefixes(&d.title_prefix, window, cx);
             this.due.update(cx, |s, cx| {
                 s.set_date(
@@ -1016,13 +1047,15 @@ impl Workspace {
             this.loading_images.clear();
             this.draft_baseline = Some(this.draft(cx));
             this.load_images(window, cx);
+            this.request_conversation(cx);
             let workspace = d.workspace_id.clone();
             if !workspace.is_empty() {
                 let model = this.model.clone();
                 let profile = editor.profile.clone();
                 cx.defer(move |cx| {
                     model.update(cx, |m, cx| {
-                        m.send_at(Job::LoadMembers(workspace), profile, cx)
+                        m.send_at(Job::LoadMembers(workspace.clone()), profile.clone(), cx);
+                        m.send_at(Job::LoadWorkitemTypes(workspace), profile, cx)
                     })
                 });
             }
@@ -1041,15 +1074,41 @@ impl Workspace {
             },
         )
         .detach();
-        cx.subscribe(&model, |this, _, remote: &RemoteContext, cx| {
-            if this.selected.as_ref() == Some(&remote.guid)
-                && this.edit_profile == remote.profile
-                && this.editor_session == remote.session
-            {
-                this.remote_target = Some(remote.target.clone());
-                cx.notify();
-            }
-        })
+        cx.subscribe_in(
+            &model,
+            window,
+            |this, _, result: &ConversationResult, window, cx| {
+                if this.selected.as_ref() == Some(&result.source.guid)
+                    && this.edit_profile == result.profile
+                    && this.editor_session == result.session
+                    && this.edit_source.as_ref() == Some(result.source.as_ref())
+                    && this
+                        .model
+                        .read(cx)
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            snapshot
+                                .records
+                                .iter()
+                                .any(|record| record.in_scope && record.source == *result.source)
+                        })
+                {
+                    this.conversation_error = result.error.clone();
+                    this.edit_source = Some(*result.source.clone());
+                    this.load_images(window, cx);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &model,
+            window,
+            |this, _, remote: &RemoteContext, window, cx| {
+                this.confirm_submission(remote, window, cx);
+            },
+        )
         .detach();
         cx.subscribe_in(
             &model,
@@ -1063,6 +1122,9 @@ impl Workspace {
         )
         .detach();
         cx.observe_in(&model, window, |this, _, window, cx| {
+            if this.model.read(cx).errors.contains_key("submit") {
+                this.pending_submission = None;
+            }
             let (revision, action, settings) = {
                 let m = this.model.read(cx);
                 (
@@ -1078,6 +1140,24 @@ impl Workspace {
                 {
                     set(&this.lark_path, s.lark_path.clone(), window, cx);
                     set(&this.tapd_path, s.tapd_path.clone(), window, cx);
+                }
+                // 未确认写入也保留服务器回执；自动填入恢复入口，不让用户盲猜或重复创建。
+                if this.recover_id.read(cx).value().trim().is_empty()
+                    && let Some(target) = this
+                        .model
+                        .read(cx)
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| {
+                            snapshot.records.iter().find(|record| {
+                                record.uncertain
+                                    && Some(&record.source.guid) == this.selected.as_ref()
+                            })
+                        })
+                        .and_then(|record| record.target.clone())
+                {
+                    set(&this.recover_id, target.id, window, cx);
+                    this.recover_kind = target.kind;
                 }
                 // 保存回执只推进比较基线，不覆盖回执到达前继续输入的内容。
                 if matches!(action, "draft_saved" | "imported")
@@ -1100,9 +1180,6 @@ impl Workspace {
                         })
                 {
                     this.draft_baseline = Some(saved);
-                }
-                if action == "target_accepted" {
-                    this.remote_target = None;
                 }
                 if action == "project_added" {
                     this.new_workspace_open = false;
@@ -1130,6 +1207,23 @@ impl Workspace {
                 }
             }
             this.sync_directory(window, cx);
+            let imported_type = this.selected.as_ref().and_then(|id| {
+                this.model
+                    .read(cx)
+                    .snapshot
+                    .as_ref()?
+                    .records
+                    .iter()
+                    .find(|r| &r.source.guid == id)?
+                    .target
+                    .as_ref()
+                    .map(|target| type_key(&target.kind, &target.workitem_type_id))
+            });
+            if let Some(id) = imported_type
+                && selected(&this.workitem_type, cx) != id
+            {
+                this.fill_workitem_types(&id, window, cx);
+            }
             if let Some(settings) = settings
                 && this.last_prefixes != settings.workspace_prefixes
             {
@@ -1158,6 +1252,8 @@ impl Workspace {
                 this.selected = None;
                 this.edit_source = None;
                 this.edit_profile.clear();
+                this.pending_submission = None;
+                this.conversation_error = None;
                 this.attachments.clear();
                 this.images.clear();
                 this.refresh_editor_images(cx);
@@ -1174,7 +1270,7 @@ impl Workspace {
                     .records
                     .iter()
                     .find(|r| &r.source.guid == id)
-            }) && let Some(saved) = &record.last_draft
+            }) && let Some(saved) = record.last_draft.clone()
             {
                 for a in &mut this.attachments {
                     if let Some(old) = saved.attachments.iter().find(|v| v.id == a.id) {
@@ -1226,9 +1322,10 @@ impl Workspace {
             discard_prompt_open: false,
             pending_prefix: None,
             edit_profile: String::new(),
-            source_open: false,
             editor_session: editor_session(),
-            remote_target: None,
+            include_source_link: true,
+            pending_submission: None,
+            conversation_error: None,
             new_workspace_open: false,
             clear_confirmation: None,
             lark_form_open: false,
@@ -1244,6 +1341,7 @@ impl Workspace {
             description_scroll,
             deferred_media: Vec::new(),
             workspace,
+            workitem_type,
             owner: choice_state(window, cx),
             prefix: choice_state(window, cx),
             due,
@@ -1326,10 +1424,29 @@ impl Workspace {
         });
     }
     fn draft(&self, cx: &App) -> Draft {
+        let selection = selected(&self.workitem_type, cx);
+        let bound = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .and_then(|s| {
+                s.records
+                    .iter()
+                    .find(|r| Some(&r.source.guid) == self.selected.as_ref())
+            })
+            .and_then(|r| r.target.as_ref());
+        let (kind, type_id) = bound.map_or_else(
+            || selection.split_once(':').unwrap_or(("story", "")),
+            |t| (t.kind.as_str(), t.workitem_type_id.as_str()),
+        );
         Draft {
+            workitem_kind: kind.into(),
+            workitem_type_id: type_id.into(),
+            include_source_link: self.include_source_link,
             title: self.title.read(cx).value().to_string(),
             title_prefix: selected(&self.prefix, cx),
-            attachments: self.attachments.clone(),
+            attachments: self.draft_attachments(cx),
             description: self.description.read(cx).value().to_string(),
             workspace_id: selected(&self.workspace, cx),
             owner: selected(&self.owner, cx),
@@ -1366,13 +1483,14 @@ impl Workspace {
         self.pending_pastes.clear();
         self.pending_files = 0;
         self.pending_file_paths.clear();
-        self.source_open = false;
         self.editor_session = editor_session();
-        self.remote_target = None;
+        self.pending_submission = None;
+        self.conversation_error = None;
         self.attachments.clear();
         self.images.clear();
         self.refresh_editor_images(cx);
         self.loading_images.clear();
+        set(&self.recover_id, String::new(), window, cx);
         set(&self.title, String::new(), window, cx);
         self.description.update(cx, |s, cx| s.set_text("", cx));
         self.deferred_media.clear();
@@ -1454,6 +1572,7 @@ impl Workspace {
         .detach();
     }
     fn reload_source(&mut self, guid: String, cx: &mut Context<Self>) {
+        self.conversation_error = None;
         self.editor_session = editor_session();
         self.edit_source = None;
         self.attachments.clear();
@@ -1464,7 +1583,7 @@ impl Workspace {
         self.deferred_media.clear();
         self.pending_files = 0;
         self.pending_file_paths.clear();
-        self.remote_target = None;
+        self.pending_submission = None;
         self.send(Job::OpenDraft(guid, true, self.editor_session), cx);
     }
     fn load_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1625,29 +1744,9 @@ impl Render for Workspace {
                             )
                             .child(self.last_check.clone())
                             .child(
-                                div()
-                                    .id("check-status")
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(div().size(px(7.)).rounded_full().bg(if checking {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().muted_foreground
-                                    }))
-                                    .child(if checking {
-                                        self.tr(cx, "正在检查", "Checking")
-                                    } else {
-                                        self.tr(cx, "就绪", "Ready")
-                                    }),
-                            )
-                            .child(
                                 Button::new("refresh")
-                                    .label(if checking {
-                                        self.tr(cx, "检查中…", "Checking…")
-                                    } else {
-                                        self.tr(cx, "立即检查", "Check now")
-                                    })
+                                    .label(self.tr(cx, "立即检查", "Check now"))
+                                    .disabled(checking)
                                     .primary()
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.send(Job::Refresh, cx)),
@@ -1710,11 +1809,7 @@ fn message_text<'a>(language: &str, key: &'a str) -> &'a str {
             "保留当前内容，正在后台读取",
             "Keeping current content while refreshing in the background",
         ),
-        "target_accepted" => text(
-            language,
-            "已接受远端版本，可以继续编辑和更新",
-            "Remote version accepted; continue editing and update when ready",
-        ),
+        "types_loaded" => text(language, "类型选项已刷新", "Work item types refreshed"),
         "projects_loaded" => text(
             language,
             "项目列表已刷新并缓存",

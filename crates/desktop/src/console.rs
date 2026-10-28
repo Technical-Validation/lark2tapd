@@ -59,7 +59,11 @@ pub fn category(message: &str) -> &'static str {
         message
     };
     let text = reason.to_ascii_lowercase();
-    if [
+    if text.starts_with("tapd readback differs") {
+        "readback_mismatch"
+    } else if text.starts_with("tapd changed since") {
+        "conflict"
+    } else if [
         "keychain", "sqlite", "database", "disk", "storage", "persist",
     ]
     .iter()
@@ -120,9 +124,10 @@ pub fn category(message: &str) -> &'static str {
     }
 }
 fn output(level: &str, module: &str, body: &str) {
+    // atexit 和 panic hook 可能晚于时区 TLS 的销毁；UTC 不依赖该缓存，Z 明确标识时区。
     let line = format!(
         "{} [{level}] [{module}] {body}",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
     );
     #[cfg(not(test))]
     let _ = writeln!(std::io::stderr().lock(), "{line}");
@@ -312,8 +317,68 @@ pub fn tasks(before: &Snapshot, after: &Snapshot) {
 mod tests {
     use super::*;
     use lark2tapd_core::{SourceTask, SyncRecord};
+
+    #[test]
+    fn readback_failure_has_a_specific_safe_category() {
+        assert_eq!(
+            category(
+                "TAPD readback differs in description; target ID retained, write remains uncertain"
+            ),
+            "readback_mismatch"
+        );
+        assert_eq!(
+            category(
+                "TAPD changed since the accepted version; review its current contents before updating"
+            ),
+            "conflict"
+        );
+    }
+
+    #[test]
+    fn tls_teardown_log_child() {
+        if std::env::var_os("LARK2TAPD_TLS_LOG_TEST").is_none() {
+            return;
+        }
+        struct LogOnDrop;
+        impl Drop for LogOnDrop {
+            fn drop(&mut self) {
+                event("test.lifecycle", "tls_teardown_logged");
+            }
+        }
+        thread_local! { static FINAL_LOG: LogOnDrop = const { LogOnDrop }; }
+        install_panic_hook();
+        std::thread::spawn(|| {
+            FINAL_LOG.with(|_| {});
+            // 在日志析构器之后初始化本地时区缓存，使它先被销毁。
+            let _ = chrono::Local::now();
+            event("test.lifecycle", "before_teardown");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn logging_survives_thread_local_teardown_without_recursive_panic() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "console::tests::tls_teardown_log_child",
+                "--nocapture",
+            ])
+            .env("LARK2TAPD_TLS_LOG_TEST", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("tls_teardown_logged"));
+    }
+
     fn record(id: &str) -> SyncRecord {
         SyncRecord {
+            last_synced_at: None,
             media_body_pending: false,
             title_prefix: String::new(),
             last_draft: None,
@@ -362,6 +427,7 @@ mod tests {
     fn pending_content_and_changed_tasks_are_included_in_unsynced_total() {
         let mut synced = record("synced");
         synced.target = Some(lark2tapd_core::TargetTask {
+            workitem_type_id: String::new(),
             id: "1".into(),
             url: String::new(),
             kind: "story".into(),

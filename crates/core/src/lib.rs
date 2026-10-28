@@ -15,15 +15,86 @@ pub struct SourcePerson {
     pub id: String,
     pub name: String,
 }
+// 消息正文仍以任务快照为准；通过标识补查发送信息，不拿任务信息代替。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SourceMessage {
+    pub message_id: String,
+    pub content: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SourceMessageDetails {
+    pub sender: Option<SourcePerson>,
+    pub sent_at: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq)]
 #[serde(default)]
 pub struct SourceMetadata {
     pub creator: Option<SourcePerson>,
     pub assignees: Vec<SourcePerson>,
+    pub followers: Vec<SourcePerson>,
+    pub source_messages: Vec<SourceMessage>,
+    pub updated_at: Option<String>,
     // 保留飞书原始毫秒时间戳；显示时再按用户本地时区转换。
     pub created_at: Option<String>,
     pub completed_at: Option<String>,
     pub due_at: Option<String>,
+    pub resolved_names: BTreeMap<String, String>,
+    pub message_details: BTreeMap<String, SourceMessageDetails>,
+    // 数字来源消息 -> 原文匹配出的独立消息；只用于展示，不能当作来源 ID 转换。
+    pub matched_messages: BTreeMap<String, Vec<SourceMessage>>,
+    pub source_images: BTreeMap<String, DraftAttachment>,
+}
+impl SourceMetadata {
+    pub fn matched_messages_for(&self, source: &SourceMessage) -> Option<&[SourceMessage]> {
+        let messages = self.matched_messages.get(&source.message_id)?;
+        // 旧缓存与迟到结果必须仍逐字覆盖当前原文；不能展示只匹配了一部分的会话。
+        (!messages.is_empty()
+            && messages.iter().all(|message| !message.content.is_empty())
+            && messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+                == source.content)
+            .then_some(messages.as_slice())
+    }
+
+    // CLI 的 localized_name 可能退化为 ID；展示层不把它作为姓名。
+    pub fn person_name<'a>(&'a self, person: &'a SourcePerson) -> Option<&'a str> {
+        [
+            &person.name,
+            self.resolved_names.get(&person.id).unwrap_or(&person.name),
+        ]
+        .into_iter()
+        .find(|name| !name.trim().is_empty() && **name != person.id)
+        .map(String::as_str)
+    }
+}
+impl PartialEq for SourceMetadata {
+    // 补查结果仅用于显示：权限变化、超时或人员改名不能令草稿过期或触发待同步。
+    fn eq(&self, other: &Self) -> bool {
+        (
+            &self.creator,
+            &self.assignees,
+            &self.followers,
+            &self.source_messages,
+            &self.updated_at,
+            &self.created_at,
+            &self.completed_at,
+            &self.due_at,
+        ) == (
+            &other.creator,
+            &other.assignees,
+            &other.followers,
+            &other.source_messages,
+            &other.updated_at,
+            &other.created_at,
+            &other.completed_at,
+            &other.due_at,
+        )
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TapdWorkspace {
@@ -33,6 +104,14 @@ pub struct TapdWorkspace {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TapdMember {
     pub account: String,
+    pub name: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TapdWorkitemType {
+    #[serde(default = "story_kind")]
+    pub kind: String,
+    /// 空值表示该种类不使用类型 ID（例如传统 Bug）。
+    pub id: String,
     pub name: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +127,8 @@ pub struct DirectoryCache {
     pub manual_workspaces: Vec<TapdWorkspace>,
     pub workspaces_fetched_at: Option<String>,
     pub members: BTreeMap<String, MemberCache>,
+    #[serde(default)]
+    pub workitem_types: BTreeMap<String, Vec<TapdWorkitemType>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,10 +139,32 @@ pub struct SourceTask {
     pub url: String,
     pub due: Option<String>,
     pub completed: bool,
+    // 详情随字段扩展，不让它同时膨胀每个携带任务的后台队列消息。
     #[serde(default)]
-    pub metadata: SourceMetadata,
+    pub metadata: Box<SourceMetadata>,
 }
 impl SourceTask {
+    pub fn needs_conversation_resolution(&self) -> bool {
+        self.metadata.source_messages.iter().any(|message| {
+            !message.message_id.is_empty()
+                && message.message_id.bytes().all(|byte| byte.is_ascii_digit())
+                && !message.content.trim().is_empty()
+                && self
+                    .metadata
+                    .matched_messages_for(message)
+                    .is_none_or(|matched| {
+                        matched.iter().any(|message| {
+                            self.metadata
+                                .message_details
+                                .get(&message.message_id)
+                                .and_then(|details| details.sender.as_ref())
+                                .and_then(|person| self.metadata.person_name(person))
+                                .is_none()
+                        })
+                    })
+        })
+    }
+
     // 仅比较稳定身份；缺少身份或同名不能推断为本人。
     pub fn is_related_to(&self, user_id: &str) -> bool {
         !user_id.trim().is_empty()
@@ -79,6 +182,12 @@ impl SourceTask {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Draft {
+    #[serde(default = "story_kind")]
+    pub workitem_kind: String,
+    #[serde(default)]
+    pub workitem_type_id: String,
+    #[serde(default = "include_source_link_default")]
+    pub include_source_link: bool,
     pub title: String,
     #[serde(default)]
     pub title_prefix: String,
@@ -91,6 +200,9 @@ pub struct Draft {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DraftAttachment {
+    /// 来源派生图片的待上传意图随正文引用存在，保存/重开也不能变成独立附件。
+    #[serde(default)]
+    pub source_derived: bool,
     pub id: String,
     pub name: String,
     pub path: String,
@@ -102,6 +214,13 @@ pub struct DraftAttachment {
     pub remote_url: Option<String>,
     #[serde(default)]
     pub uncertain: bool,
+}
+fn story_kind() -> String {
+    "story".into()
+}
+
+fn include_source_link_default() -> bool {
+    true
 }
 impl Draft {
     // 只折叠所选前缀，不吞掉标题中的其他用户文本。
@@ -115,6 +234,8 @@ impl Draft {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TargetTask {
+    #[serde(default)]
+    pub workitem_type_id: String,
     pub id: String,
     pub url: String,
     pub kind: String,
@@ -123,8 +244,30 @@ pub struct TargetTask {
     pub owner: String,
     pub due: Option<String>,
 }
+// 写入已返回合法目标身份，但读回未确认；保留回执不等于宣布同步成功。
+pub struct UnconfirmedWrite {
+    pub target: TargetTask,
+    pub message: String,
+}
+impl std::fmt::Display for UnconfirmedWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::fmt::Debug for UnconfirmedWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnconfirmedWrite")
+            .field("message", &self.message)
+            .finish_non_exhaustive()
+    }
+}
+impl std::error::Error for UnconfirmedWrite {}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncRecord {
+    /// 整次提交完成后记录；中间正文写入、附件回执和失败不能推进成功时间。
+    #[serde(default)]
+    pub last_synced_at: Option<String>,
     /// 图片已上传不代表正文已回填；独立日志防止失败或重启后误报完成。
     #[serde(default)]
     pub media_body_pending: bool,
@@ -230,6 +373,9 @@ pub struct Snapshot {
 
 // 网关保持同步；桌面端必须在后台 actor 线程调用，不能阻塞 UI。
 pub trait Gateway: Send {
+    fn list_workitem_types(&self, _workspace: &str) -> Result<Vec<TapdWorkitemType>> {
+        Err(anyhow!("Work item types are unavailable"))
+    }
     fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
         Err(anyhow!("Workspace enumeration is not supported"))
     }
@@ -395,7 +541,7 @@ impl Engine {
             "Target identity changed"
         );
         ensure!(
-            target.description.contains(&source_marker(guid)),
+            record.target.is_some() || target.description.contains(&source_marker(guid)),
             "Source marker missing: inspect TAPD manually; automatic retry remains blocked"
         );
         ensure!(
@@ -448,18 +594,39 @@ impl Engine {
             record.in_scope = false;
         }
         let mut discovered = 0;
-        for source in tasks {
+        for mut source in tasks {
             if let Some(record) = state
                 .snapshot
                 .records
                 .iter_mut()
                 .find(|r| r.source.guid == source.guid)
             {
+                // 只有同一原生来源版本才复用匹配缓存；正文/成员/更新时间变化即失效。
+                if record.source == source {
+                    let previous = &record.source.metadata;
+                    source.metadata.matched_messages = previous.matched_messages.clone();
+                    source.metadata.source_images = previous.source_images.clone();
+                    for (id, details) in &previous.message_details {
+                        source
+                            .metadata
+                            .message_details
+                            .entry(id.clone())
+                            .or_insert_with(|| details.clone());
+                    }
+                    for (id, name) in &previous.resolved_names {
+                        source
+                            .metadata
+                            .resolved_names
+                            .entry(id.clone())
+                            .or_insert_with(|| name.clone());
+                    }
+                }
                 // 保留导入基线和人工草稿；缺失任务也不会从缓存删除。
                 record.source = source;
                 record.in_scope = true;
             } else {
                 state.snapshot.records.push(SyncRecord {
+                    last_synced_at: None,
                     media_body_pending: false,
                     in_scope: true,
                     title_prefix: String::new(),
@@ -479,6 +646,52 @@ impl Engine {
         self.persist(state).await?;
         Ok(discovered)
     }
+    pub async fn cache_conversation(&mut self, source: &SourceTask) -> Result<bool> {
+        let mut state = self.state.clone();
+        let Some(record) = state
+            .snapshot
+            .records
+            .iter_mut()
+            .find(|record| record.in_scope && record.source == *source)
+        else {
+            return Ok(false);
+        };
+        // 只更新展示补全信息，不修改原文、草稿、同步基线或任务范围。
+        for id in source.metadata.matched_messages.keys() {
+            ensure!(
+                source
+                    .metadata
+                    .source_messages
+                    .iter()
+                    .any(|message| &message.message_id == id
+                        && source.metadata.matched_messages_for(message).is_some()),
+                "Incomplete conversation match"
+            );
+        }
+        record
+            .source
+            .metadata
+            .matched_messages
+            .clone_from(&source.metadata.matched_messages);
+        record
+            .source
+            .metadata
+            .message_details
+            .extend(source.metadata.message_details.clone());
+        record
+            .source
+            .metadata
+            .source_images
+            .extend(source.metadata.source_images.clone());
+        record
+            .source
+            .metadata
+            .resolved_names
+            .extend(source.metadata.resolved_names.clone());
+        self.persist(state).await?;
+        Ok(true)
+    }
+
     // 全量目录先校验再原子替换；网络、校验或落盘失败都保留旧缓存。
     pub async fn refresh_workspaces(&mut self, gateway: &impl Gateway) -> Result<()> {
         let mut workspaces = gateway.list_workspaces()?;
@@ -495,6 +708,32 @@ impl Engine {
         }
         state.snapshot.directory.workspaces = workspaces;
         state.snapshot.directory.workspaces_fetched_at = Some(Utc::now().to_rfc3339());
+        self.persist(state).await
+    }
+    pub async fn refresh_workitem_types(
+        &mut self,
+        gateway: &impl Gateway,
+        workspace: &str,
+    ) -> Result<()> {
+        ensure!(!workspace.trim().is_empty(), "Workspace is required");
+        let items = gateway.list_workitem_types(workspace)?;
+        // 种类和类型 ID 共同决定目录身份；Bug 可没有类型 ID，但不能借用 Story 的身份。
+        let mut identities = HashSet::new();
+        for item in &items {
+            ensure!(
+                matches!(item.kind.as_str(), "story" | "bug")
+                    && (item.kind == "bug" || !item.id.trim().is_empty())
+                    && !item.name.trim().is_empty()
+                    && identities.insert((&item.kind, &item.id)),
+                "Invalid or duplicate work item type"
+            );
+        }
+        let mut state = self.state.clone();
+        state
+            .snapshot
+            .directory
+            .workitem_types
+            .insert(workspace.into(), items);
         self.persist(state).await
     }
     pub async fn refresh_members(&mut self, gateway: &impl Gateway, workspace: &str) -> Result<()> {
@@ -684,9 +923,27 @@ impl Engine {
             && record.baseline.as_ref() == Some(&record.source)
             && let Some(last) = &record.last_draft
         {
-            return Ok(last.clone());
+            let mut draft = last.clone();
+            if let Some(target) = &record.target {
+                draft.workitem_kind = target.kind.clone();
+                draft.workitem_type_id = target.workitem_type_id.clone();
+            }
+            return Ok(draft);
         }
-        Ok(record.draft.clone().unwrap_or_else(|| Draft {
+        let mut draft = record.draft.clone().unwrap_or_else(|| Draft {
+            workitem_kind: record
+                .target
+                .as_ref()
+                .map_or_else(story_kind, |t| t.kind.clone()),
+            workitem_type_id: record
+                .target
+                .as_ref()
+                .map(|target| target.workitem_type_id.clone())
+                .unwrap_or_default(),
+            include_source_link: record
+                .last_draft
+                .as_ref()
+                .is_none_or(|draft| draft.include_source_link),
             title: record.source.title.clone(),
             title_prefix: record.title_prefix.clone(),
             attachments: record
@@ -704,7 +961,23 @@ impl Engine {
                 |t| t.owner.clone(),
             ),
             due: record.source.due.clone(),
-        }))
+        });
+        if let Some(target) = &record.target {
+            draft.workitem_kind = target.kind.clone();
+            draft.workitem_type_id = target.workitem_type_id.clone();
+        }
+        Ok(draft)
+    }
+    pub async fn finish_submission(&mut self, guid: &str) -> Result<()> {
+        let index = self.index(guid)?;
+        let record = &self.snapshot().records[index];
+        ensure!(
+            record.target.is_some() && !record.uncertain && !record.has_pending_attachments(),
+            "Submission is not fully confirmed"
+        );
+        let mut state = self.state.clone();
+        state.snapshot.records[index].last_synced_at = Some(Utc::now().to_rfc3339());
+        self.persist(state).await
     }
     pub async fn set_media_body_pending(&mut self, guid: &str, pending: bool) -> Result<()> {
         let index = self.index(guid)?;
@@ -714,27 +987,6 @@ impl Engine {
             "Persist target before recording image finalization"
         );
         state.snapshot.records[index].media_body_pending = pending;
-        self.persist(state).await
-    }
-    /// 调用方已展示并再次核对远端版本；此处只接受同一目标，绝不执行覆盖写入。
-    pub async fn accept_target(&mut self, guid: &str, target: &TargetTask) -> Result<()> {
-        let index = self.index(guid)?;
-        let record = &self.snapshot().records[index];
-        ensure!(
-            !record.uncertain,
-            "Recover uncertain write before accepting remote edits"
-        );
-        let old = record
-            .target
-            .as_ref()
-            .ok_or_else(|| anyhow!("No existing target"))?;
-        ensure!(
-            old.id == target.id && old.kind == target.kind,
-            "Cannot accept a different target identity"
-        );
-        validate_target(target)?;
-        let mut state = self.state.clone();
-        state.snapshot.records[index].target = Some(target.clone());
         self.persist(state).await
     }
     /// 任务映射持久化后逐个记录附件上传状态；调用方必须先记不确定再发起上传。
@@ -815,6 +1067,30 @@ impl Engine {
             "Uncertain write: do not retry; inspect TAPD and bind the existing remote task"
         );
         validate_draft(draft)?;
+        if let Some(target) = &record.target {
+            let accepted_type = expected_target
+                .as_ref()
+                .unwrap_or(target)
+                .workitem_type_id
+                .as_str();
+            ensure!(
+                target.kind == draft.workitem_kind
+                    && (accepted_type.is_empty() || accepted_type == draft.workitem_type_id),
+                "Cannot change the type of an imported item"
+            );
+        } else {
+            ensure!(
+                self.snapshot()
+                    .directory
+                    .workitem_types
+                    .get(&draft.workspace_id)
+                    .is_some_and(
+                        |types| types.iter().any(|item| item.kind == draft.workitem_kind
+                            && item.id == draft.workitem_type_id)
+                    ),
+                "Load and select a current TAPD work item type before importing"
+            );
+        }
         // 不能跨项目复用选择；已删除的配置也不能经旧草稿绕过校验。
         ensure!(
             draft.title_prefix.is_empty()
@@ -893,6 +1169,17 @@ impl Engine {
             Err(error) => {
                 let mut failed = self.state.clone();
                 failed.snapshot.records[index].last_error = Some(error.to_string());
+                // 已返回的合法身份必须保留，但 uncertain 仍为 true，绝不自动重试创建。
+                if let Some(receipt) = error.downcast_ref::<UnconfirmedWrite>()
+                    && validate_target(&receipt.target).is_ok()
+                    && record.target.as_ref().is_none_or(|old| {
+                        old.id == receipt.target.id && old.kind == receipt.target.kind
+                    })
+                {
+                    failed.snapshot.records[index].target = Some(receipt.target.clone());
+                    failed.snapshot.records[index].target_workspace =
+                        Some(draft.workspace_id.clone());
+                }
                 self.persist(failed).await?;
                 return Err(error);
             }
@@ -969,7 +1256,7 @@ fn validate_draft(draft: &Draft) -> Result<()> {
 fn validate_target(target: &TargetTask) -> Result<()> {
     ensure!(!target.id.trim().is_empty(), "Missing target ID");
     ensure!(
-        ["story", "task"].contains(&target.kind.as_str()),
+        ["story", "task", "bug"].contains(&target.kind.as_str()),
         "Unsupported target kind"
     );
     ensure!(!target.title.trim().is_empty(), "Missing target title");
@@ -1022,7 +1309,7 @@ impl Default for MockGateway {
                         ),
                         due: Some("2026-07-01".into()),
                         completed: false,
-                        metadata: SourceMetadata {
+                        metadata: Box::new(SourceMetadata {
                             creator: Some(SourcePerson {
                                 id: "demo-self".into(),
                                 name: "演示用户".into(),
@@ -1034,7 +1321,8 @@ impl Default for MockGateway {
                             created_at: Some("1780272000000".into()),
                             completed_at: None,
                             due_at: Some("1782864000000".into()),
-                        },
+                            ..Default::default()
+                        }),
                     })
                     .collect(),
                 targets: BTreeMap::new(),
@@ -1096,6 +1384,24 @@ impl MockGateway {
     }
 }
 impl Gateway for MockGateway {
+    fn list_workitem_types(&self, workspace: &str) -> Result<Vec<TapdWorkitemType>> {
+        ensure!(
+            ["demo", "demo-2"].contains(&workspace),
+            "Workspace not found"
+        );
+        Ok(vec![
+            TapdWorkitemType {
+                kind: "story".into(),
+                id: if workspace == "demo" { "7" } else { "8" }.into(),
+                name: "开发任务".into(),
+            },
+            TapdWorkitemType {
+                kind: "bug".into(),
+                id: String::new(),
+                name: "Bug".into(),
+            },
+        ])
+    }
     fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
         Ok(vec![
             TapdWorkspace {
@@ -1143,9 +1449,13 @@ impl Gateway for MockGateway {
             .lock()
             .map_err(|_| anyhow!("Mock store lock poisoned"))?;
         let id = format!("mock-{}", source.guid);
-        let key = (draft.workspace_id.clone(), id.clone(), "story".into());
+        let key = (
+            draft.workspace_id.clone(),
+            id.clone(),
+            draft.workitem_kind.clone(),
+        );
         ensure!(!store.targets.contains_key(&key), "Mock duplicate target");
-        let target = mock_target(id, "story".into(), draft, source);
+        let target = mock_target(id, draft.workitem_kind.clone(), draft, source);
         store.targets.insert(key, target.clone());
         Ok(target)
     }
@@ -1168,9 +1478,15 @@ impl Gateway for MockGateway {
 }
 fn mock_target(id: String, kind: String, draft: &Draft, source: &SourceTask) -> TargetTask {
     TargetTask {
+        workitem_type_id: draft.workitem_type_id.clone(),
         url: format!(
-            "https://www.tapd.cn/{}/prong/stories/view/{id}",
-            draft.workspace_id
+            "https://www.tapd.cn/{}/prong/{}/view/{id}",
+            draft.workspace_id,
+            match kind.as_str() {
+                "bug" => "bugs",
+                "task" => "tasks",
+                _ => "stories",
+            }
         ),
         id,
         kind,

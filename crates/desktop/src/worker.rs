@@ -1,10 +1,13 @@
 //! 串行 actor 拥有数据库与写入日志；只读任务并行取回数据，按账户/配置代数合并。
 #[path = "worker_cli_paths.rs"]
 mod cli_paths;
+#[cfg(test)]
+#[path = "worker_media_tests.rs"]
+mod media_tests;
 use anyhow::{Result, bail};
 use cli_paths::discover_executable;
 use lark2tapd_bridge::installer::{
-    CliTool, InstallationPlan, install_cli, installation_plan, probe_supported_cli,
+    CliTool, InstallationPlan, install_cli, installation_plan, probe_cli,
 };
 use lark2tapd_bridge::{
     CliGateway, ConnectionReport, Credentials, load_credentials, save_credentials,
@@ -65,6 +68,7 @@ impl RefreshTrigger {
 pub enum Job {
     LoadProjects,
     LoadMembers(String),
+    LoadWorkitemTypes(String),
     AddWorkspace(TapdWorkspace),
     CheckWorkspace(TapdWorkspace),
     SetPreference(Preference),
@@ -86,18 +90,18 @@ pub enum Job {
     Refresh,
     RefreshFrom(RefreshTrigger),
     OpenDraft(String, bool, u64),
-    CheckTarget {
-        guid: String,
+    ResolveConversation {
+        source: Box<SourceTask>,
         session: u64,
     },
-    AcceptTarget {
+    PrepareSubmit {
         guid: String,
-        target: TargetTask,
+        session: u64,
     },
     ClearCredentials(CliTool),
     LoadConnectionStatus,
     SaveDraft(String, Draft, SourceTask),
-    Submit(String, Draft, SourceTask),
+    Submit(String, Draft, SourceTask, Option<Box<TargetTask>>),
     SaveAndConnect {
         tool: CliTool,
         credentials: Credentials,
@@ -114,6 +118,14 @@ pub enum Job {
         id: String,
         kind: String,
     },
+}
+
+#[derive(Clone)]
+pub struct ConversationResult {
+    pub source: Box<SourceTask>,
+    pub session: u64,
+    pub profile: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -199,6 +211,7 @@ pub enum Event {
         marker: Option<String>,
     },
     Editor(Editor),
+    Conversation(ConversationResult),
     InstallPlan(InstallationPlan),
     Error(String),
 }
@@ -222,6 +235,16 @@ enum Connection {
     Live(Box<CliGateway>),
 }
 impl Gateway for Connection {
+    fn list_workitem_types(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<lark2tapd_core::TapdWorkitemType>> {
+        match self {
+            #[cfg(test)]
+            Self::Mock(g) => g.list_workitem_types(workspace),
+            Self::Live(g) => g.list_workitem_types(workspace),
+        }
+    }
     fn list_workspaces(&self) -> Result<Vec<TapdWorkspace>> {
         match self {
             #[cfg(test)]
@@ -336,8 +359,10 @@ enum ReadData {
         binding: Option<String>,
     },
     Tasks(Vec<SourceTask>),
+    Conversation(ConversationResult),
     Projects(Vec<TapdWorkspace>),
     Members(String, Vec<TapdMember>),
+    WorkitemTypes(String, Vec<lark2tapd_core::TapdWorkitemType>),
     Workspace(TapdWorkspace),
     RemoteTarget {
         guid: String,
@@ -353,6 +378,12 @@ enum ReadData {
 }
 // 远端结果只携带数据；复用核心校验和事务，不将 Engine 移入网络线程。
 impl Gateway for ReadData {
+    fn list_workitem_types(&self, _: &str) -> Result<Vec<lark2tapd_core::TapdWorkitemType>> {
+        match self {
+            Self::WorkitemTypes(_, items) => Ok(items.clone()),
+            _ => bail!("Unexpected read"),
+        }
+    }
     fn fetch_tasks(&self) -> Result<Vec<SourceTask>> {
         match self {
             Self::Tasks(v) => Ok(v.clone()),
@@ -465,8 +496,12 @@ fn read_key(job: &Job) -> Option<String> {
         Job::Refresh | Job::RefreshFrom(_) => "tasks".into(),
         Job::LoadProjects => "projects".into(),
         Job::LoadMembers(id) => format!("members:{id}"),
+        Job::LoadWorkitemTypes(id) => format!("workitem-types:{id}"),
         Job::CheckWorkspace(w) => format!("workspace:{}:{}", w.id, w.name),
-        Job::CheckTarget { guid, session } => format!("target:{guid}:{session}"),
+        Job::PrepareSubmit { guid, session } => format!("target:{guid}:{session}"),
+        Job::ResolveConversation { source, session } => {
+            format!("conversation:{}:{session}", source.guid)
+        }
         Job::LocalFile {
             guid,
             path,
@@ -489,7 +524,9 @@ fn read_error_field(key: &str) -> &'static str {
     } else if key.starts_with("workspace:") {
         "new-workspace"
     } else if key.starts_with("target:") {
-        "target"
+        "submit"
+    } else if key.starts_with("workitem-types:") {
+        "workitem-types"
     } else if key.starts_with("members:") {
         "members"
     } else {
@@ -506,10 +543,12 @@ fn read_error_field(key: &str) -> &'static str {
 }
 fn field(job: &Job) -> &'static str {
     match job {
-        Job::CheckTarget { .. } | Job::AcceptTarget { .. } => "target",
+        Job::PrepareSubmit { .. } => "submit",
         Job::Refresh | Job::RefreshFrom(_) => "tasks",
+        Job::ResolveConversation { .. } => "conversation",
         Job::LoadProjects => "projects",
         Job::LoadMembers(_) => "members",
+        Job::LoadWorkitemTypes(_) => "workitem-types",
         Job::Check(tool) | Job::TestConnection { tool, .. } => connection_key(*tool),
         Job::ProbeCli(tool) => cli_key(*tool),
         Job::SetPreference(p) => setting_field(p),
@@ -628,6 +667,46 @@ fn spawn_cancellable_thread(
     action: impl FnOnce() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || lark2tapd_bridge::with_process_cancellation(cancelled, action))
+}
+
+// 图片下载不携带账户 Token；解码后转为受限 PNG，再进入同账户的已校验缓存。
+fn load_source_images(
+    source: &mut SourceTask,
+    root: &std::path::Path,
+    cancelled: &AtomicBool,
+) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut failure = None;
+    for url in lark2tapd_bridge::source_images::source_image_urls(source) {
+        if source.metadata.source_images.contains_key(&url) {
+            continue;
+        }
+        if source.metadata.source_images.len() >= 10 {
+            failure = Some("At most 10 source images can be cached for one task".into());
+            break;
+        }
+        let result = (|| -> Result<DraftAttachment> {
+            let bytes =
+                lark2tapd_bridge::source_images::download_source_image(&url, deadline, cancelled)?;
+            let png = lark2tapd_core::media::normalized_png(&bytes)
+                .map_err(|_| anyhow::anyhow!("Source image failed safe decoding"))?;
+            anyhow::ensure!(
+                png.len() < lark2tapd_bridge::MAX_INLINE_IMAGE_BYTES,
+                "Source image PNG exceeds TAPD's 5 MB limit"
+            );
+            lark2tapd_core::save_pasted_image(root, &png, "png")
+        })();
+        match result {
+            Ok(mut image) => {
+                image.source_derived = true;
+                source.metadata.source_images.insert(url, image);
+            }
+            Err(error) => {
+                failure = Some(error.to_string());
+            }
+        }
+    }
+    failure
 }
 
 fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) -> std::thread::JoinHandle<()> {
@@ -765,6 +844,61 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) -> std::thre
                     },
                 ));
             }
+            // 选中后的补查独立于批量刷新和编辑队列；失败只反馈给对应编辑会话。
+            if let Job::ResolveConversation { source, session } = job {
+                let result = (|| -> Result<(SourceTask, Option<String>)> {
+                    let (profile, gateway) = connection(
+                        mode,
+                        settings,
+                        backend.as_ref(),
+                        #[cfg(test)]
+                        mock,
+                    )?;
+                    anyhow::ensure!(
+                        profile == origin,
+                        "Account changed; refresh tasks before matching conversation"
+                    );
+                    match gateway {
+                        Connection::Live(gateway) => {
+                            let mut enriched = *source.clone();
+                            let mut image_error = None;
+                            if lark2tapd_bridge::source_images::needs_source_images(&source) {
+                                anyhow::ensure!(
+                                    gateway.get_source(&source.guid)? == *source,
+                                    "Source changed; refresh before loading source images"
+                                );
+                                image_error = load_source_images(
+                                    &mut enriched,
+                                    &media_root(&data_root, &origin)?,
+                                    &cancelled,
+                                );
+                            }
+                            match gateway.resolve_source_conversation(&enriched, &cancelled) {
+                                Ok(matched) => Ok((matched, image_error)),
+                                Err(error) => Ok((
+                                    enriched,
+                                    Some(image_error.unwrap_or_else(|| error.to_string())),
+                                )),
+                            }
+                        }
+                        #[cfg(test)]
+                        Connection::Mock(_) => Ok((*source.clone(), None)),
+                    }
+                })();
+                let (source, error) = match result {
+                    Ok((source, error)) => (Box::new(source), error),
+                    Err(error) => (source, Some(error.to_string())),
+                };
+                return Ok((
+                    origin.clone(),
+                    ReadData::Conversation(ConversationResult {
+                        source,
+                        session,
+                        profile: origin,
+                        error,
+                    }),
+                ));
+            }
             let (profile, gateway) = connection(
                 mode,
                 settings,
@@ -773,7 +907,7 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) -> std::thre
                 mock,
             )?;
             let data = match job {
-                Job::CheckTarget { guid, session } => {
+                Job::PrepareSubmit { guid, session } => {
                     let (workspace, target) =
                         target_identity.ok_or_else(|| anyhow::anyhow!("No persisted target"))?;
                     ReadData::RemoteTarget {
@@ -784,6 +918,10 @@ fn spawn_read(sender: Weak<mpsc::Sender<Envelope>>, task: ReadTask) -> std::thre
                 }
                 Job::Refresh | Job::RefreshFrom(_) => ReadData::Tasks(gateway.fetch_tasks()?),
                 Job::LoadProjects => ReadData::Projects(gateway.list_workspaces()?),
+                Job::LoadWorkitemTypes(id) => {
+                    let items = gateway.list_workitem_types(&id)?;
+                    ReadData::WorkitemTypes(id, items)
+                }
                 Job::LoadMembers(id) => {
                     let members = gateway.list_members(&id)?;
                     ReadData::Members(id, members)
@@ -854,7 +992,7 @@ trait ConnectionBackend: Send + Sync {
             CliTool::Lark => &settings.lark_path,
             CliTool::Tapd => &settings.tapd_path,
         };
-        probe_supported_cli(tool, std::path::Path::new(path))
+        probe_cli(tool, std::path::Path::new(path))
     }
     fn check(
         &self,
@@ -1101,7 +1239,7 @@ fn start_with_backend(
             lock.try_lock().map_err(|_| {
                 anyhow::anyhow!("This data directory is already open in another app instance")
             })?;
-            tokio::runtime::Runtime::new()?.block_on(async {
+            let result = tokio::runtime::Runtime::new()?.block_on(async {
                 let mut preferences = Engine::open(&root.join(if mode.is_mock() {
                     "preferences-mock.db"
                 } else {
@@ -1216,7 +1354,7 @@ fn start_with_backend(
                                 error_field = read_error_field(&done.key);
                                 if let (Err(error),Some((guid,profile,marker,session)))=(&done.result,&done.attachment_origin) && profile==&namespace {output.send(Event::AttachmentFailed{guid:guid.clone(),profile:profile.clone(),marker:marker.clone(),session:*session,message:error.to_string()}).await?;}
                                 let (current, data) = done.result?;
-                                if matches!(data, ReadData::Members(..) | ReadData::Workspace(_) | ReadData::Attachment {..} | ReadData::RemoteTarget{..}) {
+                                if matches!(data, ReadData::Members(..) | ReadData::WorkitemTypes(..) | ReadData::Workspace(_) | ReadData::Attachment {..} | ReadData::RemoteTarget{..} | ReadData::Conversation(_)) {
                                     anyhow::ensure!(current == namespace, "Account changed; refresh tasks before checking this project");
                                 }
                                 if !matches!(data, ReadData::CliProbe { .. } | ReadData::ConnectionReport { .. })
@@ -1262,6 +1400,20 @@ fn start_with_backend(
                                             output.send(Event::FormError { field: connection_key(*tool), message: failure.clone() }).await?;
                                         } else if report.connected { crate::console::change(connection_key(*tool),"verification_succeeded"); }
                                     }
+                                    ReadData::Conversation(result) => {
+                                        let mut result = result.clone();
+                                        if result.error.is_none() || !result.source.metadata.source_images.is_empty() {
+                                            match engine.cache_conversation(&result.source).await {
+                                                Ok(true) => {
+                                                    // 展示补全不参与来源相等比较，必须显式公布新快照。
+                                                    output.send(Event::State { mode, snapshot: engine.snapshot().clone(), profile: namespace.clone(), message: "", new_count: 0 }).await?;
+                                                }
+                                                Ok(false) => result.error = Some("Source changed; reload the task before matching conversation".into()),
+                                                Err(error) => result.error = Some(error.to_string()),
+                                            }
+                                        }
+                                        output.send(Event::Conversation(result)).await?;
+                                    }
                                     ReadData::Tasks(_) => {
                                         let prior = engine.snapshot().clone();
                                         new_count = engine.refresh(&data).await?;
@@ -1272,6 +1424,7 @@ fn start_with_backend(
                                         engine.refresh_workspaces(&data).await?;
                                         message = "projects_loaded";
                                     }
+                                    ReadData::WorkitemTypes(id, _) => {engine.refresh_workitem_types(&data,id).await?; message="types_loaded";}
                                     ReadData::Members(id, _) => {
                                         engine.refresh_members(&data, id).await?;
                                         message = "members_loaded";
@@ -1314,11 +1467,14 @@ fn start_with_backend(
                                     || !pending.keys().any(|key| key.ends_with("-connection")),
                                 "Connection in progress; finish authorization before refreshing account data"
                             );
-                            if matches!(job, Job::LoadMembers(_) | Job::CheckWorkspace(_) | Job::LocalFile{..} | Job::PastedImage{..} | Job::CheckTarget{..}) {
+                            if matches!(job, Job::LoadMembers(_) | Job::LoadWorkitemTypes(_) | Job::CheckWorkspace(_) | Job::LocalFile{..} | Job::PastedImage{..} | Job::PrepareSubmit{..} | Job::ResolveConversation{..}) {
                                 anyhow::ensure!(profile == namespace, "Account changed; refresh tasks first");
                             }
                             if let Job::LocalFile{guid,..} | Job::PastedImage{guid,..} = &job {
                                 anyhow::ensure!(engine.snapshot().records.iter().any(|r| &r.source.guid==guid), "Task no longer available");
+                            }
+                            if let Job::ResolveConversation { source, .. } = &job {
+                                anyhow::ensure!(engine.snapshot().records.iter().any(|record| record.in_scope && record.source == **source), "Source changed; reload the task before matching conversation");
                             }
                             if matches!(job, Job::Refresh | Job::RefreshFrom(_)) {
                                 opened = true;
@@ -1334,10 +1490,18 @@ fn start_with_backend(
                                     new_count: 0,
                                 })
                                 .await?;
-                            let target_identity=if let Job::CheckTarget{guid,..}=&job {
+                            let target_identity=if let Job::PrepareSubmit{guid,..}=&job {
                                 let r=engine.snapshot().records.iter().find(|r| &r.source.guid==guid).ok_or_else(||anyhow::anyhow!("Task no longer available"))?;
                                 Some((r.target_workspace.clone().ok_or_else(||anyhow::anyhow!("Missing target workspace"))?,r.target.clone().ok_or_else(||anyhow::anyhow!("No persisted target"))?))
                             }else{None};
+                            // 只补查当前选择；快速切换任务时回收旧会话查询，避免堆积后台搜索。
+                            if matches!(&job, Job::ResolveConversation { .. }) {
+                                let obsolete: Vec<_> = pending.keys().filter(|old| old.starts_with("conversation:") && *old != &key).cloned().collect();
+                                for old in obsolete {
+                                    if let Some(read) = pending.remove(&old) { read.cancelled.store(true, Ordering::SeqCst); }
+                                    output.send(Event::Activity { key: old, active: false }).await?;
+                                }
+                            }
                             if !begin_read(&mut pending,&key,generation,attachment_origin(&job,&namespace)) {
                                 return Ok(());
                             }
@@ -1523,7 +1687,7 @@ fn start_with_backend(
                                 engine.save_draft_for_source(&guid, &draft, &source).await?;
                                 message = "draft_saved";
                             }
-                            Job::Submit(..) | Job::Recover { .. } | Job::AcceptTarget{..} => {
+                            Job::Submit(..) | Job::Recover { .. } => {
                                 anyhow::ensure!(
                                     profile == namespace,
                                     "Account changed; reopen this task"
@@ -1531,15 +1695,7 @@ fn start_with_backend(
                                 let (current, gateway) = connection(mode, settings.clone(), backend.as_ref(), #[cfg(test)] mock.clone())?;
                                 anyhow::ensure!(current == namespace, "Account changed; refresh tasks first");
                                 match job {
-                                    Job::AcceptTarget{guid,target}=>{
-                                        let r=engine.snapshot().records.iter().find(|r|r.source.guid==guid).ok_or_else(||anyhow::anyhow!("Task no longer available"))?;
-                                        let old=r.target.as_ref().ok_or_else(||anyhow::anyhow!("No persisted target"))?;
-                                        anyhow::ensure!(old.id==target.id&&old.kind==target.kind,"Target identity changed");
-                                        let workspace=r.target_workspace.as_deref().ok_or_else(||anyhow::anyhow!("Missing target workspace"))?;
-                                        anyhow::ensure!(gateway.get_target(workspace,&target.id,&target.kind)?==target,"Remote target changed again; inspect it before accepting");
-                                        engine.accept_target(&guid,&target).await?;message="target_accepted";
-                                    }
-                                    Job::Submit(guid, draft, source) => {
+                                    Job::Submit(guid, draft, source, expected) => {
                                         output
                                             .send(Event::Activity {
                                                 key: "submit".into(),
@@ -1553,6 +1709,7 @@ fn start_with_backend(
                                             &guid,
                                             draft,
                                             source,
+                                            expected.map(|target| *target),
                                         )
                                         .await;
                                         output
@@ -1620,7 +1777,10 @@ fn start_with_backend(
                     }
                 }
                 Ok::<_, anyhow::Error>(())
-            })
+            });
+            // 后台线程全部退出后显式解锁；并行 fork 短暂继承的描述符不能延迟退出确认后的锁释放。
+            lock.unlock()?;
+            result
         })();
         if let Err(error) = result {
             crate::console::failure("worker", &error.to_string());
@@ -1644,6 +1804,7 @@ async fn submit(
     guid: &str,
     mut draft: Draft,
     source: SourceTask,
+    expected: Option<TargetTask>,
 ) -> Result<()> {
     anyhow::ensure!(
         draft.attachments.len() <= 10,
@@ -1672,6 +1833,15 @@ async fn submit(
             }
         }
     }
+    // 防止保存重开后的旧表单把已删来源图重新上传；不丢弃上传结果不确定的日志。
+    let referenced = lark2tapd_bridge::referenced_image_ids(&draft.description);
+    draft.attachments.retain(|a| {
+        !a.source_derived
+            || referenced.contains(&a.id)
+            || a.uncertain
+            || a.remote_id.is_some()
+            || a.remote_url.is_some()
+    });
     for attachment in &draft.attachments {
         lark2tapd_core::media::verify_attachment(media, attachment)?;
         lark2tapd_bridge::validate_attachment_for_upload(attachment)?;
@@ -1682,13 +1852,20 @@ async fn submit(
     }
     gateway.validate_draft(&draft)?;
     engine.validate_destination(&draft)?;
+    let expected = expected.or_else(|| {
+        engine
+            .snapshot()
+            .records
+            .iter()
+            .find(|r| r.source.guid == guid)
+            .and_then(|r| r.target.clone())
+    });
+    // 已导入条目的类型来自这次确认的远端版本；不把旧缓存缺字段当成改类型请求。
+    if let Some(target) = &expected {
+        draft.workitem_kind = target.kind.clone();
+        draft.workitem_type_id = target.workitem_type_id.clone();
+    }
     engine.save_draft_for_source(guid, &draft, &source).await?;
-    let expected = engine
-        .snapshot()
-        .records
-        .iter()
-        .find(|r| r.source.guid == guid)
-        .and_then(|r| r.target.clone());
     engine.commit(gateway, guid, &draft, expected).await?;
     // 第一次正文写入可能仍是图片占位符；回执落盘不能冒充正文已更新。
     let pending_image_body = draft
@@ -1737,7 +1914,7 @@ async fn submit(
         engine.commit(gateway, guid, &draft, Some(target)).await?;
         engine.set_media_body_pending(guid, false).await?;
     }
-    Ok(())
+    engine.finish_submission(guid).await
 }
 
 pub fn media_root(data_root: &std::path::Path, profile: &str) -> Result<PathBuf> {
@@ -2024,13 +2201,16 @@ mod tests {
             let mock = MockGateway::from_snapshot(engine.snapshot());
             engine.refresh(&mock).await.unwrap();
             engine.refresh_workspaces(&mock).await.unwrap();
+            engine.refresh_workitem_types(&mock, "demo").await.unwrap();
             engine.refresh_members(&mock, "demo").await.unwrap();
+            engine.refresh_workitem_types(&mock, "demo").await.unwrap();
             let mut settings = engine.snapshot().settings.clone();
             settings.workspace_id = "demo".into();
             engine.save_settings(settings).await.unwrap();
             let source = engine.snapshot().records[0].source.clone();
             let guid = source.guid.clone();
             let mut draft = engine.prepare(&guid).unwrap();
+            draft.workitem_type_id = "7".into();
             let path = root.path().join("note.txt");
             std::fs::write(&path, "selected file").unwrap();
             draft
@@ -2043,6 +2223,7 @@ mod tests {
                 &guid,
                 draft.clone(),
                 source.clone(),
+                None,
             )
             .await
             .unwrap();
@@ -2069,6 +2250,7 @@ mod tests {
                 &guid,
                 draft,
                 source,
+                None,
             )
             .await
             .unwrap();
@@ -2086,7 +2268,7 @@ mod tests {
         });
     }
     #[test]
-    fn editor_and_remote_review_echo_sessions_and_accept_explicitly() {
+    fn editor_and_submission_preflight_echo_sessions() {
         let root = tempfile::tempdir().unwrap();
         let worker = start(root.path().to_owned(), Mode::Mock);
         event(&worker);
@@ -2113,6 +2295,18 @@ mod tests {
                 break;
             }
         }
+        request(&worker, Job::LoadWorkitemTypes("demo".into()));
+        loop {
+            if matches!(
+                event(&worker),
+                Event::State {
+                    message: "types_loaded",
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
         request(&worker, Job::OpenDraft(guid.clone(), false, 42));
         let editor = loop {
             if let Event::Editor(editor) = event(&worker) {
@@ -2122,7 +2316,15 @@ mod tests {
         };
         request(
             &worker,
-            Job::Submit(guid.clone(), editor.draft, editor.source),
+            Job::Submit(
+                guid.clone(),
+                Draft {
+                    workitem_type_id: "7".into(),
+                    ..editor.draft
+                },
+                editor.source,
+                None,
+            ),
         );
         loop {
             if matches!(
@@ -2137,7 +2339,7 @@ mod tests {
         }
         request(
             &worker,
-            Job::CheckTarget {
+            Job::PrepareSubmit {
                 guid: guid.clone(),
                 session: 77,
             },
@@ -2156,18 +2358,7 @@ mod tests {
                 break target;
             }
         };
-        request(&worker, Job::AcceptTarget { guid, target });
-        loop {
-            if matches!(
-                event(&worker),
-                Event::State {
-                    message: "target_accepted",
-                    ..
-                }
-            ) {
-                break;
-            }
-        }
+        assert!(!target.id.is_empty());
     }
     #[test]
     fn failed_paste_reports_only_its_original_marker() {
@@ -2288,9 +2479,11 @@ mod tests {
             let mock = MockGateway::from_snapshot(engine.snapshot());
             engine.refresh(&mock).await.unwrap();
             engine.refresh_workspaces(&mock).await.unwrap();
+            engine.refresh_workitem_types(&mock, "demo").await.unwrap();
             let source = engine.snapshot().records[0].source.clone();
             let guid = source.guid.clone();
             let mut draft = engine.prepare(&guid).unwrap();
+            draft.workitem_type_id = "7".into();
             draft.workspace_id = "demo".into();
             let path = root.path().join("file.txt");
             std::fs::write(&path, "user selected").unwrap();
@@ -2314,7 +2507,8 @@ mod tests {
                     &media,
                     &guid,
                     draft,
-                    source
+                    source,
+                    None
                 )
                 .await
                 .unwrap_err()

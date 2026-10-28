@@ -6,6 +6,33 @@ use std::{fs::File, io::Read, path::Path};
 
 pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
+// 剪贴板、来源下载和预览共用像素/解码内存限制，不能只信任 Content-Type 或扩展名。
+pub fn bounded_image(bytes: &[u8]) -> Result<image::DynamicImage> {
+    use std::io::Cursor;
+    ensure!(
+        bytes.len() <= MAX_ATTACHMENT_BYTES as usize,
+        "Image exceeds 20 MiB"
+    );
+    let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let (w, h) = reader.into_dimensions()?;
+    ensure!(
+        w > 0 && h > 0 && w <= 8192 && h <= 8192 && u64::from(w) * u64::from(h) <= 16 * 1024 * 1024,
+        "Image dimensions exceed the safe limit"
+    );
+    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
+pub fn normalized_png(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut output = std::io::Cursor::new(Vec::new());
+    bounded_image(bytes)?.write_to(&mut output, image::ImageFormat::Png)?;
+    Ok(output.into_inner())
+}
+
 // 图片类型取自实际签名，不相信文件名；这里只识别格式，解码由 UI 图片库负责。
 fn image_extension(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -75,6 +102,7 @@ fn cache_bytes(root: &Path, bytes: &[u8], name: &str) -> Result<DraftAttachment>
     let cache = safe_fs::Cache::open(root, true)?;
     cache.store(&filename, bytes)?;
     let attachment = DraftAttachment {
+        source_derived: false,
         id,
         name: name.into(),
         path: cache

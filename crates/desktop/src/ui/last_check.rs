@@ -60,6 +60,14 @@ impl Render for LastCheck {
             .snapshot
             .as_ref()
             .and_then(|s| s.last_checked.as_deref());
+        let checking = model.activities.contains("tasks");
+        // 与全局错误通知保持同一文案，关闭详情时才能确认并清除待重播的错误。
+        let failure = model.errors.get("tasks").map(|error| {
+            format!(
+                "{} {error}",
+                text(model.language(), "操作未完成：", "Could not complete:")
+            )
+        });
         let label = relative_time(checked, model.language(), Utc::now());
         let full = checked
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -73,12 +81,51 @@ impl Render for LastCheck {
             .debug_selector(|| "last-check".into())
             .text_xs()
             .text_color(cx.theme().muted_foreground)
-            .child(label)
-            .when_some(full, |d, full| {
-                d.tooltip(move |window, cx| {
-                    gpui_kit::component::tooltip::Tooltip::new(full.clone()).build(window, cx)
-                })
+            // 状态只有一个入口；点击错误复用现有可关闭的详细通知，不占据顶栏宽度。
+            .when(checking, |d| {
+                d.child(div().debug_selector(|| "check-running".into()).child(text(
+                    model.language(),
+                    "检查中…",
+                    "Checking…",
+                )))
             })
+            .when(!checking, |d| {
+                if let Some(error) = failure {
+                    d.child(
+                        Button::new("check-error")
+                            .ghost()
+                            .text_color(cx.theme().danger)
+                            .label(text(model.language(), "检查失败", "Check failed"))
+                            .tooltip(text(
+                                model.language(),
+                                "点击查看错误详情",
+                                "View error details",
+                            ))
+                            .on_click(move |_, _, cx| {
+                                let message = error.clone();
+                                cx.defer(move |cx| {
+                                    feedback::present(
+                                        Feedback {
+                                            message,
+                                            error: true,
+                                        },
+                                        cx,
+                                    )
+                                });
+                            }),
+                    )
+                } else {
+                    d.child(div().debug_selector(|| "check-success".into()).child(label))
+                }
+            })
+            .when_some(
+                full.filter(|_| !checking && !model.errors.contains_key("tasks")),
+                |d, full| {
+                    d.tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                    })
+                },
+            )
     }
 }
 

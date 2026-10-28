@@ -2,16 +2,79 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// 两路服务端条件必须是并集；分页游标独立，重复任务只读一次详情。
+#[test]
+fn filtered_search_unions_creator_and_assignee_with_independent_pagination() {
+    let (dir, gateway) = oauth_gateway(
+        r#"
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ assert a[3:7]==['--as','user','--format','json']
+ params=json.loads(a[a.index('--params')+1]); body=json.load(sys.stdin)
+ assert body['query']=='' and body['filter']['is_completed'] is False
+ role='creator_ids' if 'creator_ids' in body['filter'] else 'assignee_ids'
+ assert body['filter']=={role:['self'],'is_completed':False}
+ second=params.get('page_token')=='next'
+ with open(__file__+'.queries','a') as f: f.write(role+':'+str(second)+'\n')
+ ids=(['both','removed','completed'] if second else ['creator','both']) if role=='creator_ids' else (['assignee'] if second else ['both'])
+ print(json.dumps({'ok':True,'data':{'items':[{'id':id} for id in ids],'has_more':not second,'page_token':'next' if not second else ''}}))
+elif a[:3]==['task','tasks','get']:
+ p=json.load(sys.stdin);id=p['task_guid']
+ with open(__file__+'.details','a') as f: f.write(id+'\n')
+ t={'guid':id,'summary':'Title','creator':{'id':'self' if id in ['creator','both','completed'] else 'other'}}
+ if id=='assignee': t['members']=[{'id':'self','role':'assignee'}]
+ if id=='completed': t['completed_at']='1735689600000'
+ print(json.dumps({'ok':True,'data':{'task':t}}))
+else: sys.exit(99)
+"#,
+    );
+    let tasks = gateway.fetch_tasks().unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.guid.as_str())
+            .collect::<Vec<_>>(),
+        ["creator", "both", "assignee"]
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("fake.queries")).unwrap(),
+        "creator_ids:False\ncreator_ids:True\nassignee_ids:False\nassignee_ids:True\n"
+    );
+    let details = fs::read_to_string(dir.path().join("fake.details")).unwrap();
+    let mut ids = details.lines().collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["assignee", "both", "completed", "creator", "removed"]);
+}
+
+#[test]
+fn second_search_failure_or_incomplete_notice_never_returns_creator_only_tasks() {
+    for result in [
+        "{'ok':False,'error':{'type':'authorization','code':99991672}}",
+        "{'ok':True,'data':{'items':[],'has_more':False,'notice':'incomplete'}}",
+    ] {
+        let (_dir, gateway) = oauth_gateway(&format!(
+            r#"
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ body=json.load(sys.stdin)
+ if 'assignee_ids' in body['filter']: print(json.dumps({result}))
+ else: print(json.dumps({{'ok':True,'data':{{'items':[{{'id':'created'}}],'has_more':False}}}}))
+elif a[:3]==['task','tasks','get']:
+ print(json.dumps({{'ok':True,'data':{{'task':{{'guid':'created','summary':'Task','creator':{{'id':'self'}}}}}}}}))
+else: sys.exit(99)
+"#
+        ));
+        assert!(gateway.fetch_tasks().is_err());
+    }
+}
+
 #[test]
 fn incomplete_filter_is_sent_on_every_page_including_after_an_empty_page() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
-if a[:2]==['task','+get-related-tasks']:
- assert '--include-complete=false' in a
- second='--page-token' in a
- if second: assert a[a.index('--page-token')+1]=='next'
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ second='page_token' in params
+ if second: assert params['page_token']=='next'
  with open(__file__+'.pages','a') as f: f.write(('second' if second else 'first')+'\n')
- items=[{'guid':'open','creator':{'id':'self'}}] if second else []
+ items=[{'id':'open'}] if second else []
  print(json.dumps({'ok':True,'data':{'items':items,'has_more':not second,'page_token':'next' if not second else ''}}))
 else:
  p=json.load(sys.stdin);assert p['task_guid']=='open'
@@ -31,10 +94,10 @@ else:
 
 #[test]
 fn tasks_completed_after_listing_are_excluded_but_overdue_open_tasks_remain() {
-    let (_dir, g) = oauth_gateway(
+    let (_dir, g) = creator_search_gateway(
         r#"
-if a[:2]==['task','+get-related-tasks']:
- print(json.dumps({'ok':True,'data':{'items':[{'guid':g,'creator':{'id':'self'},'completed_at':'0'} for g in ['overdue','just-completed','done-status']],'has_more':False}}))
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':g,'creator':{'id':'self'},'completed_at':'0'} for g in ['overdue','just-completed','done-status']],'has_more':False}}))
 else:
  p=json.load(sys.stdin);guid=p['task_guid']
  task={'guid':guid,'summary':'Task','creator':{'id':'self'},'completed_at':'0','due':{'timestamp':'1577836800000'}}
@@ -54,10 +117,10 @@ else:
 
 #[test]
 fn cancelling_during_rate_limit_cooldown_stops_without_retrying() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
-if a[:2]==['task','+get-related-tasks']:
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'g0','creator':{'id':'self'}}],'has_more':False}}))
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':'g0','creator':{'id':'self'}}],'has_more':False}}))
 else:
  with open(__file__+'.attempts','a') as f: f.write('attempt\n')
  print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_seconds':10}}));sys.exit(1)
@@ -90,7 +153,7 @@ else:
 
 #[test]
 fn other_api_errors_are_not_retried_even_when_marked_retryable() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
 with open(__file__+'.attempts','a') as f: f.write('attempt\n')
 print(json.dumps({'ok':False,'error':{'type':'authorization','code':99991672,'retryable':True,'retry_after_seconds':1,'message':'99991400'}}));sys.exit(1)
@@ -112,7 +175,7 @@ print(json.dumps({'ok':False,'error':{'type':'authorization','code':99991672,'re
 fn tapd_writes_are_never_retried_by_read_rate_limiting() {
     let (dir, g) = gateway(
         r#"
-assert a[:2]==['task','add']
+assert a[:2]==['story','add']
 with open(__file__+'.attempts','a') as f: f.write('attempt\n')
 print(json.dumps({'status':0,'error':{'type':'api','code':99991400,'retry_after_seconds':1}}));sys.exit(1)
 "#,
@@ -126,12 +189,12 @@ print(json.dumps({'status':0,'error':{'type':'api','code':99991400,'retry_after_
 
 #[test]
 fn rate_limited_detail_recovers_without_restarting_successful_reads() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
 import time
-if a[:2]==['task','+get-related-tasks']:
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
  with open(__file__+'.pages','a') as f: f.write('page\n')
- print(json.dumps({'ok':True,'data':{'items':[{'guid':g,'creator':{'id':'self'}} for g in ['g0','g1']],'has_more':False}}))
+ print(json.dumps({'ok':True,'data':{'items':[{'id':g,'creator':{'id':'self'}} for g in ['g0','g1']],'has_more':False}}))
 else:
  p=json.load(sys.stdin);guid=p['task_guid'];path=__file__+'.'+guid
  previous=open(path).readlines() if os.path.exists(path) else []
@@ -178,9 +241,9 @@ else:
 
 #[test]
 fn rate_limited_page_retries_are_bounded_and_never_return_partial_tasks() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
-assert a[:2]==['task','+get-related-tasks']
+assert a[:3]==['api','POST','/open-apis/task/v2/tasks/search']
 with open(__file__+'.attempts','a') as f: f.write('attempt\n')
 print(json.dumps({'ok':False,'error':{'type':'api','code':99991400}}))
 "#,
@@ -220,7 +283,7 @@ print(json.dumps({'ok':False,'error':{'type':'api','code':99991400}}))
 
 #[test]
 fn rate_limit_wait_respects_refresh_budget() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
 with open(__file__+'.attempts','a') as f: f.write('attempt\n')
 print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_seconds':120}}));sys.exit(1)
@@ -241,13 +304,13 @@ print(json.dumps({'ok':False,'error':{'type':'api','code':99991400,'retry_after_
 
 #[test]
 fn detail_reads_across_pages_are_complete_and_keep_list_order() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
-if a[:2]==['task','+get-related-tasks']:
- page=1 if '--page-token' not in a else 2
- if page==2: assert a[a.index('--page-token')+1]=='next'
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ page=1 if 'page_token' not in params else 2
+ if page==2: assert params['page_token']=='next'
  with open(__file__+'.pages','a') as f: f.write(str(page)+'\n')
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'g'+str(i),'creator':{'id':'self'}} for i in range((page-1)*4,page*4)],'has_more':page==1,'page_token':'next'}}))
+ print(json.dumps({'ok':True,'data':{'items':[{'id':'g'+str(i),'creator':{'id':'self'}} for i in range((page-1)*4,page*4)],'has_more':page==1,'page_token':'next'}}))
 else:
  p=json.load(sys.stdin)
  with open(__file__+'.details','a') as f: f.write(p['task_guid']+'\n')
@@ -279,8 +342,8 @@ if a==['auth','status','--json','--verify']:
  with open(__file__+'.auth','a') as f: f.write('verified\n')
  print(json.dumps({'appId':'app','brand':'feishu','verified':True,'identity':'user','identities':{'user':{'openId':'private-user'}}}))
 elif a==['user','info']: print(json.dumps({'status':1,'data':{'id':'123'}}))
-elif a[:2]==['task','+get-related-tasks']:
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'private-guid','creator':{'id':'private-user'}}],'has_more':False}}))
+elif a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':'private-guid','creator':{'id':'private-user'}}],'has_more':False}}))
 else:
  p=json.load(sys.stdin)
  print(json.dumps({'ok':True,'data':{'task':{'guid':p['task_guid'],'summary':'private-title','creator':{'id':'private-user'}}}}))
@@ -307,7 +370,8 @@ else:
             RefreshPhase::LarkIdentity,
             RefreshPhase::TapdIdentity,
             RefreshPhase::ListPage,
-            RefreshPhase::TaskDetails
+            RefreshPhase::TaskDetails,
+            RefreshPhase::ListPage
         ]
     );
     assert_eq!(events.last().unwrap().completed, 1);
@@ -316,11 +380,11 @@ else:
 
 #[test]
 fn cancelled_parallel_reads_stop_all_children_before_returning() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
 import time,glob
-if a[:2]==['task','+get-related-tasks']:
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'g'+str(i),'creator':{'id':'self'}} for i in range(8)],'has_more':False}}))
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':'g'+str(i),'creator':{'id':'self'}} for i in range(8)],'has_more':False}}))
 else:
  p=json.load(sys.stdin);guid=p['task_guid']
  open(__file__+'.started-'+guid,'w').close()
@@ -393,11 +457,11 @@ else:
 
 #[test]
 fn one_detail_failure_cancels_siblings_and_never_returns_partial_tasks() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
 import time,glob
-if a[:2]==['task','+get-related-tasks']:
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'g'+str(i),'creator':{'id':'self'}} for i in range(4)],'has_more':False}}))
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':'g'+str(i),'creator':{'id':'self'}} for i in range(4)],'has_more':False}}))
 else:
  p=json.load(sys.stdin);guid=p['task_guid']
  open(__file__+'.started-'+guid,'w').close()
@@ -444,11 +508,11 @@ else:
 
 #[test]
 fn detail_reads_are_parallel_but_bounded_and_keep_list_order() {
-    let (dir, g) = oauth_gateway(
+    let (dir, g) = creator_search_gateway(
         r#"
 import time,fcntl
-if a[:2]==['task','+get-related-tasks']:
- print(json.dumps({'ok':True,'data':{'items':[{'guid':'g'+str(i),'creator':{'id':'self'}} for i in range(8)],'has_more':False}}))
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':'g'+str(i),'creator':{'id':'self'}} for i in range(8)],'has_more':False}}))
 else:
  p=json.load(sys.stdin); guid=p['task_guid']
  def update(delta):

@@ -12,11 +12,15 @@ the latter is used with default features disabled.
 The workspace uses Cargo's standard `[patch.crates-io]` override. The editor
 remains excluded from the application workspace so upstream examples and test
 configuration do not become application targets. GPUI is shared with
-`gpui-kit` 0.7.1 (`gpui-pre` 0.3.8). The only manifest change within this copy
-is a test-support dev dependency; its standalone lockfile is updated for those
-tests. Application resolution uses the root lockfile.
+`gpui-kit` 0.7.1 (`gpui-pre` 0.3.8). Manifest changes add a test-support dev
+dependency and an explicit standalone workspace boundary so tests also run
+inside nested agent checkouts. Its standalone lockfile is used for those tests. Application resolution uses the root lockfile.
 
 ## Local behavioral changes
+
+- Image rows also accept blockquote prefixes, including nested quote/list
+  prefixes. Rendering, width changes and deletion share the same prefix length;
+  source-conversation images inside `>` blocks no longer fall back to text.
 
 - `with_text` / `set_text` keep source bytes unchanged, rather than normalizing
   attached `$$` fences on load. Native Markdown projection is unchanged.

@@ -85,7 +85,7 @@ pub(crate) fn api_failure(provider: &str, value: &Value, exit: Option<i32>) -> a
         "validation" => "; check CLI version, arguments and native profile configuration",
         "policy" => "; resolve the account security policy or browser challenge",
         "confirmation" => "; explicit operation confirmation is required",
-        "internal" => "; check native CLI storage access and supported version",
+        "internal" => "; check native CLI storage access and CLI diagnostics",
         _ => "; inspect the API code and remote service status before retrying",
     });
     ApiFailure {

@@ -1,6 +1,10 @@
 use super::*;
+#[path = "conversation_match_tests.rs"]
+mod conversation_match;
 #[path = "refresh_tests.rs"]
 mod refresh;
+#[path = "source_details_tests.rs"]
+mod source_details;
 use std::{fs, os::unix::fs::PermissionsExt};
 
 // 假可执行文件验证真正的进程边界，不调用用户安装的 CLI。
@@ -302,8 +306,8 @@ else:
 }
 
 #[test]
-fn tapd_initial_setup_accepts_known_versions_without_requiring_a_workspace() {
-    for version in ["1.15.0", "1.8.1"] {
+fn tapd_initial_setup_accepts_versions_without_an_allowlist_or_workspace() {
+    for version in ["1.15.0", "1.8.1", "1.16.0", "99.0.0", "0.1.0"] {
         let (_d, mut g) = gateway(&format!(
             r#"
 if a==['--version']: print('{version}')
@@ -421,6 +425,22 @@ if a==['auth','status','--json','--verify']:
     g.credentials.lark_user_token.clear();
     (d, g)
 }
+// 并发/故障测试只设置创建人这一路的数据；负责人路径显式返回空页。
+// 两路非空及独立分页由 filtered_search_unions_* 单独覆盖，不转换或伪装 wire 格式。
+fn creator_search_gateway(body: &str) -> (tempfile::TempDir, CliGateway) {
+    oauth_gateway(&format!(
+        r#"
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ body=json.load(sys.stdin); params=json.loads(a[a.index('--params')+1])
+ assert body['query']=='' and body['filter']['is_completed'] is False
+ if 'assignee_ids' in body['filter']:
+  assert body['filter']['assignee_ids']==['self']
+  print(json.dumps({{'ok':True,'data':{{'items':[],'has_more':False}}}})); sys.exit(0)
+ assert body['filter']['creator_ids']==['self']
+{body}
+"#
+    ))
+}
 fn source() -> SourceTask {
     SourceTask {
         guid: "guid-1".into(),
@@ -429,11 +449,56 @@ fn source() -> SourceTask {
         url: "https://example.feishu.cn/task/1".into(),
         due: None,
         completed: false,
-        metadata: SourceMetadata::default(),
+        metadata: Default::default(),
     }
 }
+#[test]
+fn source_link_is_clickable_optional_and_independent_of_binding_marker() {
+    let mut value = serde_json::to_value(draft()).unwrap();
+    value["include_source_link"] = json!(true);
+    let enabled: Draft = serde_json::from_value(value.clone()).unwrap();
+    let html = render_description(&enabled, &source()).unwrap();
+    assert!(
+        html.contains("<a href=\"https://example.feishu.cn/task/1\">"),
+        "{html}"
+    );
+    value["include_source_link"] = json!(false);
+    let disabled: Draft = serde_json::from_value(value.clone()).unwrap();
+    let html = render_description(&disabled, &source()).unwrap();
+    assert!(!html.contains("https://example.feishu.cn/task/1"));
+    assert!(html.contains("[lark-task:guid-1]"));
+    value.as_object_mut().unwrap().remove("include_source_link");
+    let legacy: Draft = serde_json::from_value(value).unwrap();
+    assert!(
+        render_description(&legacy, &source())
+            .unwrap()
+            .contains("<a href=")
+    );
+}
+
+#[test]
+fn target_without_api_url_opens_by_workspace_kind_and_id() {
+    for (kind, wrapper, route) in [("task", "Task", "tasks"), ("story", "Story", "stories")] {
+        let (_dir, g) = gateway(&format!(
+            r#"
+assert a[:2]==['{kind}','list']
+assert 'workspaceid=42' in a and 'id=9' in a
+print(json.dumps({{'status':1,'data':[{{'{wrapper}':{{'id':'9','name':'Renamed','description':'body','owner':'','due':None}}}}]}}))
+"#
+        ));
+        let target = g.get_target("42", "9", kind).unwrap();
+        assert_eq!(
+            target.url,
+            format!("https://www.tapd.cn/42/prong/{route}/view/9")
+        );
+    }
+}
+
 fn draft() -> Draft {
     Draft {
+        workitem_kind: "story".into(),
+        workitem_type_id: "7".into(),
+        include_source_link: true,
         title: "Title".into(),
         description: "<script>&\"'".into(),
         workspace_id: "42".into(),
@@ -612,6 +677,7 @@ print(json.dumps({'status':1,'data':result}))
 }
 fn upload_target() -> TargetTask {
     TargetTask {
+        workitem_type_id: String::new(),
         id: "9".into(),
         kind: "story".into(),
         title: "t".into(),
@@ -680,15 +746,16 @@ fn readback_accepts_only_exact_generated_html_wrapper() {
     ] {
         let (_dir, g) = gateway(&format!(
             r#"
+assert a[0]=='story'
 p=dict(x.split('=',1) for x in a[2:])
 if a[1]=='add':
  with open(__file__+'.json','w') as f: json.dump(p,f)
- print('{{"status":1,"data":{{"Task":{{"id":"9"}}}}}}')
+ print('{{"status":1,"data":{{"Story":{{"id":"9"}}}}}}')
 else:
  with open(__file__+'.json') as f: p=json.load(f)
  p['id']='9'
  p['description']={transform}
- print(json.dumps({{'status':1,'data':[{{'Task':p}}]}}))
+ print(json.dumps({{'status':1,'data':[{{'Story':p}}]}}))
 "#
         ));
         let mut d = draft();
@@ -696,6 +763,43 @@ else:
         assert_eq!(g.create_target(&d, &source()).is_ok(), accepted);
     }
 }
+#[test]
+fn readback_compares_html_structure_and_owner_members_without_hiding_loss() {
+    for (change, accepted) in [
+        (
+            "p['description']='<p>'+p['description'].replace('&amp;','&#38;').replace('>\\n<','><')+'</p>'; p['owner']+=';'",
+            true,
+        ),
+        (
+            "p['description']=p['description'].replace('keep  spaces','keep spaces')",
+            false,
+        ),
+        (
+            "p['description']=p['description'].replace('important','changed')",
+            false,
+        ),
+        ("p['owner']='different-user;'", false),
+    ] {
+        let (_dir, g) = gateway(&format!(
+            r#"
+assert a[0]=='story'
+p=dict(x.split('=',1) for x in a[2:])
+if a[1]=='add':
+ with open(__file__+'.json','w') as f:json.dump(p,f)
+ print('{{"status":1,"data":{{"Story":{{"id":"9"}}}}}}')
+else:
+ with open(__file__+'.json') as f:p=json.load(f)
+ p['id']='9'
+ {change}
+ print(json.dumps({{'status':1,'data':[{{'Story':p}}]}}))
+"#
+        ));
+        let mut d = draft();
+        d.description = "> Sender\n>\n> important & content\n\n```\nkeep  spaces\n```".into();
+        assert_eq!(g.create_target(&d, &source()).is_ok(), accepted, "{change}");
+    }
+}
+
 // 不可信 Markdown 不能加载跟踪图、本地路径，也不能创建非 HTTP(S) 链接。
 #[test]
 fn description_blocks_external_images_and_unsafe_links() {
@@ -716,17 +820,18 @@ fn description_blocks_external_images_and_unsafe_links() {
 fn write_renders_markdown_instead_of_literal_syntax() {
     let (_dir, g) = gateway(
         r#"
+assert a[0]=='story'
 p=dict(x.split('=',1) for x in a[2:])
 if a[1]=='add':
  assert p['name']=='【需求】Title'
  assert '<h1>Heading</h1>' in p['description']
  assert '<strong>bold</strong>' in p['description']
  with open(__file__+'.json','w') as f: json.dump(p,f)
- print('{"status":1,"data":{"Task":{"id":"9"}}}')
+ print('{"status":1,"data":{"Story":{"id":"9"}}}')
 else:
  with open(__file__+'.json') as f: p=json.load(f)
  p['id']='9'
- print(json.dumps({'status':1,'data':[{'Task':p}]}))
+ print(json.dumps({'status':1,'data':[{'Story':p}]}))
 "#,
     );
     let mut d = draft();
@@ -734,24 +839,57 @@ else:
     d.title_prefix = "【需求】".into();
     g.create_target(&d, &source()).unwrap();
 }
+// 详情不止 description；消息来源正文、关注人和更新时间必须穿过 CLI 边界。
 #[test]
-fn related_union_paginates_filters_and_deduplicates_before_details() {
-    let (d, g) = oauth_gateway(
+fn native_source_details_preserve_followers_update_time_and_message_content() {
+    let (_dir, gateway) = oauth_gateway(
         r#"
-if a[:2]==['task','+get-related-tasks']:
- assert a[:9]==['task','+get-related-tasks','--as','user','--format','json','--page-limit','1','--include-complete=false']
- second='--page-token' in a
- if second: assert a[9:]==['--page-token','next']
- own={'id':'self','name':'快捷姓名'}
- items=([{'guid':'both','creator':own,'members':[dict(own,role='assignee')]},{'guid':'removed','creator':own}] if second else [
-  {'guid':'creator','creator':own},
-  {'guid':'assignee','creator':{'id':'other'},'members':[dict(own,role='assignee')]},
-  {'guid':'both','creator':own,'members':[dict(own,role='assignee')]},
-  {'guid':'followed','members':[dict(own,role='follower')]},
-  {'guid':'other','creator':{'id':'other'}},
-  {'guid':'missing','creator':{'name':'self'},'members':[{'role':'assignee'}]}])
- for t in items: t['created_at']='2025-01-01 08:00:00'
- print(json.dumps({'ok':True,'identity':'user','data':{'items':items,'has_more':not second,'page_token':'next' if not second else ''},'meta':{'count':len(items)}}))
+assert a[:3]==['task','tasks','get']
+p=json.load(sys.stdin)
+t={'guid':p['task_guid'],'summary':'完整简介','description':'## 普通详情\n\n**完整正文**','creator':{'id':'self','name':'创建人'},'updated_at':'1735689600123','members':[
+ {'id':'owner','name':'负责人','role':'assignee','type':'user'},
+ {'id':'watcher','name':'关注人','role':'follower','type':'user'},
+ {'id':'unknown','role':'follower','type':'user'},
+ {'id':'group','name':'非用户','role':'follower','type':'chat'}],
+ 'origin':{'refer_resources':[
+  {'type':'message','source_message':{'message_id':'one','content':'## 来源消息\n\n第一段\n\n第二段'}},
+  {'type':'1','source_message':{'message_id':'two','content':'**另一条消息**'}},
+  {'type':'message','unavailable_reason':'failed'}]}}
+print(json.dumps({'ok':True,'data':{'task':t}}))
+"#,
+    );
+    let task = gateway.get_source("task-detail").unwrap();
+    assert_eq!(task.title, "完整简介");
+    assert_eq!(task.description, "## 普通详情\n\n**完整正文**");
+    let metadata = serde_json::to_value(&task.metadata).unwrap();
+    assert_eq!(metadata["updated_at"], "1735689600123");
+    assert_eq!(
+        metadata["followers"],
+        json!([
+            {"id":"watcher","name":"关注人"},
+            {"id":"unknown","name":""}
+        ])
+    );
+    assert_eq!(
+        metadata["source_messages"],
+        json!([
+            {"message_id":"one","content":"## 来源消息\n\n第一段\n\n第二段"},
+            {"message_id":"two","content":"**另一条消息**"},
+            {"message_id":"","content":""}
+        ])
+    );
+    assert!(!task.is_related_to("watcher"));
+}
+
+#[test]
+fn search_candidates_use_native_metadata_and_deduplicate_details() {
+    let (d, g) = creator_search_gateway(
+        r#"
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ second='page_token' in params
+ if second: assert params['page_token']=='next'
+ ids=['both','removed'] if second else ['creator','assignee','both']
+ print(json.dumps({'ok':True,'data':{'items':[{'id':id} for id in ids],'has_more':not second,'page_token':'next' if not second else ''}}))
 else:
  assert a[:3]==['task','tasks','get']
  p=json.load(sys.stdin); guid=p['task_guid']
@@ -822,9 +960,9 @@ fn draft_preflight_rejects_invalid_workspace_without_invoking_cli() {
 }
 #[test]
 fn invalid_source_ids_are_rejected_during_refresh() {
-    let (_d, g) = oauth_gateway(
+    let (_d, g) = creator_search_gateway(
         r#"
-if a[1]=='+get-related-tasks': print('{"ok":true,"data":{"items":[{"guid":"bad@id","creator":{"id":"self"}}],"has_more":false}}')
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']: print('{"ok":true,"data":{"items":[{"id":"bad@id","creator":{"id":"self"}}],"has_more":false}}')
 else: print('{"ok":true,"data":{"task":{"guid":"bad@id","creator":{"id":"self"},"summary":"title"}}}')
 "#,
     );
@@ -841,12 +979,12 @@ fn due_day_uses_local_calendar_not_utc_and_drops_time() {
 }
 #[test]
 fn refresh_deadline_covers_all_pages_and_details() {
-    let (_d, g) = oauth_gateway(
+    let (_d, g) = creator_search_gateway(
         r#"
 import time
 time.sleep(0.2)
-if a[1]=='+get-related-tasks':
- print('{"ok":true,"data":{"items":[{"guid":"g1","creator":{"id":"self"}},{"guid":"g2","creator":{"id":"self"}},{"guid":"g3","creator":{"id":"self"}}],"has_more":false}}')
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print('{"ok":true,"data":{"items":[{"id":"g1","creator":{"id":"self"}},{"id":"g2","creator":{"id":"self"}},{"id":"g3","creator":{"id":"self"}}],"has_more":false}}')
 else:
  p=json.load(sys.stdin)
  print(json.dumps({'ok':True,'data':{'task':{'guid':p['task_guid'],'summary':'full'}}}))
@@ -859,10 +997,10 @@ else:
 }
 #[test]
 fn oversized_refresh_is_rejected_before_fetching_details() {
-    let (_d, g) = oauth_gateway(
+    let (_d, g) = creator_search_gateway(
         r#"
-if a[1]=='+get-related-tasks':
- print(json.dumps({'ok':True,'data':{'items':[{'guid':str(i),'creator':{'id':'self'}} for i in range(1001)],'has_more':False}}))
+if a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({'ok':True,'data':{'items':[{'id':str(i),'creator':{'id':'self'}} for i in range(1001)],'has_more':False}}))
 else:
  print('{"ok":false}')
 "#,
@@ -890,7 +1028,9 @@ assert not any('token' in x for x in a)
 p=dict(x.split('=',1) for x in a[2:])
 assert p['workspaceid']=='42'
 if a[1] in ['add','update']:
- assert a[:2]==(['task','add'] if a[1]=='add' else ['story','update'])
+ assert a[:2]==(['story','add'] if a[1]=='add' else ['story','update'])
+ if a[1]=='update': assert 'workitem_type_id' not in p
+ p['workitem_type_id']='7'
  assert '&lt;script&gt;&amp;' in p['description'] and '<script>' not in p['description']
  assert '[lark-task:guid-1]' in p['description']
  assert 'https://example.feishu.cn/task/1' in p['description']
@@ -907,7 +1047,7 @@ print(json.dumps({'status':1,'data':[{'Story':t}] if a[1]=='list' else {'Story':
     assert_eq!(created.title, "Title");
     assert_eq!(
         created.description,
-        "&lt;script&gt;&amp;&quot;'<p>[lark-task:guid-1]</p><p>https://example.feishu.cn/task/1</p>"
+        "&lt;script&gt;&amp;&quot;'<p>[lark-task:guid-1]</p><p><a href=\"https://example.feishu.cn/task/1\">飞书任务 / Lark task</a></p>"
     );
     let updated = g.update_target(&created, &draft(), &source()).unwrap();
     assert_eq!(updated.kind, "story");
@@ -1055,6 +1195,7 @@ else:
 "#
         ));
         let old = TargetTask {
+            workitem_type_id: String::new(),
             id: "9".into(),
             kind: "task".into(),
             title: "old".into(),
@@ -1114,12 +1255,12 @@ fn related_pagination_never_returns_partial_results() {
     for response in [
         r#"{'items':[],'has_more':True}"#,
         r#"{'items':[],'has_more':True,'page_token':'repeat'}"#,
-        r#"{'items':[],'has_more':True,'page_token':str(int(a[-1])+1) if '--page-token' in a else '1'}"#,
+        r#"{'items':[],'has_more':True,'page_token':str(int(params['page_token'])+1) if 'page_token' in params else '1'}"#,
         r#"{'items':[]}"#,
         r#"{'items':{},'has_more':False}"#,
     ] {
-        let (_d, g) = oauth_gateway(&format!(
-            "assert a[1]=='+get-related-tasks'; print(json.dumps({{'ok':True,'data':{response}}}))"
+        let (_d, g) = creator_search_gateway(&format!(
+            "assert a[:3]==['api','POST','/open-apis/task/v2/tasks/search']; print(json.dumps({{'ok':True,'data':{response}}}))"
         ));
         assert!(g.fetch_tasks().is_err(), "{response}");
     }
@@ -1187,15 +1328,18 @@ fn member_directory_uses_nickname_account_and_requires_meaningful_names() {
 }
 #[test]
 fn native_metadata_rejects_formatted_time_and_preserves_unknown_names() {
-    for (timestamp, accepted) in [
-        ("1735689600000", true),
-        ("2025-01-01 08:00:00", false),
-        ("NaN", false),
+    for (field, timestamp, accepted) in [
+        ("created_at", "1735689600000", true),
+        ("created_at", "2025-01-01 08:00:00", false),
+        ("created_at", "NaN", false),
+        ("updated_at", "1735689600123", true),
+        ("updated_at", "2025-01-01 08:00:00", false),
+        ("updated_at", "9223372036854775808", false),
     ] {
         let (_d, g) = oauth_gateway(&format!(
             r#"
 assert a[:3]==['task','tasks','get']
-print(json.dumps({{'ok':True,'data':{{'task':{{'guid':'guid-1','summary':'task','creator':{{'id':'self'}},'created_at':'{timestamp}'}}}}}}))
+print(json.dumps({{'ok':True,'data':{{'task':{{'guid':'guid-1','summary':'task','creator':{{'id':'self'}},'{field}':'{timestamp}'}}}}}}))
 "#
         ));
         let result = g.get_source("guid-1");
@@ -1238,10 +1382,10 @@ else:
 
 #[test]
 fn page_limit_refuses_the_forty_first_page() {
-    let (d, g) = oauth_gateway(
+    let (d, g) = creator_search_gateway(
         r#"
-assert a[1]=='+get-related-tasks'
-n=int(a[-1]) if '--page-token' in a else 1
+assert a[:3]==['api','POST','/open-apis/task/v2/tasks/search']
+n=int(params['page_token']) if 'page_token' in params else 1
 with open(__file__+'.pages','a') as f: f.write(str(n)+'\n')
 print(json.dumps({'ok':True,'data':{'items':[],'has_more':True,'page_token':str(n+1)}}))
 "#,
@@ -1267,4 +1411,178 @@ fn connection_checks_ignore_other_provider_configuration() {
     tapd.settings.workspace_id.clear();
     let tapd = CliGateway::new(tapd.settings, tapd.credentials).unwrap();
     tapd.check_tapd().unwrap();
+}
+
+#[test]
+fn source_inline_html_retains_format_and_links_without_executable_html() {
+    let mut d = draft();
+    d.description = crate::source_images::render_source_images(
+        "<p>请看 <strong>重点</strong> 和 <a href=\"https://example.com/doc\">文档</a></p>",
+        &Default::default(),
+    );
+    let html = render_description(&d, &source()).unwrap();
+    assert!(html.contains("<strong>重点</strong>"), "{html}");
+    assert!(
+        html.contains("<a href=\"https://example.com/doc\">文档</a>"),
+        "{html}"
+    );
+}
+#[test]
+fn reference_images_require_loading_before_insertion() {
+    let mut s = source();
+    s.metadata
+        .source_messages
+        .push(lark2tapd_core::SourceMessage {
+            message_id: "om_source".into(),
+            content: "![screen][pic]\n\n[pic]: https://p2.pstatp.com/a.png".into(),
+        });
+    assert!(crate::source_images::needs_source_images(&s));
+}
+
+#[test]
+fn bug_creation_and_updates_use_bug_fields_and_bound_kind() {
+    let (_dir, g) = gateway(
+        r#"
+p=dict(x.split('=',1) for x in a[2:])
+assert a[0]=='bug'
+if a[1] in ['add','update']:
+ assert 'name' not in p and 'owner' not in p and 'due' not in p
+ assert 'workitem_type_id' not in p
+ assert p['title']=='Title' and p['current_owner']=='alice' and p['deadline']=='2026-12-01'
+ with open(__file__+'.json','w') as f:json.dump(p,f)
+ print(json.dumps({'status':1,'data':{'Bug':{'id':'99'}}}))
+else:
+ assert a[1]=='list'
+ p=json.load(open(__file__+'.json'));p['id']='99'
+ print(json.dumps({'status':1,'data':[{'Bug':p}]}))
+"#,
+    );
+    let mut value = serde_json::to_value(draft()).unwrap();
+    value["workitem_kind"] = json!("bug");
+    value["workitem_type_id"] = json!("");
+    value["title"] = json!("Title");
+    value["owner"] = json!("alice");
+    value["due"] = json!("2026-12-01");
+    let d: Draft = serde_json::from_value(value.clone()).unwrap();
+    let target = g.create_target(&d, &source()).unwrap();
+    assert_eq!(target.kind, "bug");
+    assert_eq!(target.url, "https://www.tapd.cn/42/prong/bugs/view/99");
+    // 编辑器旧值不能把已绑定 Bug 改写为 Story。
+    value["workitem_kind"] = json!("story");
+    value["workitem_type_id"] = json!("7");
+    let changed: Draft = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        g.update_target(&target, &changed, &source()).unwrap().kind,
+        "bug"
+    );
+}
+
+#[test]
+fn creation_kind_mismatch_retains_receipt_without_confirming_success() {
+    let (_dir, g) = gateway(
+        r#"
+p=dict(x.split('=',1) for x in a[2:])
+if a[1]=='add':
+ assert a[0]=='bug'
+ p['name']=p.pop('title');p['owner']=p.pop('current_owner');p['due']=p.pop('deadline');p['id']='99'
+ with open(__file__+'.json','w') as f:json.dump(p,f)
+ print(json.dumps({'status':1,'data':{'Story':{'id':'99'}}}))
+else:
+ print(json.dumps({'status':1,'data':[{'Story':json.load(open(__file__+'.json'))}]}))
+"#,
+    );
+    let mut d = draft();
+    d.workitem_kind = "bug".into();
+    d.workitem_type_id.clear();
+    let error = g.create_target(&d, &source()).unwrap_err();
+    let receipt = error
+        .downcast_ref::<lark2tapd_core::UnconfirmedWrite>()
+        .expect("retain known identity");
+    assert_eq!(receipt.target.id, "99");
+    assert_eq!(receipt.target.kind, "story");
+}
+
+#[test]
+fn bug_directory_does_not_invent_a_story_type_id() {
+    let (_dir, g) = gateway(
+        r#"
+assert a[1:] == ['fields','workspaceid=42']
+fields = {'title':{'name':'标题'}} if a[0]=='bug' else {'workitem_type_id':{'options':{'7':'开发任务'}}}
+print(json.dumps({'status':1,'data':fields}))
+"#,
+    );
+    let items = serde_json::to_value(g.list_workitem_types("42").unwrap()).unwrap();
+    assert!(
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "bug" && item["id"] == "")
+    );
+}
+
+#[test]
+fn selected_workitem_type_is_sent_on_creation() {
+    let (_dir, g) = gateway(
+        r#"
+p=dict(x.split('=',1) for x in a[2:])
+if a[1]=='add':
+ assert a[:2]==['story','add']
+ assert p['workitem_type_id']=='7'
+ with open(__file__+'.json','w') as f:json.dump(p,f)
+ print(json.dumps({'status':1,'data':{'Story':{'id':'99'}}}))
+else:
+ p=json.load(open(__file__+'.json'));p['id']='99'
+ print(json.dumps({'status':1,'data':[{'Story':p}]}))
+"#,
+    );
+    let mut value = serde_json::to_value(draft()).unwrap();
+    value["workitem_type_id"] = json!("7");
+    let d: Draft = serde_json::from_value(value).unwrap();
+    assert!(g.create_target(&d, &source()).is_ok());
+}
+
+#[test]
+fn workitem_types_use_real_project_field_options_and_reject_bad_metadata() {
+    for (options, valid) in [
+        (r#"{'7':'开发任务','8':'产品UI任务'}"#, true),
+        ("None", false),
+        ("[]", false),
+        ("{'bad':'Label'}", false),
+        ("{'7':''}", false),
+    ] {
+        let (_dir, g) = gateway(&format!(
+            r#"
+assert a[0] in ['story','bug'] and a[1:]==['fields','workspaceid=42']
+fields={{'title':{{'name':'标题'}}}} if a[0]=='bug' else {{'workitem_type_id':{{'options':{options}}}}}
+print(json.dumps({{'status':1,'data':fields}}))
+"#
+        ));
+        let result = g.list_workitem_types("42");
+        assert_eq!(result.is_ok(), valid);
+        if valid {
+            let items = result.unwrap();
+            assert_eq!(items[0].id, "7");
+            assert_eq!(items[0].name, "开发任务");
+            assert_eq!(items[1].name, "产品UI任务");
+        }
+    }
+}
+
+#[test]
+fn source_html_does_not_download_code_or_activate_unsafe_links() {
+    let mut source = source();
+    source.metadata.source_messages.push(lark2tapd_core::SourceMessage {message_id:"m".into(),content:r#"<p><a href="javascript:bad()">unsafe</a><code>&lt;img src="https://p2.pstatp.com/code.png"&gt;</code></p><script><img src="https://p2.pstatp.com/script.png"></script><figure><img src="https://p2.pstatp.com/real.png"></figure>"#.into()});
+    assert_eq!(
+        crate::source_images::source_image_urls(&source),
+        ["https://p2.pstatp.com/real.png"]
+    );
+    let mut d = draft();
+    d.description = crate::source_images::render_source_images(
+        &source.metadata.source_messages[0].content,
+        &Default::default(),
+    );
+    let html = render_description(&d, &source).unwrap();
+    assert!(!html.contains("javascript:") && !html.contains("<script>"));
+    assert!(html.contains("&lt;img"));
 }

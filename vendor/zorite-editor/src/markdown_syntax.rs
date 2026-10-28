@@ -1643,12 +1643,18 @@ pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
 /// past the marker so a bulleted image keeps its bullet, instead of the row
 /// collapsing to the image or falling back to raw source.
 pub(crate) fn image_row(line: &str) -> Option<(&str, Option<f32>, usize)> {
-    if let Some((src, width)) = image_line(line) {
-        return Some((src, width, 0));
+    // Source conversations contain quoted images; retain every quote/list marker
+    // so painting, resizing and deletion all agree on the same image row.
+    let mut marker_len = 0;
+    loop {
+        let body = &line[marker_len..];
+        if let Some((src, width)) = image_line(body) {
+            return Some((src, width, marker_len));
+        }
+        let len = list_prefix(body).map(|(len, ..)| len).or_else(|| blockquote_prefix(body))?;
+        if len == 0 { return None; }
+        marker_len += len;
     }
-    let (plen, ..) = list_prefix(line)?;
-    let (src, width) = image_line(&line[plen..])?;
-    Some((src, width, plen))
 }
 
 /// Font-size multiplier for a line — larger for headings (matching the reading
@@ -2749,6 +2755,9 @@ mod tests {
         assert_eq!(image_row("1. ![a](b.png)"), Some(("b.png", None, 3)));
         assert_eq!(image_row("![a](b.png)"), Some(("b.png", None, 0)));
         assert_eq!(image_row("- text ![a](b.png)"), None);
+        assert_eq!(image_row("> ![a](attachment:hash)"), Some(("attachment:hash", None, 2)));
+        assert_eq!(image_row(">> ![a](b.png){width=320}"), Some(("b.png", Some(320.0), 3)));
+        assert_eq!(image_row("> text ![a](b.png)"), None);
     }
 
     #[test]

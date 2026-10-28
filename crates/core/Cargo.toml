@@ -14,6 +14,7 @@ libc = "0.2"
 tokio.workspace = true
 toasty = { version = "0.11", features = ["sqlite"] }
 toasty-driver-sqlite = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 
 [dev-dependencies]
 tempfile.workspace = true

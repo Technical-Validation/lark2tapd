@@ -63,7 +63,7 @@ impl CliGateway {
             CliTool::Lark => &self.settings.lark_path,
             CliTool::Tapd => &self.settings.tapd_path,
         };
-        let version = installer::probe_supported_cli(tool, Path::new(path))?;
+        let version = installer::probe_cli(tool, Path::new(path))?;
         Ok(format!("CLI {version} is ready"))
     }
     // 诊断命令的非零退出可携带有效结构；只有明确的协议分支可以接受它。

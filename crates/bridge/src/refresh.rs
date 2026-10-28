@@ -252,72 +252,72 @@ pub(super) fn read(
     // 跨分页共享速率与冷却，避免每页重置后突发请求。
     let pacer = read_pacing::ReadPacer::new();
     let mut tasks = Vec::new();
-    let mut page = String::new();
-    let mut pages = HashSet::new();
     let mut ids = HashSet::new();
     let mut count = 0;
-    for page_index in 0..40 {
-        trace.page = page_index + 1;
-        let (data, jobs) = trace.call(RefreshPhase::ListPage, |trace| {
-            let data = pacer.read(
-                deadline,
-                cancelled,
-                || gateway.related_until_cancellable(&page, deadline, cancelled),
-                |attempt, delay| {
-                    trace.emit(
-                        RefreshPhase::ListPage,
-                        RefreshOutcome::RateLimited {
-                            attempt,
-                            wait_ms: delay.as_millis() as u64,
-                        },
-                        None,
-                    )
-                },
-            )?;
-            let items = data["items"]
-                .as_array()
-                .expect("validated related task list");
-            count += items.len();
-            ensure!(
-                count <= 1000,
-                "Lark refresh exceeds 1000 tasks; no partial results accepted"
-            );
-            let mut jobs = Vec::new();
-            for item in items {
-                let guid = required(item, "guid")?;
-                valid_source_id(&guid)?;
-                let (creator, assignees) = source_people(item);
-                let related = creator.as_ref().is_some_and(|p| p.id == user)
-                    || assignees.iter().any(|p| p.id == user);
-                if related && ids.insert(guid.clone()) {
-                    jobs.push(guid);
+    // 创建人与负责人是 OR 关系：两路各自分页，共享去重、节流和总预算。
+    for role in ["creator_ids", "assignee_ids"] {
+        let mut page = String::new();
+        let mut pages = HashSet::new();
+        for page_index in 0..40 {
+            trace.page += 1;
+            let (data, jobs) = trace.call(RefreshPhase::ListPage, |trace| {
+                let data = pacer.read(
+                    deadline,
+                    cancelled,
+                    || gateway.search_tasks_until(&user, role, &page, deadline, cancelled),
+                    |attempt, delay| {
+                        trace.emit(
+                            RefreshPhase::ListPage,
+                            RefreshOutcome::RateLimited {
+                                attempt,
+                                wait_ms: delay.as_millis() as u64,
+                            },
+                            None,
+                        )
+                    },
+                )?;
+                let items = data["items"].as_array().expect("validated search results");
+                count += items.len();
+                ensure!(
+                    count <= 1000,
+                    "Lark refresh exceeds 1000 candidates; no partial results accepted"
+                );
+                let mut jobs = Vec::new();
+                for item in items {
+                    let guid = required(item, "id")?;
+                    valid_source_id(&guid)?;
+                    if ids.insert(guid.clone()) {
+                        jobs.push(guid);
+                    }
                 }
+                Ok((data, jobs))
+            })?;
+            trace.scheduled += jobs.len();
+            if !jobs.is_empty() {
+                let details = read_details(gateway, &jobs, &pacer, &mut trace)?;
+                // 搜索与详情间可能已完成/移交；原生详情再次验证，不信任索引作为授权依据。
+                tasks.extend(
+                    details
+                        .into_iter()
+                        .filter(|task| !task.completed && task.is_related_to(&user)),
+                );
             }
-            Ok((data, jobs))
-        })?;
-        trace.scheduled += jobs.len();
-        let details = read_details(gateway, &jobs, &pacer, &mut trace)?;
-        // 列表与详情之间可能已完成或移交；只接受仍未完成且属于已验证主体的任务。
-        tasks.extend(
-            details
-                .into_iter()
-                .filter(|task| !task.completed && task.is_related_to(&user)),
-        );
-        if data["has_more"] == false {
-            return Ok((namespace, tasks));
-        }
-        page = required(&data, "page_token")?;
-        if !pages.insert(page.clone()) || page_index == 39 {
-            return Err(trace.fail(
-                RefreshPhase::ListPage,
-                None,
-                anyhow::anyhow!(
-                    "Lark pagination did not finish within 40 pages; no partial results accepted"
-                ),
-            ));
+            if data["has_more"] == false {
+                break;
+            }
+            page = required(&data, "page_token")?;
+            if !pages.insert(page.clone()) || page_index == 39 {
+                return Err(trace.fail(RefreshPhase::ListPage, None, anyhow::anyhow!(
+                    "Lark search pagination did not finish within 40 pages per relation; no partial results accepted"
+                )));
+            }
         }
     }
-    unreachable!("last page rejects continuation")
+    gateway.enrich_sources(&mut tasks, deadline, cancelled);
+    trace
+        .checkpoint()
+        .map_err(|error| trace.fail(RefreshPhase::TaskDetails, None, error))?;
+    Ok((namespace, tasks))
 }
 
 enum DetailEvent {

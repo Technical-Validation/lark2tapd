@@ -162,7 +162,7 @@ impl CliGateway {
         valid_id(workspace)?;
         valid_id(&target.id)?;
         ensure!(
-            matches!(target.kind.as_str(), "story" | "task"),
+            matches!(target.kind.as_str(), "story" | "task" | "bug"),
             "Invalid attachment target kind"
         );
         ensure!(

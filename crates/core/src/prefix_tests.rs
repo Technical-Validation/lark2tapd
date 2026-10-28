@@ -2,6 +2,9 @@ use super::*;
 
 fn draft(prefix: &str, title: &str) -> Draft {
     Draft {
+        workitem_kind: "story".into(),
+        workitem_type_id: "7".into(),
+        include_source_link: true,
         title: title.into(),
         title_prefix: prefix.into(),
         attachments: vec![],
@@ -66,6 +69,7 @@ async fn legacy_prefix_migration_is_persisted_once_without_changing_titles() -> 
     let mut engine = Engine::open(&path).await?;
     let source = MockGateway::default().fetch_tasks()?.remove(0);
     let original = SyncRecord {
+        last_synced_at: None,
         media_body_pending: false,
         title_prefix: "需求".into(),
         last_draft: Some(draft("需求", "【需求】【需求】旧标题")),
@@ -73,6 +77,7 @@ async fn legacy_prefix_migration_is_persisted_once_without_changing_titles() -> 
         baseline: Some(source.clone()),
         source,
         target: Some(TargetTask {
+            workitem_type_id: String::new(),
             id: "1".into(),
             url: "url".into(),
             kind: "task".into(),

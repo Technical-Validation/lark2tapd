@@ -24,6 +24,14 @@ The approved destination is the original local repository at `/Users/roxi/other_
 - Do not automatically stash, reset, clean, remove worktrees, delete branches, or perform post-landing cleanup.
 - Do not install CLIs, access real Keychain credentials, authorize OAuth, or invoke real Lark/TAPD business operations during verification. Tests use their existing isolated substitutes.
 
+## Delta Land contract
+
+This skill is eligible for **Land Changes** through `metadata.delta-action: land`. Delta opens a fresh Land subthread for that action; an explicit `/land` can also run in the current conversation. Use the checkout attached to the executing thread, including inherited uncommitted changes, rather than assuming the parent's checkout or branch. Do not spawn another subthread just to execute this skill.
+
+Delta's isolated checkouts normally start from the project's default branch. A source branch named `main` is therefore not itself a blocker or evidence that the source is the original destination. Establish isolation from the resolved checkout paths and Git metadata; prepare a delivery branch as described below when necessary. The local-only destination and verification requirements in this file are project policy, not universal Delta requirements.
+
+Reference: [Delta product guide — Projects, worktrees, and checkouts; Skills](https://delta.dev/docs/delta-101.md).
+
 ## 1. Establish source, destination, and applicable requirements
 
 Use non-interactive Git commands. Prefix every Git command that may launch an editor with `GIT_EDITOR=true`; supply explicit commit messages and retain normal hooks and signing requirements. Do not use `--no-verify`, signing bypasses, interactive rebases, or a pager.
@@ -34,15 +42,18 @@ From the attached source checkout, determine its actual root and current branch,
 source_root=$(git rev-parse --show-toplevel)
 target_root=/Users/roxi/other_projects/lark2tapd
 source_branch=$(git branch --show-current)
+source_start=$(git rev-parse HEAD)
 git --no-optional-locks status --short --branch
 git log -6 --oneline
 git branch -a
 git remote
 ```
 
-Require the resolved source checkout to differ from the original destination checkout and the source to be on a named development branch other than `main`. Otherwise stop and request a separate source checkout rather than preparing commits directly on the shared destination. Keep the captured roots, branches, and commit IDs explicitly available in every shell invocation; shell-local variables do not automatically persist between commands executed in different shells.
+Require the source and destination to resolve to different physical checkout directories (resolve symlinks before comparing). Inspect their Git directories and common directories as well: distinct linked Git worktrees can share branch refs even though their checkout paths differ. If both paths identify the same checkout, stop and request an isolated source checkout; never prepare commits directly in the original destination. Do not stop merely because the source is on `main` or detached HEAD. After the remaining read-only preflight passes, section 2 prepares a delivery branch without moving the destination's `main` ref.
 
-Inspect the relevant remote URLs without printing embedded credentials; redact userinfo and secret query parameters before displaying any URL. Inspect only relevant non-secret configuration, never the entire environment or credential files. The researched repository has only a `local` backlink; that name is not an external publication remote or proof of destination identity.
+Keep the captured roots, initial branch, `source_start`, subsequent branch names, and commit IDs explicitly available in every shell invocation; shell-local variables do not automatically persist between commands executed in different shells. Require no merge/rebase/cherry-pick in progress in the source before preparing it.
+
+Inspect the relevant remote URLs without printing embedded credentials; redact userinfo and secret query parameters before displaying any URL. Inspect only relevant non-secret configuration, never the entire environment or credential files. Discover the current remotes rather than assuming only `local` exists. The `local` backlink is not an external publication remote or proof of destination identity; an `origin` remote does not authorize external publication.
 
 Check the original checkout with read-only operations:
 
@@ -65,6 +76,14 @@ Check macOS and the availability of Git, a Rust toolchain supporting edition 202
 ## 2. Prepare the requested change without including unrelated work
 
 Inspect staged, unstaged, and untracked changes in the source checkout. Commit only files that belong to the requested delivery, including a newly installed skill when it is part of this request. If ownership or scope is unclear, ask before including them. Never stage everything indiscriminately, discard unrelated files, or silently omit requested changes.
+
+If the source is on `main` or detached HEAD, automatically create a uniquely named local delivery branch at the captured `source_start` in this attached checkout. This preparation is authorized by the landing invocation; do not ask the user to create another checkout solely because of the branch name. Choose an unused concrete name such as `chore/user/land-source-<unique-suffix>`, check that the ref does not exist, and then run:
+
+```sh
+git switch -c "$source_branch" "$source_start"
+```
+
+Set `source_branch` to the chosen name before running the command; never execute a literal placeholder. Do not use `-C`, `-B`, or any force option. Verify that `HEAD` still equals `source_start`, the staged/unstaged/untracked contents are unchanged, and the original branch refs (especially destination `main`) have not moved. If branch creation fails or concurrent edits prevent verifying preservation, stop without stashing, resetting, or discarding anything. If the source already has a named non-`main` development branch, retain it. Keep the resulting delivery/development branch through integration and reporting.
 
 Use an explicit Conventional Commit message, such as `chore: configure local landing workflow` for this skill alone. Preserve applicable signing and hooks. A failure is a blocker, not a reason to bypass them.
 
@@ -189,3 +208,5 @@ git -C "$target_root" merge-base --is-ancestor "$source_tip" refs/heads/main
 Require the branch to be `main`, `HEAD` and `refs/heads/main` to equal the verified `candidate`, the tree to equal the verified candidate tree, the source tip to be included, and the checkout to be clean. Never report source-branch publication, a prepared merge commit, or running tests as successful landing. If post-landing verification fails, state that the mutation occurred but final verification failed; do not automatically roll back or claim success.
 
 Report the destination, landed commit, included source, actual checks and results, any deliberately untested/manual boundaries, and the fact that no external publication or cleanup occurred. Leave the source development branch, any integration branch, and worktrees intact.
+
+Follow Delta's active landing-outcome instructions for the final result. Report `landed` only after verifying the configured final destination above; this workflow's destination is local `main`, not an external remote. Report `failed` only for an actual blocking failure with no permitted safe recovery. Branch preparation, ongoing verification, waiting for input, and already-present no-ops use ordinary prose, not a final result block. Never label local checks as hosted CI or invent remote/commit/CI URLs. Editing or installing this skill alone is not a landing invocation and must not emit a landing result. Do not claim that a parent thread's worktree was updated by landing; updating related Delta worktrees is a separate operation.

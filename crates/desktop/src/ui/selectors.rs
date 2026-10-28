@@ -19,6 +19,15 @@ impl SelectItem for Choice {
 pub(super) type ChoiceList = SearchableVec<Choice>;
 pub(super) type ChoiceState = SelectState<ChoiceList>;
 
+// UI 选择键包含种类，不把空类型 ID 或跨种类同 ID 当作同一选项。
+pub(super) fn type_key(kind: &str, id: &str) -> String {
+    if kind == "story" && id.is_empty() {
+        String::new()
+    } else {
+        format!("{kind}:{id}")
+    }
+}
+
 pub(super) fn selected(input: &Entity<ChoiceState>, cx: &App) -> String {
     input.read(cx).selected_value().cloned().unwrap_or_default()
 }
@@ -84,6 +93,55 @@ impl Workspace {
             cx,
         );
     }
+    pub(super) fn fill_workitem_types(
+        &self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = selected(&self.workspace, cx);
+        let options: Vec<Choice> = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.directory.workitem_types.get(&workspace))
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| Choice {
+                        id: type_key(&item.kind, &item.id),
+                        label: item.name.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 目录已缓存时清除失效选择；绑定目标保留其身份，不让刷新改写历史映射。
+        let model = self.model.read(cx);
+        let snapshot = model.snapshot.as_ref();
+        let bound = snapshot.is_some_and(|s| {
+            s.records
+                .iter()
+                .any(|r| Some(&r.source.guid) == self.selected.as_ref() && r.target.is_some())
+        });
+        let value = if !bound
+            && snapshot.is_some_and(|s| s.directory.workitem_types.contains_key(&workspace))
+            && !options.iter().any(|option: &Choice| option.id == value)
+        {
+            ""
+        } else {
+            value
+        };
+        replace(
+            &self.workitem_type,
+            options,
+            value,
+            self.tr(cx, "类型未加载或已不可用", "Type not loaded or unavailable")
+                .into(),
+            window,
+            cx,
+        );
+    }
     pub(super) fn fill_members(
         &self,
         settings: bool,
@@ -145,7 +203,8 @@ impl Workspace {
             .as_ref()
             .zip(directory.as_ref())
             .is_some_and(|(a, b)| {
-                a.workspaces == b.workspaces
+                a.workitem_types == b.workitem_types
+                    && a.workspaces == b.workspaces
                     && a.members.len() == b.members.len()
                     && a.members.iter().all(|(id, c)| {
                         b.members
@@ -178,6 +237,8 @@ impl Workspace {
             self.fill_projects(settings, &project, window, cx);
             self.fill_members(settings, &owner, window, cx);
         }
+        let type_id = selected(&self.workitem_type, cx);
+        self.fill_workitem_types(&type_id, window, cx);
         let id = selected(&self.prefix_workspace, cx);
         self.fill_prefix_workspace(&id, window, cx);
     }
@@ -207,11 +268,15 @@ impl Workspace {
         );
         if !settings {
             self.fill_prefixes("", window, cx);
+            self.fill_workitem_types("", window, cx);
         } else if self.settings_loaded {
             // 切换空间与清空旧处理人一起保存，避免跨空间沿用默认处理人。
             self.save_destination(cx);
         }
         if !id.is_empty() {
+            if !settings {
+                self.send(Job::LoadWorkitemTypes(id.clone()), cx);
+            }
             self.send(Job::LoadMembers(id), cx);
         }
         cx.notify();

@@ -1,30 +1,9 @@
 //! Markdown 永远只解引用当前任务已批准的缓存图片，阻断任意文件、网络及 data URL。
 use super::*;
 use anyhow::{Result, ensure};
+use lark2tapd_core::media::{bounded_image, normalized_png};
+#[cfg(test)]
 use std::io::Cursor;
-
-fn bounded_image(bytes: &[u8]) -> Result<image::DynamicImage> {
-    ensure!(bytes.len() <= 20 * 1024 * 1024, "Image exceeds 20 MiB");
-    let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
-    let (w, h) = reader.into_dimensions()?;
-    ensure!(
-        w > 0 && h > 0 && w <= 8192 && h <= 8192 && u64::from(w) * u64::from(h) <= 16 * 1024 * 1024,
-        "Image dimensions exceed the safe limit"
-    );
-    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    reader.limits(limits);
-    Ok(reader.decode()?)
-}
-
-fn normalized_png(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut output = Cursor::new(Vec::new());
-    bounded_image(bytes)?.write_to(&mut output, image::ImageFormat::Png)?;
-    Ok(output.into_inner())
-}
 
 // GPUI 的渲染缓冲使用 BGRA；所有解码仍先经过相同的大小与内存限制。
 fn rendered_image(bytes: &[u8]) -> Result<Arc<RenderImage>> {
@@ -49,7 +28,68 @@ fn blocked_image() -> Arc<Image> {
 }
 
 impl Workspace {
-    pub(super) fn markdown(&self, id: &'static str, text: String) -> gpui_kit::base::TextView {
+    fn available_images(&self) -> Vec<DraftAttachment> {
+        let mut images = self.attachments.clone();
+        if let Some(source) = &self.edit_source {
+            for image in source.metadata.source_images.values() {
+                if !images.iter().any(|known| known.id == image.id) {
+                    images.push(image.clone());
+                }
+            }
+        }
+        images
+    }
+    // 来源图只随正文中的真实引用进入草稿；撤销插入后不留下待上传的孤立图片。
+    pub(super) fn draft_attachments(&self, cx: &App) -> Vec<DraftAttachment> {
+        let mut attachments = self.attachments.clone();
+        let used = lark2tapd_bridge::referenced_image_ids(self.description.read(cx).text());
+        if let Some(source) = &self.edit_source {
+            for image in source.metadata.source_images.values() {
+                if let Some(known) = attachments.iter_mut().find(|known| known.id == image.id) {
+                    known.source_derived = true;
+                } else if used.contains(&image.id) {
+                    let mut image = image.clone();
+                    image.source_derived = true;
+                    attachments.push(image);
+                }
+            }
+        }
+        // 持久化回执是唯一权威，不让来源缓存的未上传副本制造永久脏草稿。
+        if let Some(saved) = self
+            .model
+            .read(cx)
+            .snapshot
+            .as_ref()
+            .and_then(|s| {
+                s.records
+                    .iter()
+                    .find(|r| Some(&r.source.guid) == self.selected.as_ref())
+            })
+            .and_then(|r| r.last_draft.as_ref())
+        {
+            for attachment in &mut attachments {
+                if let Some(receipt) = saved.attachments.iter().find(|a| a.id == attachment.id) {
+                    attachment.remote_id = receipt.remote_id.clone();
+                    attachment.remote_url = receipt.remote_url.clone();
+                    attachment.uncertain = receipt.uncertain;
+                }
+            }
+        }
+        attachments.retain(|a| {
+            !a.source_derived
+                || used.contains(&a.id)
+                || a.uncertain
+                || a.remote_id.is_some()
+                || a.remote_url.is_some()
+        });
+        attachments
+    }
+
+    pub(super) fn markdown(
+        &self,
+        id: impl Into<ElementId>,
+        text: String,
+    ) -> gpui_kit::base::TextView {
         let images = self.images.clone();
         let blocked = blocked_image();
         gpui_kit::base::TextView::markdown(id, text)
@@ -134,7 +174,7 @@ impl Workspace {
         let Some(guid) = self.selected.clone() else {
             return false;
         };
-        if self.attachments.len() + self.pending_pastes.len() + self.pending_files >= 10 {
+        if self.draft_attachments(cx).len() + self.pending_pastes.len() + self.pending_files >= 10 {
             self.form_error(
                 "attachments",
                 self.tr(
@@ -240,7 +280,12 @@ impl Workspace {
             }
         }
         if !self.attachments.iter().any(|a| a.id == ready.attachment.id) {
-            if self.attachments.len() >= 10 {
+            if self.draft_attachments(cx).len() >= 10
+                && !self
+                    .draft_attachments(cx)
+                    .iter()
+                    .any(|a| a.id == ready.attachment.id)
+            {
                 if let Some(marker) = &ready.marker {
                     self.description.update(cx, |s, cx| {
                         s.resolve_placeholder(marker, "", cx);
@@ -312,7 +357,10 @@ impl Workspace {
             .into_iter()
             .filter(|p| !self.pending_file_paths.contains(p))
             .collect();
-        if self.attachments.len() + self.pending_files + self.pending_pastes.len() + paths.len()
+        if self.draft_attachments(cx).len()
+            + self.pending_files
+            + self.pending_pastes.len()
+            + paths.len()
             > 10
         {
             self.form_error(
@@ -347,7 +395,7 @@ impl Workspace {
                 Ok(root) => root,
                 Err(_) => return,
             };
-        for attachment in self.attachments.clone().into_iter().filter(|a| a.is_image) {
+        for attachment in self.available_images().into_iter().filter(|a| a.is_image) {
             let key = format!("attachment:{}", attachment.id);
             if self.images.contains_key(&key) || !self.loading_images.insert(key.clone()) {
                 continue;
@@ -371,7 +419,11 @@ impl Workspace {
                         return;
                     }
                     this.loading_images.remove(&key);
-                    if !this.attachments.iter().any(|a| a.id == attachment_id) {
+                    if !this
+                        .available_images()
+                        .iter()
+                        .any(|a| a.id == attachment_id)
+                    {
                         return;
                     }
                     match result {

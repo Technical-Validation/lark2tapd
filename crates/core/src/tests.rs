@@ -10,6 +10,7 @@ struct FaultGateway {
     reject_draft: bool,
     source_override: Option<SourceTask>,
     fail_write: bool,
+    retain_receipt: bool,
     tasks: Option<Vec<SourceTask>>,
     remote_title: Option<String>,
     journal_path: Option<std::path::PathBuf>,
@@ -26,6 +27,7 @@ impl FaultGateway {
             reject_draft: false,
             source_override: None,
             fail_write: false,
+            retain_receipt: false,
             tasks: None,
             remote_title: None,
             journal_path: None,
@@ -88,6 +90,12 @@ impl Gateway for FaultGateway {
         }
         let target = self.inner.create_target(draft, source)?;
         if self.fail_write {
+            if self.retain_receipt {
+                return Err(anyhow::Error::new(UnconfirmedWrite {
+                    target,
+                    message: "readback mismatch".into(),
+                }));
+            }
             bail!("response lost after remote write");
         }
         Ok(target)
@@ -106,6 +114,54 @@ impl Gateway for FaultGateway {
         Ok(target)
     }
 }
+#[tokio::test]
+async fn unconfirmed_receipt_survives_restart_and_never_recreates_target() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("receipt.sqlite");
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    gateway.fail_write = true;
+    gateway.retain_receipt = true;
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let draft = selected_draft(&engine, &guid)?;
+    engine.save_draft(&guid, &draft).await?;
+    assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
+    let target = engine.snapshot().records[0]
+        .target
+        .clone()
+        .expect("known receipt retained");
+    assert!(engine.snapshot().records[0].uncertain);
+    assert!(engine.snapshot().records[0].last_draft.is_none());
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    assert_eq!(engine.snapshot().records[0].target.as_ref(), Some(&target));
+    assert!(
+        engine
+            .commit(&gateway, &guid, &draft, Some(target.clone()))
+            .await
+            .is_err()
+    );
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 1);
+    engine
+        .bind_existing(
+            &gateway,
+            &guid,
+            &draft.workspace_id,
+            &target.id,
+            &target.kind,
+        )
+        .await?;
+    gateway.fail_write = false;
+    engine
+        .commit(&gateway, &guid, &draft, Some(target.clone()))
+        .await?;
+    assert_eq!(
+        engine.snapshot().records[0].target.as_ref().unwrap().id,
+        target.id
+    );
+    Ok(())
+}
+
 // 本地预检失败不能留下不确定日志，也不能触发任何外部读写。
 #[tokio::test]
 async fn transport_preflight_failure_keeps_persisted_state_unchanged() -> Result<()> {
@@ -114,7 +170,7 @@ async fn transport_preflight_failure_keeps_persisted_state_unchanged() -> Result
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     let before = engine.snapshot().clone();
     let reads = gateway.reads.load(Ordering::SeqCst);
@@ -143,13 +199,13 @@ async fn stale_draft_requires_explicit_latest_source_rebase() -> Result<()> {
     let mut engine = configured(&path, &gateway).await?;
     let old_source = engine.snapshot().records[0].source.clone();
     let guid = &old_source.guid;
-    let old_draft = engine.prepare(guid)?;
+    let old_draft = selected_draft(&engine, guid)?;
     engine.save_draft(guid, &old_draft).await?;
     gateway.change_demo_task()?;
     engine.refresh(&gateway).await?;
     drop(engine);
     let mut engine = Engine::open(&path).await?;
-    assert!(engine.prepare(guid).is_err());
+    assert!(selected_draft(&engine, guid).is_err());
     let before = engine.snapshot().clone();
     assert!(engine.save_draft(guid, &old_draft).await.is_err());
     assert!(
@@ -161,13 +217,16 @@ async fn stale_draft_requires_explicit_latest_source_rebase() -> Result<()> {
     assert_eq!(engine.snapshot(), &before);
     let latest = engine.snapshot().records[0].source.clone();
     let fresh = Draft {
+        workitem_kind: "story".into(),
+        workitem_type_id: "7".into(),
+        include_source_link: true,
         title: latest.title.clone(),
         description: latest.description.clone(),
         due: latest.due.clone(),
         ..old_draft
     };
     engine.save_draft_for_source(guid, &fresh, &latest).await?;
-    assert_eq!(engine.prepare(guid)?, fresh);
+    assert_eq!(selected_draft(&engine, guid)?, fresh);
     engine.commit(&gateway, guid, &fresh, None).await?;
     assert_eq!(
         engine.snapshot().records[0].baseline.as_ref(),
@@ -184,7 +243,7 @@ async fn discard_reloads_latest_source_but_preserves_uncertain_draft() -> Result
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     gateway.inner.change_demo_task()?;
     engine.refresh(&gateway).await?;
@@ -192,7 +251,7 @@ async fn discard_reloads_latest_source_but_preserves_uncertain_draft() -> Result
     drop(engine);
     let mut engine = Engine::open(&path).await?;
     assert!(engine.snapshot().records[0].draft.is_none());
-    let fresh = engine.prepare(&guid)?;
+    let fresh = selected_draft(&engine, &guid)?;
     assert_eq!(fresh.title, "设计同步流程 · 已更新");
     engine.save_draft(&guid, &fresh).await?;
     gateway.fail_write = true;
@@ -211,7 +270,7 @@ async fn commit_reads_selected_source_and_checks_identity() -> Result<()> {
     let mut engine = configured(&dir.path().join("state.sqlite"), &gateway).await?;
     let source = engine.snapshot().records[0].source.clone();
     let guid = &source.guid;
-    let draft = engine.prepare(guid)?;
+    let draft = selected_draft(&engine, guid)?;
     engine.save_draft(guid, &draft).await?;
     let mut wrong = source.clone();
     wrong.guid = "another-guid".into();
@@ -226,6 +285,15 @@ async fn commit_reads_selected_source_and_checks_identity() -> Result<()> {
     Ok(())
 }
 
+// 测试显式选择当前项目类型；生产 prepare 不替用户选择。
+fn selected_draft(engine: &Engine, guid: &str) -> Result<Draft> {
+    let mut draft = engine.prepare(guid)?;
+    if draft.workitem_type_id.is_empty() {
+        draft.workitem_type_id = "7".into();
+    }
+    Ok(draft)
+}
+
 async fn configured(path: &Path, gateway: &impl Gateway) -> Result<Engine> {
     let mut engine = Engine::open(path).await?;
     engine
@@ -238,7 +306,216 @@ async fn configured(path: &Path, gateway: &impl Gateway) -> Result<Engine> {
     let directory = MockGateway::default();
     engine.refresh_workspaces(&directory).await?;
     engine.refresh_members(&directory, "demo").await?;
+    engine.refresh_workitem_types(&directory, "demo").await?;
     Ok(engine)
+}
+
+// 新详情字段必须跨 SQLite 重启保留，刷新不能改写已保存草稿或隐式同步。
+#[tokio::test]
+async fn source_details_survive_restart_without_overwriting_draft() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("source-details.sqlite");
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let old_source = engine.snapshot().records[0].source.clone();
+    let mut draft = selected_draft(&engine, &old_source.guid)?;
+    draft.description = "用户保存的草稿".into();
+    engine.save_draft(&old_source.guid, &draft).await?;
+    let mut source = old_source.clone();
+    source.metadata.followers = vec![SourcePerson {
+        id: "watcher".into(),
+        name: "关注人".into(),
+    }];
+    source.metadata.updated_at = Some("1735689600123".into());
+    source.metadata.source_messages = vec![SourceMessage {
+        content: "## 完整来源消息\n\n正文".into(),
+        ..Default::default()
+    }];
+    gateway.tasks = Some(vec![source.clone()]);
+    engine.refresh(&gateway).await?;
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    let record = &engine.snapshot().records[0];
+    assert_eq!(record.source, source);
+    assert_eq!(record.draft.as_ref(), Some(&draft));
+    assert!(
+        engine
+            .save_draft_for_source(&old_source.guid, &draft, &old_source)
+            .await
+            .is_err()
+    );
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+// 展示补查成功/失败不改变来源版本，不能误触发草稿过期或待同步。
+#[tokio::test]
+async fn display_enrichment_survives_restart_without_invalidating_source() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("enriched.sqlite");
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let original = engine.snapshot().records[0].source.clone();
+    let draft = selected_draft(&engine, &original.guid)?;
+    let mut enriched = original.clone();
+    enriched
+        .metadata
+        .resolved_names
+        .insert("ou_person".into(), "查询姓名".into());
+    enriched.metadata.message_details.insert(
+        "om_message".into(),
+        SourceMessageDetails {
+            sender: Some(SourcePerson {
+                id: "ou_person".into(),
+                name: String::new(),
+            }),
+            sent_at: Some("1735689600000".into()),
+        },
+    );
+    assert_eq!(original, enriched);
+    gateway.tasks = Some(vec![enriched]);
+    engine.refresh(&gateway).await?;
+    engine
+        .save_draft_for_source(&original.guid, &draft, &original)
+        .await?;
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    let metadata = &engine.snapshot().records[0].source.metadata;
+    assert_eq!(
+        metadata.resolved_names.get("ou_person").map(String::as_str),
+        Some("查询姓名")
+    );
+    assert_eq!(
+        metadata.message_details["om_message"].sent_at.as_deref(),
+        Some("1735689600000")
+    );
+    gateway.tasks = Some(vec![original.clone()]);
+    engine.refresh(&gateway).await?;
+    engine
+        .save_draft_for_source(&original.guid, &draft, &original)
+        .await?;
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    let mut changed = original.clone();
+    changed.metadata.updated_at = Some("1735689600001".into());
+    assert_ne!(original, changed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn matched_conversation_is_cached_by_source_version_without_touching_draft() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("matched.sqlite");
+    let mut gateway = FaultGateway::new(MockGateway::default());
+    let mut original = gateway.fetch_tasks()?.remove(0);
+    original.metadata.source_messages = vec![SourceMessage {
+        message_id: "123".into(),
+        content: "first\n\nsecond".into(),
+    }];
+    gateway.tasks = Some(vec![original.clone()]);
+    let mut engine = configured(&path, &gateway).await?;
+    let draft = selected_draft(&engine, &original.guid)?;
+    engine.save_draft(&original.guid, &draft).await?;
+    let mut enriched = original.clone();
+    enriched.metadata.matched_messages.insert(
+        "123".into(),
+        vec![
+            SourceMessage {
+                message_id: "om_first".into(),
+                content: "first".into(),
+            },
+            SourceMessage {
+                message_id: "om_second".into(),
+                content: "second".into(),
+            },
+        ],
+    );
+    enriched.metadata.message_details.insert(
+        "om_first".into(),
+        SourceMessageDetails {
+            sender: Some(SourcePerson {
+                id: "alice".into(),
+                name: "Alice".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(original, enriched);
+    let mut incomplete = enriched.clone();
+    incomplete
+        .metadata
+        .matched_messages
+        .get_mut("123")
+        .unwrap()
+        .pop();
+    assert!(engine.cache_conversation(&incomplete).await.is_err());
+    assert!(
+        engine.snapshot().records[0]
+            .source
+            .metadata
+            .matched_messages
+            .is_empty()
+    );
+    assert!(engine.cache_conversation(&enriched).await?);
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    engine.refresh(&gateway).await?;
+    let record = &engine.snapshot().records[0];
+    assert_eq!(
+        record
+            .source
+            .metadata
+            .matched_messages_for(&original.metadata.source_messages[0])
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        record.source.metadata.message_details["om_first"]
+            .sender
+            .as_ref()
+            .unwrap()
+            .name,
+        "Alice"
+    );
+    assert_eq!(record.draft.as_ref(), Some(&draft));
+    engine
+        .save_draft_for_source(&original.guid, &draft, &original)
+        .await?;
+    let mut changed = original.clone();
+    changed.metadata.source_messages[0].content = "different".into();
+    gateway.tasks = Some(vec![changed]);
+    engine.refresh(&gateway).await?;
+    assert!(
+        engine.snapshot().records[0]
+            .source
+            .metadata
+            .matched_messages
+            .is_empty()
+    );
+    assert!(!engine.cache_conversation(&enriched).await?);
+    gateway.tasks = Some(vec![]);
+    engine.refresh(&gateway).await?;
+    assert!(!engine.cache_conversation(&enriched).await?);
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn legacy_source_metadata_loads_without_new_detail_fields() -> Result<()> {
+    let source: SourceTask = serde_json::from_value(serde_json::json!({
+        "guid":"legacy", "title":"简介", "description":"正文", "url":"", "due":null,
+        "completed":false, "metadata":{"created_at":"1735689600000", "assignees":[]}
+    }))?;
+    assert_eq!(source.title, "简介");
+    assert_eq!(source.description, "正文");
+    assert!(source.metadata.followers.is_empty());
+    assert!(source.metadata.source_messages.is_empty());
+    assert_eq!(source.metadata.updated_at, None);
+    let message: SourceMessage =
+        serde_json::from_value(serde_json::json!({"content":"旧消息正文"}))?;
+    assert_eq!(message.content, "旧消息正文");
+    assert!(message.message_id.is_empty());
+    Ok(())
 }
 
 #[tokio::test]
@@ -250,7 +527,7 @@ async fn ambiguous_write_is_journaled_and_never_retried_after_restart() -> Resul
     gateway.journal_path = Some(path.clone());
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
     assert_eq!(engine.snapshot().records[0].status(), SyncStatus::Uncertain);
@@ -269,12 +546,12 @@ async fn target_changes_after_preview_are_not_overwritten() -> Result<()> {
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&dir.path().join("state.sqlite"), &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     engine.commit(&gateway, &guid, &draft, None).await?;
     gateway.inner.change_demo_task()?;
     engine.refresh(&gateway).await?;
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     let preview = engine.preview_target(&gateway, &guid)?;
     gateway.remote_title = Some("别人修改了目标".into());
@@ -299,7 +576,7 @@ async fn stale_source_and_unsaved_drafts_cannot_commit() -> Result<()> {
     let gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&dir.path().join("state.sqlite"), &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
     engine.save_draft(&guid, &draft).await?;
     gateway.inner.change_demo_task()?;
@@ -357,7 +634,7 @@ async fn settings_validation_and_invalid_draft_block_writes() -> Result<()> {
     assert_eq!(&engine.snapshot().settings, &original);
     let guid = engine.snapshot().records[0].source.guid.clone();
     for field in ["title", "workspace", "due"] {
-        let mut draft = engine.prepare(&guid)?;
+        let mut draft = selected_draft(&engine, &guid)?;
         match field {
             "title" => draft.title = " ".into(),
             "workspace" => draft.workspace_id.clear(),
@@ -374,6 +651,9 @@ async fn settings_validation_and_invalid_draft_block_writes() -> Result<()> {
 fn status_uses_every_source_field_and_uncertainty_takes_priority() -> Result<()> {
     let source = MockGateway::default().fetch_tasks()?.remove(0);
     let draft = Draft {
+        workitem_kind: "story".into(),
+        workitem_type_id: "7".into(),
+        include_source_link: true,
         title: source.title.clone(),
         title_prefix: String::new(),
         attachments: vec![],
@@ -383,6 +663,7 @@ fn status_uses_every_source_field_and_uncertainty_takes_priority() -> Result<()>
         due: source.due.clone(),
     };
     let mut record = SyncRecord {
+        last_synced_at: None,
         media_body_pending: false,
         title_prefix: String::new(),
         last_draft: None,
@@ -422,13 +703,13 @@ async fn mismatched_write_result_remains_uncertain() -> Result<()> {
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&dir.path().join("state.sqlite"), &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     engine.commit(&gateway, &guid, &draft, None).await?;
     gateway.inner.change_demo_task()?;
     engine.refresh(&gateway).await?;
     let old = engine.snapshot().records[0].target.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     let preview = engine.preview_target(&gateway, &guid)?;
     gateway.replace_result_id = true;
@@ -452,7 +733,7 @@ async fn recovery_binds_readback_without_assuming_success() -> Result<()> {
     gateway.fail_write = true;
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
     assert!(
@@ -481,7 +762,7 @@ async fn mock_remote_and_source_can_be_restored_from_snapshot() -> Result<()> {
     let gateway = MockGateway::default();
     let mut engine = configured(&dir.path().join("state.sqlite"), &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     engine.commit(&gateway, &guid, &draft, None).await?;
     gateway.change_demo_task()?;
@@ -513,8 +794,9 @@ async fn mock_sync_survives_restart_and_requires_confirmation() -> anyhow::Resul
     assert_eq!(engine.refresh(&gateway).await?, 3);
     engine.refresh_workspaces(&gateway).await?;
     engine.refresh_members(&gateway, "demo").await?;
+    engine.refresh_workitem_types(&gateway, "demo").await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let mut draft = engine.prepare(&guid)?;
+    let mut draft = selected_draft(&engine, &guid)?;
     draft.title = "人工编辑标题".into();
     draft.description = "<原样保留> & \"内容\"\n第二行".into();
     engine.save_draft(&guid, &draft).await?;
@@ -522,7 +804,7 @@ async fn mock_sync_survives_restart_and_requires_confirmation() -> anyhow::Resul
     drop(engine);
     let mut engine = Engine::open(&path).await?;
     assert_eq!(engine.snapshot().settings, settings);
-    assert_eq!(engine.prepare(&guid)?, draft);
+    assert_eq!(selected_draft(&engine, &guid)?, draft);
     assert_eq!(
         engine.snapshot().records[0].status(),
         SyncStatus::Unimported
@@ -534,7 +816,7 @@ async fn mock_sync_survives_restart_and_requires_confirmation() -> anyhow::Resul
     gateway.change_demo_task()?;
     engine.refresh(&gateway).await?;
     assert_eq!(engine.snapshot().records[0].status(), SyncStatus::Changed);
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     let target = engine.preview_target(&gateway, &guid)?;
     assert!(
@@ -579,11 +861,11 @@ async fn absent_record_cannot_be_edited_or_written() -> Result<()> {
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&dir.path().join("scope.sqlite"), &gateway).await?;
     let source = engine.snapshot().records[0].source.clone();
-    let draft = engine.prepare(&source.guid)?;
+    let draft = selected_draft(&engine, &source.guid)?;
     engine.save_draft(&source.guid, &draft).await?;
     gateway.tasks = Some(vec![]);
     engine.refresh(&gateway).await?;
-    assert!(engine.prepare(&source.guid).is_err());
+    assert!(selected_draft(&engine, &source.guid).is_err());
     assert!(
         engine
             .save_draft_for_source(&source.guid, &draft, &source)
@@ -604,7 +886,7 @@ async fn absent_record_cannot_be_edited_or_written() -> Result<()> {
 #[test]
 fn self_scope_matches_creator_or_assignee_not_unknown_identity() -> Result<()> {
     let mut source = MockGateway::default().fetch_tasks()?.remove(0);
-    source.metadata = SourceMetadata {
+    *source.metadata = SourceMetadata {
         creator: Some(SourcePerson {
             id: "creator".into(),
             name: String::new(),
@@ -619,7 +901,7 @@ fn self_scope_matches_creator_or_assignee_not_unknown_identity() -> Result<()> {
     assert!(source.is_related_to("assignee"));
     assert!(!source.is_related_to("同名"));
     assert!(!source.is_related_to(""));
-    source.metadata = SourceMetadata::default();
+    *source.metadata = SourceMetadata::default();
     assert!(!source.is_related_to("creator"));
     Ok(())
 }
@@ -744,7 +1026,7 @@ async fn hidden_uncertain_record_retains_recovery_across_restart() -> Result<()>
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     gateway.fail_write = true;
     assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
@@ -801,7 +1083,7 @@ async fn owner_removed_after_preview_is_blocked_before_write_journal() -> Result
     engine.refresh_workspaces(&gateway.inner).await?;
     engine.refresh_members(&gateway.inner, "demo").await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let mut draft = engine.prepare(&guid)?;
+    let mut draft = selected_draft(&engine, &guid)?;
     draft.owner = "alice".into();
     engine.save_draft(&guid, &draft).await?;
     let preview = engine.preview_target(&gateway, &guid)?;
@@ -846,7 +1128,7 @@ async fn prefix_configuration_is_atomic_and_commit_preserves_selection() -> Resu
         );
     }
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let mut value = serde_json::to_value(engine.prepare(&guid)?)?;
+    let mut value = serde_json::to_value(selected_draft(&engine, &guid)?)?;
     value["title_prefix"] = "其他".into();
     let invalid: Draft = serde_json::from_value(value.clone())?;
     engine.save_draft(&guid, &invalid).await?;
@@ -872,7 +1154,7 @@ async fn prefix_configuration_is_atomic_and_commit_preserves_selection() -> Resu
     engine.refresh(&gateway).await?;
     drop(engine);
     let engine = Engine::open(&path).await?;
-    let draft = serde_json::to_value(engine.prepare(&guid)?)?;
+    let draft = serde_json::to_value(selected_draft(&engine, &guid)?)?;
     assert_eq!(draft["title_prefix"], "【需求】");
     assert_eq!(draft["title"], "设计同步流程 · 已更新");
     assert_eq!(
@@ -904,6 +1186,11 @@ fn old_drafts_default_prefix_and_attachments() -> Result<()> {
     let value = serde_json::to_value(draft)?;
     assert_eq!(value["title_prefix"], "");
     assert_eq!(value["attachments"], serde_json::json!([]));
+    assert_eq!(value["workitem_kind"], "story");
+    assert_eq!(value["workitem_type_id"], "");
+    let item: TapdWorkitemType =
+        serde_json::from_value(serde_json::json!({"id":"7","name":"Development"}))?;
+    assert_eq!(item.kind, "story");
     Ok(())
 }
 
@@ -915,14 +1202,14 @@ async fn successful_draft_survives_restart_and_explicit_update() -> Result<()> {
     let gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let mut draft = engine.prepare(&guid)?;
+    let mut draft = selected_draft(&engine, &guid)?;
     draft.title = "人工标题".into();
     engine.save_draft(&guid, &draft).await?;
     engine.commit(&gateway, &guid, &draft, None).await?;
     let target = engine.snapshot().records[0].target.clone();
     drop(engine);
     let mut engine = Engine::open(&path).await?;
-    assert_eq!(engine.prepare(&guid)?, draft);
+    assert_eq!(selected_draft(&engine, &guid)?, draft);
     draft.title = "第二次人工标题".into();
     engine.save_draft(&guid, &draft).await?;
     engine
@@ -944,7 +1231,7 @@ async fn attachment_upload_progress_is_durable_and_bound_to_target() -> Result<(
     let gateway = MockGateway::default();
     let mut engine = configured(&path, &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let mut draft = engine.prepare(&guid)?;
+    let mut draft = selected_draft(&engine, &guid)?;
     let mut attachment: DraftAttachment = serde_json::from_value(
         serde_json::json!({"id":"abc", "name":"test.txt", "path":"/cache/abc", "size":3, "is_image":false}),
     )?;
@@ -961,7 +1248,7 @@ async fn attachment_upload_progress_is_durable_and_bound_to_target() -> Result<(
     engine.attachment_progress(&guid, &attachment).await?;
     drop(engine);
     let mut engine = Engine::open(&path).await?;
-    assert!(engine.prepare(&guid)?.attachments[0].uncertain);
+    assert!(selected_draft(&engine, &guid)?.attachments[0].uncertain);
     let mut forged = attachment.clone();
     forged.path = "/outside".into();
     assert!(engine.attachment_progress(&guid, &forged).await.is_err());
@@ -971,7 +1258,10 @@ async fn attachment_upload_progress_is_durable_and_bound_to_target() -> Result<(
     engine.attachment_progress(&guid, &attachment).await?;
     gateway.change_demo_task()?;
     engine.refresh(&gateway).await?;
-    assert_eq!(engine.prepare(&guid)?.attachments, vec![attachment]);
+    assert_eq!(
+        selected_draft(&engine, &guid)?.attachments,
+        vec![attachment]
+    );
     Ok(())
 }
 
@@ -1093,7 +1383,7 @@ async fn invalid_attachment_lists_never_start_write_journal() -> Result<()> {
         serde_json::json!({"id":"a", "name":"test.txt", "path":"/cache/a", "size":3, "is_image":false}),
     )?;
     for count in [2, 11] {
-        let mut draft = engine.prepare(&guid)?;
+        let mut draft = selected_draft(&engine, &guid)?;
         draft.attachments = (0..count)
             .map(|index| {
                 let mut item = attachment.clone();
@@ -1120,7 +1410,7 @@ async fn stale_editor_preserves_attachment_progress() -> Result<()> {
     let gateway = MockGateway::default();
     let mut engine = configured(&path, &gateway).await?;
     let source = engine.snapshot().records[0].source.clone();
-    let mut draft = engine.prepare(&source.guid)?;
+    let mut draft = selected_draft(&engine, &source.guid)?;
     let mut attachment: DraftAttachment = serde_json::from_value(
         serde_json::json!({"id":"a", "name":"test.txt", "path":"/cache/a", "size":3, "is_image":false}),
     )?;
@@ -1134,7 +1424,7 @@ async fn stale_editor_preserves_attachment_progress() -> Result<()> {
     engine
         .save_draft_for_source(&source.guid, &draft, &source)
         .await?;
-    assert!(engine.prepare(&source.guid)?.attachments[0].uncertain);
+    assert!(selected_draft(&engine, &source.guid)?.attachments[0].uncertain);
     attachment.uncertain = false;
     attachment.remote_id = Some("remote-1".into());
     engine
@@ -1144,7 +1434,7 @@ async fn stale_editor_preserves_attachment_progress() -> Result<()> {
         .save_draft_for_source(&source.guid, &draft, &source)
         .await?;
     assert_eq!(
-        engine.prepare(&source.guid)?.attachments[0]
+        selected_draft(&engine, &source.guid)?.attachments[0]
             .remote_id
             .as_deref(),
         Some("remote-1")
@@ -1159,7 +1449,7 @@ async fn stale_editor_preserves_attachment_progress() -> Result<()> {
     drop(engine);
     let engine = Engine::open(&path).await?;
     assert_eq!(
-        engine.prepare(&source.guid)?.attachments[0]
+        selected_draft(&engine, &source.guid)?.attachments[0]
             .remote_id
             .as_deref(),
         Some("remote-1")
@@ -1175,7 +1465,7 @@ async fn pending_attachments_are_visible_after_target_sync() -> Result<()> {
     let mut engine = configured(&dir.path().join("pending.sqlite"), &gateway).await?;
     assert!(!engine.snapshot().records[0].has_pending_attachments());
     let source = engine.snapshot().records[0].source.clone();
-    let mut draft = engine.prepare(&source.guid)?;
+    let mut draft = selected_draft(&engine, &source.guid)?;
     let mut attachment: DraftAttachment = serde_json::from_value(
         serde_json::json!({"id":"a", "name":"test.txt", "path":"/cache/a", "size":3, "is_image":false}),
     )?;
@@ -1208,7 +1498,7 @@ async fn image_body_pending_is_not_hidden_by_successful_upload_receipts() -> Res
     let gateway = MockGateway::default();
     let mut engine = configured(&dir.path().join("body.sqlite"), &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let draft = engine.prepare(&guid)?;
+    let draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     engine.commit(&gateway, &guid, &draft, None).await?;
     let mut value = serde_json::to_value(&engine.snapshot().records[0])?;
@@ -1225,7 +1515,7 @@ async fn image_finalization_failure_before_write_survives_restart() -> Result<()
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&path, &gateway).await?;
     let source = engine.snapshot().records[0].source.clone();
-    let mut draft = engine.prepare(&source.guid)?;
+    let mut draft = selected_draft(&engine, &source.guid)?;
     let mut attachment: DraftAttachment = serde_json::from_value(
         serde_json::json!({"id":"image","name":"picture.png","path":"/cache/picture.png","size":100,"is_image":true}),
     )?;
@@ -1264,12 +1554,47 @@ async fn image_finalization_failure_before_write_survives_restart() -> Result<()
 }
 
 #[tokio::test]
-async fn accepted_remote_target_retains_local_draft_and_mapping() -> Result<()> {
+async fn success_time_requires_complete_submission_and_survives_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("success-time.sqlite");
+    let gateway = MockGateway::default();
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    assert!(engine.finish_submission(&guid).await.is_err());
+    let draft = selected_draft(&engine, &guid)?;
+    engine.save_draft(&guid, &draft).await?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    assert!(engine.snapshot().records[0].last_synced_at.is_none());
+    engine.set_media_body_pending(&guid, true).await?;
+    assert!(engine.finish_submission(&guid).await.is_err());
+    assert!(engine.snapshot().records[0].last_synced_at.is_none());
+    engine.set_media_body_pending(&guid, false).await?;
+    engine.finish_submission(&guid).await?;
+    let time = engine.snapshot().records[0].last_synced_at.clone().unwrap();
+    assert!(chrono::DateTime::parse_from_rfc3339(&time).is_ok());
+    engine.set_media_body_pending(&guid, true).await?;
+    assert!(engine.finish_submission(&guid).await.is_err());
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    assert_eq!(
+        engine.snapshot().records[0].last_synced_at.as_ref(),
+        Some(&time)
+    );
+    // 旧缓存缺少成功时间时保留未知，不以加载/启动时间冒充历史成功时间。
+    let mut legacy = serde_json::to_value(&engine.snapshot().records[0])?;
+    legacy.as_object_mut().unwrap().remove("last_synced_at");
+    let restored: SyncRecord = serde_json::from_value(legacy)?;
+    assert!(restored.last_synced_at.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn confirmed_remote_version_updates_without_replacing_baseline_first() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut gateway = FaultGateway::new(MockGateway::default());
     let mut engine = configured(&dir.path().join("accept.sqlite"), &gateway).await?;
     let guid = engine.snapshot().records[0].source.guid.clone();
-    let mut draft = engine.prepare(&guid)?;
+    let mut draft = selected_draft(&engine, &guid)?;
     engine.save_draft(&guid, &draft).await?;
     engine.commit(&gateway, &guid, &draft, None).await?;
     let old = engine.snapshot().records[0].target.clone();
@@ -1279,8 +1604,18 @@ async fn accepted_remote_target_retains_local_draft_and_mapping() -> Result<()> 
     assert!(engine.commit(&gateway, &guid, &draft, old).await.is_err());
     let fresh = engine.preview_target(&gateway, &guid)?.unwrap();
     let id = fresh.id.clone();
-    engine.accept_target(&guid, &fresh).await?;
-    assert_eq!(engine.prepare(&guid)?.title, "本地编辑");
+    assert_ne!(engine.snapshot().records[0].target.as_ref(), Some(&fresh));
+    assert_eq!(selected_draft(&engine, &guid)?.title, "本地编辑");
+    gateway.remote_title = Some("确认后再次编辑".into());
+    assert!(
+        engine
+            .commit(&gateway, &guid, &draft, Some(fresh.clone()))
+            .await
+            .is_err()
+    );
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 1);
+    assert!(!engine.snapshot().records[0].uncertain);
+    gateway.remote_title = Some("远端编辑".into());
     engine.commit(&gateway, &guid, &draft, Some(fresh)).await?;
     assert_eq!(engine.snapshot().records[0].target.as_ref().unwrap().id, id);
     Ok(())
@@ -1323,9 +1658,79 @@ async fn runtime_settings_do_not_weaken_persistent_settings_or_business_writes()
     assert_eq!(engine.snapshot().settings, next);
     let before = engine.snapshot().clone();
     let guid = &before.records[0].source.guid;
-    let mut draft = engine.prepare(guid)?;
+    let mut draft = selected_draft(&engine, guid)?;
     draft.title = "not committed".into();
     assert!(engine.save_draft(guid, &draft).await.is_err());
     assert_eq!(engine.snapshot(), &before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bug_draft_and_binding_survive_restart_without_story_type() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("bug.db");
+    let gateway = MockGateway::default();
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut value = serde_json::to_value(engine.prepare(&guid)?)?;
+    value["workitem_kind"] = serde_json::json!("bug");
+    value["workitem_type_id"] = serde_json::json!("");
+    let draft: Draft = serde_json::from_value(value)?;
+    engine.save_draft(&guid, &draft).await?;
+    drop(engine);
+    let mut engine = Engine::open(&path).await?;
+    let draft = engine.prepare(&guid)?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    assert_eq!(
+        engine.snapshot().records[0].target.as_ref().unwrap().kind,
+        "bug"
+    );
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    let value = serde_json::to_value(engine.prepare(&guid)?)?;
+    assert_eq!(value["workitem_kind"], "bug");
+    assert_eq!(value["workitem_type_id"], "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn creation_requires_a_cached_project_type_and_preserves_it_on_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("types.db");
+    let gateway = FaultGateway::new(MockGateway::default());
+    let mut engine = configured(&path, &gateway).await?;
+    let guid = engine.snapshot().records[0].source.guid.clone();
+    let mut draft = engine.prepare(&guid)?;
+    for invalid in ["", "8", "unavailable"] {
+        draft.workitem_type_id = invalid.into();
+        engine.save_draft(&guid, &draft).await?;
+        assert!(engine.commit(&gateway, &guid, &draft, None).await.is_err());
+        assert!(!engine.snapshot().records[0].uncertain);
+    }
+    assert_eq!(gateway.writes.load(Ordering::SeqCst), 0);
+    let cache = engine.snapshot().directory.workitem_types.clone();
+    assert!(
+        engine
+            .refresh_workitem_types(&gateway, "demo")
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.snapshot().directory.workitem_types, cache);
+    draft.workitem_type_id = "7".into();
+    engine.save_draft(&guid, &draft).await?;
+    engine.commit(&gateway, &guid, &draft, None).await?;
+    let target = engine.snapshot().records[0].target.clone();
+    draft.workitem_type_id = "8".into();
+    engine.save_draft(&guid, &draft).await?;
+    assert!(
+        engine
+            .commit(&gateway, &guid, &draft, target)
+            .await
+            .is_err()
+    );
+    drop(engine);
+    let engine = Engine::open(&path).await?;
+    assert_eq!(engine.snapshot().directory.workitem_types, cache);
+    assert_eq!(engine.prepare(&guid)?.workitem_type_id, "7");
     Ok(())
 }

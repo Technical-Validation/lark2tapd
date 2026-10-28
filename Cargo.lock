@@ -4142,9 +4142,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "html5ever",
  "lark2tapd-core",
  "libc",
  "markdown",
+ "markup5ever_rcdom",
  "security-framework",
  "serde",
  "serde_json",
@@ -4160,6 +4162,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "image",
  "libc",
  "serde",
  "serde_json",

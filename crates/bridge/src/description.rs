@@ -24,13 +24,46 @@ pub fn render_description(draft: &Draft, source: &SourceTask) -> Result<String> 
     // 来源标记在 Markdown 之后追加，防止被引用链接或未闭合代码块吞掉。
     html.push_str(&format!("<p>[lark-task:{}]</p>", source.guid));
     let source_url = safe_url(&source.url, true);
-    if !source_url.is_empty() {
-        html.push_str(&format!("<p>{}</p>", escape_html(&source_url)));
+    if draft.include_source_link && !source_url.is_empty() {
+        html.push_str(&format!(
+            "<p><a href=\"{}\">飞书任务 / Lark task</a></p>",
+            escape_html(&source_url)
+        ));
     }
     Ok(html)
 }
 
-fn collect_definitions(node: &Node, definitions: &mut HashMap<String, String>) {
+// 仅实际 Markdown 图片节点引用的缓存图进入提交，不把代码示例里的 URI 当作图片。
+pub fn referenced_image_ids(input: &str) -> std::collections::HashSet<String> {
+    fn visit(
+        node: &Node,
+        defs: &HashMap<String, String>,
+        ids: &mut std::collections::HashSet<String>,
+    ) {
+        let url = match node {
+            Node::Image(image) => Some(image.url.as_str()),
+            Node::ImageReference(image) => defs.get(&image.identifier).map(String::as_str),
+            _ => None,
+        };
+        if let Some(id) = url.and_then(|url| url.strip_prefix("attachment:")) {
+            ids.insert(id.to_owned());
+        }
+        if let Some(children) = node.children() {
+            for child in children {
+                visit(child, defs, ids);
+            }
+        }
+    }
+    let mut ids = std::collections::HashSet::new();
+    if let Ok(tree) = markdown::to_mdast(input, &Default::default()) {
+        let mut defs = HashMap::new();
+        collect_definitions(&tree, &mut defs);
+        visit(&tree, &defs, &mut ids);
+    }
+    ids
+}
+
+pub(crate) fn collect_definitions(node: &Node, definitions: &mut HashMap<String, String>) {
     if let Node::Definition(d) = node {
         definitions
             .entry(d.identifier.clone())
@@ -43,7 +76,7 @@ fn collect_definitions(node: &Node, definitions: &mut HashMap<String, String>) {
     }
 }
 
-fn safe_link(raw: &str) -> bool {
+pub(crate) fn safe_link(raw: &str) -> bool {
     url::Url::parse(raw).is_ok_and(|u| {
         matches!(u.scheme(), "http" | "https")
             && u.host_str().is_some()

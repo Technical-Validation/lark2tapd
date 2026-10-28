@@ -7,6 +7,8 @@ mod connections;
 mod layout;
 #[path = "prefix_settings_tests.rs"]
 mod prefix_settings;
+#[path = "source_tests.rs"]
+mod source;
 use gpui_kit::component::{Theme, WindowExt};
 use gpui_kit::test::TestWindowExt;
 use std::{
@@ -192,9 +194,14 @@ fn load_task(
     });
     pump(events, model, cx, |cx| {
         model.read(cx).snapshot.as_ref().is_some_and(|s| {
-            !s.directory.workspaces.is_empty() && s.directory.members.contains_key("demo")
+            !s.directory.workspaces.is_empty()
+                && s.directory.members.contains_key("demo")
+                && s.directory.workitem_types.contains_key("demo")
         })
     });
+    choose(cx, handle, "draft-workitem-type", "开发任务");
+    // 通用场景从已配置的编辑器开始；专门的类型测试另行检查选择造成的脏状态。
+    view.update(cx, |view, cx| view.draft_baseline = Some(view.draft(cx)));
     guid
 }
 
@@ -283,6 +290,7 @@ fn invalidated_editor_drops_old_discard_prompt_and_dirty_baseline(cx: &mut TestA
     let session = cx.read(|cx| view.read(cx).editor_session);
     view.update(cx, |v, _| {
         let attachment = DraftAttachment {
+            source_derived: false,
             id: "test".into(),
             name: "test.txt".into(),
             path: "unused".into(),
@@ -585,6 +593,11 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
             .target
             .is_some()
     });
+    assert!(
+        VisualTestContext::from_window(handle, cx)
+            .debug_bounds("last-sync-time")
+            .is_some()
+    );
     let id = cx.read(|cx| {
         let t = model.read(cx).snapshot.as_ref().unwrap().records[0]
             .target
@@ -598,6 +611,13 @@ fn direct_submit_prefix_and_update_persist_without_preview(cx: &mut TestAppConte
         w.click("draft-title", cx);
         w.press("cmd-a", cx);
         w.input("同一目标的新标题", cx);
+        assert!(w.try_find("check-remote-target").is_none());
+        assert!(w.try_find("accept-remote-target").is_none());
+        assert!(
+            model.read(cx).snapshot.as_ref().unwrap().records[0]
+                .last_synced_at
+                .is_some()
+        );
     })
     .unwrap();
     click(cx, handle, "submit");
@@ -705,13 +725,14 @@ fn polling_autosaves_and_reports_invalid_input_inline(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn source_details_expand_and_settings_do_not_clobber_draft(cx: &mut TestAppContext) {
+fn visible_source_metadata_and_settings_do_not_clobber_draft(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, view) = setup(cx);
     load_task(&events, &model, &view, handle, cx);
-    cx.read(|cx| assert!(!view.read(cx).source_open));
-    click(cx, handle, "toggle-source-details");
-    cx.read(|cx| assert!(view.read(cx).source_open));
-    click(cx, handle, "toggle-source-details");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("toggle-source-details").is_none());
+    })
+    .unwrap();
     choose(cx, handle, "draft-owner", "alice");
     let before = cx.read(|cx| view.read(cx).draft(cx));
     let (settings, _) = open_settings_for_test(cx, handle);
@@ -1127,6 +1148,7 @@ fn attachment_or_body_failure_is_attention_not_synced(cx: &mut TestAppContext) {
     let mut record = cx.read(|cx| model.read(cx).snapshot.as_ref().unwrap().records[0].clone());
     record.baseline = Some(record.source.clone());
     record.target = Some(lark2tapd_core::TargetTask {
+        workitem_type_id: String::new(),
         id: "target".into(),
         url: String::new(),
         kind: "story".into(),
@@ -1141,6 +1163,7 @@ fn attachment_or_body_failure_is_attention_not_synced(cx: &mut TestAppContext) {
     record.media_body_pending = false;
     let mut draft = cx.read(|cx| view.read(cx).draft(cx));
     draft.attachments.push(DraftAttachment {
+        source_derived: false,
         id: "file".into(),
         name: "file.txt".into(),
         path: "unused".into(),

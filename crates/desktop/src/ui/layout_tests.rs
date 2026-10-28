@@ -1,41 +1,124 @@
-//! 布局回归使用真实控件边界，防止折叠区再次按按钮文字收缩。
+//! 布局回归使用真实控件边界，验证紧凑信息区和内容可见性。
 use super::*;
 
+// 三项来源信息默认可见；长正文不再把基本信息区撑高。
 #[gpui_kit::test]
-fn expanded_source_trigger_spans_the_detail_content(cx: &mut TestAppContext) {
+fn compact_source_metadata_is_always_visible(cx: &mut TestAppContext) {
     let (_dir, events, model, handle, view) = setup(cx);
     load_task(&events, &model, &view, handle, cx);
-    click(cx, handle, "toggle-source-details");
-    // 长正文在最小窗口内也不能把背景撑出可用内容区。
-    model.update(cx, |m, cx| {
-        m.snapshot.as_mut().unwrap().records[0].source.description =
-            "长描述需要在详情区域内正确换行。".repeat(40);
+    model.update(cx, |model, cx| {
+        model.snapshot.as_mut().unwrap().records[0]
+            .source
+            .description = "长正文".repeat(400);
         cx.notify();
     });
-    cx.simulate_window_resize(handle, size(px(920.), px(640.)));
-    cx.run_until_parked();
-    cx.update_window(handle, |_, w, cx| {
-        w.render_frame(cx);
-        let trigger = w.find("toggle-source-details").bounds();
-        let title = w.find("tapd-title-group").bounds();
+    for width in [1440., 920.] {
+        cx.simulate_window_resize(handle, size(px(width), px(640.)));
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("toggle-source-details").is_none());
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(handle, cx);
+        let metadata = visual
+            .debug_bounds("source-detail-panel")
+            .expect("always-visible metadata");
         assert!(
-            (trigger.size.width - title.size.width).abs() < px(2.),
-            "trigger {trigger:?}, title {title:?}"
+            metadata.size.height <= px(60.),
+            "metadata must be compact: {metadata:?}"
         );
-        assert!((trigger.left() - title.left()).abs() < px(2.));
-    })
-    .unwrap();
-    let panel = VisualTestContext::from_window(handle, cx)
-        .debug_bounds("source-detail-panel")
+        assert!(metadata.right() <= px(width));
+        for id in ["source-creator", "source-assignees", "source-created"] {
+            let field = visual.debug_bounds(id).expect("required metadata");
+            assert!(field.top() >= metadata.top() && field.bottom() <= metadata.bottom());
+        }
+        for id in ["source-updated", "source-followers", "source-body"] {
+            assert!(visual.debug_bounds(id).is_none());
+        }
+    }
+}
+
+// 长简介、普通详情和消息来源必须同时保留，不能挤掉元数据或 TAPD 编辑区。
+#[gpui_kit::test]
+fn visible_source_keeps_full_title_messages_and_required_metadata(cx: &mut TestAppContext) {
+    let (_dir, events, model, handle, view) = setup(cx);
+    load_task(&events, &model, &view, handle, cx);
+    let draft = cx.read(|cx| view.read(cx).draft(cx));
+    model.update(cx, |m, cx| {
+        let source = &mut m.snapshot.as_mut().unwrap().records[0].source;
+        source.title = "完整任务简介\n\n".repeat(12);
+        source.description = "## 任务详情\n\n**正文**\n\n- 检查项".into();
+        source.metadata.source_messages = vec![
+            lark2tapd_core::SourceMessage {
+                message_id: "om_later".into(),
+                content: "## 来源消息\n\n消息正文".into(),
+            },
+            lark2tapd_core::SourceMessage {
+                message_id: "om_earlier".into(),
+                content: String::new(),
+            },
+            lark2tapd_core::SourceMessage {
+                message_id: "7684199632590769140".into(),
+                content: "没有发送时间的消息".into(),
+            },
+        ];
+        for (id, time) in [
+            ("om_later", "1735689602000"),
+            ("om_earlier", "1735689600000"),
+        ] {
+            source.metadata.message_details.insert(
+                id.into(),
+                lark2tapd_core::SourceMessageDetails {
+                    sender: Some(lark2tapd_core::SourcePerson {
+                        id: "ou_sender".into(),
+                        name: String::new(),
+                    }),
+                    sent_at: Some(time.into()),
+                },
+            );
+        }
+        source
+            .metadata
+            .resolved_names
+            .insert("ou_sender".into(), "发送人姓名".into());
+        cx.notify();
+    });
+    cx.update_window(handle, |_, w, cx| w.render_frame(cx))
         .unwrap();
-    let trigger = cx
-        .update_window(handle, |_, w, _| w.find("toggle-source-details").bounds())
-        .unwrap();
+    let mut visual = VisualTestContext::from_window(handle, cx);
+    let summary = visual.debug_bounds("source-summary").expect("full summary");
     assert!(
-        (panel.size.width - trigger.size.width).abs() < px(2.),
-        "panel {panel:?}, trigger {trigger:?}"
+        summary.size.height > px(100.),
+        "summary must not be line-clamped"
     );
-    assert!(panel.right() <= px(920.));
+    for selector in [
+        "source-creator",
+        "source-created",
+        "source-assignees",
+        "source-message-0",
+        "source-message-1",
+        "source-message-2",
+        "source-message-header-om_later",
+        "source-message-header-om_earlier",
+        "source-message-header-7684199632590769140",
+    ] {
+        assert!(
+            visual.debug_bounds(selector).is_some(),
+            "missing {selector}"
+        );
+    }
+    let early = visual
+        .debug_bounds("source-message-header-om_earlier")
+        .unwrap();
+    let late = visual
+        .debug_bounds("source-message-header-om_later")
+        .unwrap();
+    let unknown = visual
+        .debug_bounds("source-message-header-7684199632590769140")
+        .unwrap();
+    assert!(early.top() < late.top() && late.top() < unknown.top());
+    cx.read(|cx| assert_eq!(view.read(cx).draft(cx), draft));
 }
 
 #[gpui_kit::test]

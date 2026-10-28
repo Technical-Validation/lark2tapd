@@ -8,7 +8,7 @@ impl Workspace {
     pub(super) fn task_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().to_lowercase();
         let model = self.model.read(cx);
-        let records: Vec<_> = model
+        let mut records: Vec<_> = model
             .snapshot
             .as_ref()
             .map(|s| {
@@ -23,6 +23,10 @@ impl Workspace {
                     .collect()
             })
             .unwrap_or_default();
+        // 仅改变视图顺序，不重排缓存或切换当前任务；相同时间沿用原有顺序。
+        records.sort_by_key(|record| {
+            std::cmp::Reverse(timestamp(record.source.metadata.created_at.as_deref()))
+        });
         div()
             .flex()
             .flex_col()
@@ -182,24 +186,48 @@ impl Workspace {
         let stale = self.edit_source.as_ref() != Some(&record.source);
         let guid = record.source.guid.clone();
         let partial = record.has_pending_attachments();
+        let type_workspace = selected(&self.workspace, cx);
+        let selected_type = selected(&self.workitem_type, cx);
+        let types_loading = model
+            .activities
+            .contains(&format!("workitem-types:{type_workspace}"));
+        let type_valid = record.target.is_some()
+            || model
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.directory.workitem_types.get(&type_workspace))
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| type_key(&item.kind, &item.id) == selected_type)
+                });
+        let submitting = model.activities.contains("submit");
+        let preparing = self.pending_submission.is_some();
+        let target_url = record.target.as_ref().map(|target| {
+            lark2tapd_bridge::target_url(target, record.target_workspace.as_deref().unwrap_or(""))
+        });
+        let recovery_id = self.recover_id.read(cx).value();
+        let recovery_valid = !recovery_id.trim().is_empty()
+            && recovery_id.trim().bytes().all(|byte| byte.is_ascii_digit());
         div().id("detail-scroll").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.description_scroll).p_6().flex().flex_col().gap_4()
             // 状态与外部入口保持在标题行，飞书图标位于最右侧。
             .child(div().flex().items_center().gap_2()
-                .child(div().flex_1().min_w_0().text_xl().font_semibold().child(self.tr(cx,"任务详情","Task details")))
+                .child(div().debug_selector(|| "source-summary".into()).flex_1().min_w_0().whitespace_normal().text_xl().font_semibold().child(record.source.title.clone()))
                 .child(div().id("detail-sync-status").flex().items_center().gap_1().text_sm().text_color(cx.theme().muted_foreground)
                     .when(Filter::Synced.matches(&record), |d| d.child(synced_icon(cx)))
                     .child(if partial { self.tr(cx,"附件待处理","Attachments pending") } else { status_text(model.language(),record.status()) })
                     .tooltip({let label = if partial { self.tr(cx,"附件待处理","Attachments pending") } else { status_text(model.language(),record.status()) }; move |window,cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window,cx) }))
-                .when_some(record.target.as_ref(),|d,t|d.child(Button::new("open-target").label(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).ghost().disabled(t.url.is_empty()).on_click({let url=t.url.clone();move |_,_,cx|open_safe_url(&url,cx)})))
+                .when_some(target_url,|d,url|d.child(Button::new("open-target").child(Icon::new(IconName::ExternalLink).size_4()).accessibility_label(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).tooltip(self.tr(cx,"在 TAPD 中打开","Open in TAPD")).ghost().disabled(url.is_empty()).on_click(move |_,_,cx|open_safe_url(&url,cx))))
                 .child(Button::new("open-source").child(img(lark_icon(cx.theme().is_dark())).size(px(20.))).accessibility_label(self.tr(cx,"在飞书中打开","Open in Lark")).tooltip(self.tr(cx,"在飞书中打开","Open in Lark")).ghost().disabled(record.source.url.is_empty()).on_click({let url=record.source.url.clone();move |_,_,cx|open_safe_url(&url,cx)})))
-            .child(Collapsible::new().w_full().min_w_0().rounded_md().overflow_hidden().bg(cx.theme().muted).open(self.source_open).motion_id("source-details")
-                .child(Button::new("toggle-source-details").w_full().label(if self.source_open{self.tr(cx,"收起飞书任务详情","Hide Lark task details")}else{self.tr(cx,"展开飞书任务详情","Show Lark task details")}).ghost().on_click(cx.listener(|this,_,_,cx|{this.source_open = !this.source_open;cx.notify();})))
-                .content(self.source_details(&record.source,cx)))
+            .child(self.source_metadata_row(&record.source,cx))
+            .when(!record.source.metadata.source_messages.is_empty(), |d| d.child(self.source_conversation(&record.source, cx)))
             .when(stale,|d|d.child(div().flex().flex_col().gap_2().child(self.tr(cx,"来源已变化或草稿尚未加载。","Source changed or the draft is not loaded."))
                 .child(Button::new("reload-source").label(self.tr(cx,"丢弃草稿并重新读取","Discard draft and reload")).disabled(busy||uncertain).on_click(cx.listener({let guid=guid.clone();move |this,_,_,cx|this.reload_source(guid.clone(),cx)})))))
             .child(field(self.tr(cx,"TAPD 标题","TAPD title"),InputGroup::new("tapd-title-group").input(InputGroupInput::new(&self.title).id("draft-title").aria_label(self.tr(cx,"标题","Title")).disabled(busy||uncertain||stale)).addon(InputGroupAddon::new("title-prefix-addon").child(Select::new(&self.prefix).id("title-prefix").appearance(false).placeholder(self.tr(cx,"无前缀","No prefix")).cleanable(true).w(px(160.)).disabled(busy||uncertain||stale)))))
             .child(field(self.tr(cx,"内容 · Markdown","Description · Markdown"),self.description_editor(busy||uncertain||stale,cx)))
+            .when(record.source.description.contains("[Image]") && self.description.read(cx).text().contains("[Image]"),|d| d.child(div().debug_selector(|| "source-image-unavailable".into()).text_sm().text_color(cx.theme().muted_foreground).child(self.tr(cx,"飞书接口仅返回 [Image] 占位文本，未提供对应图片。请在飞书查看原图，或粘贴图片替换占位符。","Lark returned only an [Image] placeholder, without image data. View the original in Lark or paste the image to replace it."))))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.tr(cx,"支持粘贴图片。仅显示本任务的本地图片，外部图片不自动加载。","Paste images here. Only this task’s local images are displayed; external images are not loaded automatically.")))
+            .child(Switch::new("include-source-link").label(self.tr(cx,"附加飞书任务链接","Include Lark task link")).checked(self.include_source_link).disabled(busy||uncertain||stale).on_click(cx.listener(|this,enabled,_,cx| {this.include_source_link = *enabled;cx.notify();})))
             .child(Button::new("add-attachments").label(self.tr(cx,"添加附件","Add attachments")).disabled(busy||uncertain||stale).on_click(cx.listener(|this,_,window,cx|this.add_files(window,cx))))
             .children(self.attachments.iter().map(|a|{
                 let uploaded=a.remote_id.as_ref().is_some_and(|v|!v.is_empty())||a.remote_url.as_ref().is_some_and(|v|!v.is_empty());let id=a.id.clone();
@@ -210,83 +238,82 @@ impl Workspace {
             .child(self.field_feedback("attachments",cx))
             .child(div().flex().gap_3().child(field(self.tr(cx,"目标项目空间","TAPD workspace"),Select::new(&self.workspace).id("draft-workspace").placeholder(self.tr(cx,"选择项目空间","Select workspace")).search_placeholder(self.tr(cx,"搜索项目空间","Search workspaces")).disabled(busy||record.target.is_some()||stale)))
                 .child(field(self.tr(cx,"处理人","Assignee"),Select::new(&self.owner).id("draft-owner").placeholder(self.tr(cx,"选择处理人","Select assignee")).cleanable(true).disabled(busy||uncertain||stale))))
+            .child(field(self.tr(cx,"TAPD 类型","TAPD work item type"),Select::new(&self.workitem_type).id("draft-workitem-type").placeholder(if types_loading {self.tr(cx,"读取类型中…","Loading types…")}else if record.target.is_some(){self.tr(cx,"已有条目类型不变","Existing type is unchanged")}else{self.tr(cx,"选择创建类型","Select a type")}).disabled(busy||uncertain||stale||record.target.is_some())))
+            .child(self.field_feedback("workitem-types",cx))
             .child(field(self.tr(cx,"截止日期","Due date"),DatePicker::new(&self.due).cleanable(true).disabled(busy||uncertain||stale)))
             .when_some(record.last_error.clone(),|d,error|d.child(div().text_sm().text_color(cx.theme().danger).child(error)))
             .when(uncertain,|d|d.child(div().p_3().bg(cx.theme().muted).flex().flex_col().gap_2()
                 .child(self.tr(cx,"上次写入结果不确定，请先在 TAPD 核对已有条目，不会自动重试创建。","The last write is uncertain. Verify the existing TAPD item; creation is not automatically retried."))
-                .child(format!("[lark-task:{}]",guid)).child(Input::new(&self.recover_id).id("recovery-id"))
-                .child(div().flex().gap_2().children([("story","Story"),("task","Task")].into_iter().map(|(kind,label)|Button::new(kind).label(label).ghost().when(self.recover_kind==kind,|b|b.primary()).on_click(cx.listener(move |this,_,_,cx|{this.recover_kind=kind.into();cx.notify();})))))
-                .child(Button::new("recover").label(self.tr(cx,"验证已有条目","Verify existing item")).disabled(busy).on_click(cx.listener({let guid=guid.clone();let workspace=record.target_workspace.clone().or_else(||record.draft.as_ref().map(|d|d.workspace_id.clone())).unwrap_or_default();move |this,_,_,cx|this.send_editor(Job::Recover{guid:guid.clone(),workspace:workspace.clone(),id:this.recover_id.read(cx).value().to_string(),kind:this.recover_kind.clone()},cx)})))))
-            .child(div().flex().gap_3().child(Button::new("save-draft").label(self.tr(cx,"保存草稿","Save draft")).disabled(busy||uncertain||stale||!self.pending_pastes.is_empty()||self.pending_files>0).on_click(cx.listener({let guid=guid.clone();move |this,_,_,cx|{if let Some(source)=this.edit_source.clone(){this.send_editor(Job::SaveDraft(guid.clone(),this.draft(cx),source),cx);}}})))
-                .child(Button::new("submit").label(if record.target.is_some(){self.tr(cx,"更新到 TAPD","Update in TAPD")}else{self.tr(cx,"导入 TAPD","Import to TAPD")}).primary().disabled(busy||uncertain||stale||!self.pending_pastes.is_empty()||self.pending_files>0).on_click(cx.listener(move |this,_,_,cx|{if let Some(source)=this.edit_source.clone(){this.send_editor(Job::Submit(guid.clone(),this.draft(cx),source),cx);}}))))
+                .child(format!("[lark-task:{}]",guid)).child(Input::new(&self.recover_id).id("recovery-id").aria_label(self.tr(cx,"TAPD 条目的完整数字 ID（不是链接）","Full numeric TAPD item ID, not a URL")))
+                .when(!recovery_valid, |d| d.child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.tr(cx,"请填写已有条目的完整数字 ID，核对后才能继续。","Enter the existing item's full numeric ID to verify it."))))
+                .child(div().flex().gap_2().children([("story","Story"),("bug","Bug"),("task","Task")].into_iter().map(|(kind,label)|Button::new(kind).label(label).ghost().when(self.recover_kind==kind,|b|b.primary()).on_click(cx.listener(move |this,_,_,cx|{this.recover_kind=kind.into();cx.notify();})))))
+                .child(Button::new("recover").label(self.tr(cx,"验证已有条目","Verify existing item")).disabled(busy || !recovery_valid).on_click(cx.listener({let guid=guid.clone();let workspace=record.target_workspace.clone().or_else(||record.draft.as_ref().map(|d|d.workspace_id.clone())).unwrap_or_default();move |this,_,_,cx|this.send_editor(Job::Recover{guid:guid.clone(),workspace:workspace.clone(),id:this.recover_id.read(cx).value().trim().to_owned(),kind:this.recover_kind.clone()},cx)})))))
+            .child(div().flex().flex_wrap().items_center().gap_3().child(Button::new("save-draft").label(self.tr(cx,"保存草稿","Save draft")).disabled(busy||uncertain||stale||!self.pending_pastes.is_empty()||self.pending_files>0).on_click(cx.listener({let guid=guid.clone();move |this,_,_,cx|{if let Some(source)=this.edit_source.clone(){this.send_editor(Job::SaveDraft(guid.clone(),this.draft(cx),source),cx);}}})))
+                .child(Button::new("submit").loading(submitting||preparing).label(if preparing {self.tr(cx,"检查中…","Checking…")}else if submitting {if record.target.is_some(){self.tr(cx,"更新中…","Updating…")}else{self.tr(cx,"导入中…","Importing…")}}else if record.target.is_some(){self.tr(cx,"更新到 TAPD","Update in TAPD")}else{self.tr(cx,"导入 TAPD","Import to TAPD")}).primary().disabled(!type_valid||busy||self.pending_submission.is_some()||uncertain||stale||!self.pending_pastes.is_empty()||self.pending_files>0).on_click(cx.listener(move |this,_,_,cx|{if let Some(source)=this.edit_source.clone(){this.begin_submission(&guid,source,cx);}})))
+                .when_some(record.last_synced_at.as_deref().and_then(|time| local_time(Some(time))), |d,time| d.child(div().id("last-sync-time").debug_selector(|| "last-sync-time".into()).text_xs().text_color(cx.theme().muted_foreground).child(format!("{} {time}",self.tr(cx,"上次成功更新：","Last successful update:"))))))
+
             .child(self.field_feedback("submit",cx))
-            .when(record.target.is_some(),|d|d.child(Button::new("check-remote-target").label(self.tr(cx,"核对 TAPD 最新内容","Review current TAPD contents")).ghost().on_click(cx.listener({let guid=record.source.guid.clone();move |this,_,_,cx|this.send_editor(Job::CheckTarget{guid:guid.clone(),session:this.editor_session},cx)}))))
-            .when_some(self.remote_target.clone(),|d,target|d.child(div().p_3().border_1().border_color(cx.theme().border).rounded_md().flex().flex_col().gap_2()
-                .child(self.tr(cx,"远端当前版本；接受只更新本地基线，不会立即覆盖 TAPD。","Current remote version. Accepting updates the local baseline only; it does not write to TAPD."))
-                .child(target.title.clone()).child(self.markdown("remote-description",target.description.clone()))
-                .child(Button::new("accept-remote-target").label(self.tr(cx,"接受当前版本并继续编辑","Accept version and continue editing")).disabled(busy).on_click(cx.listener({let guid=record.source.guid.clone();move |this,_,_,cx|this.send_editor(Job::AcceptTarget{guid:guid.clone(),target:target.clone()},cx)})))))
             .into_any_element()
     }
-    fn source_details(&self, source: &SourceTask, cx: &App) -> impl IntoElement {
+    fn source_metadata_row(&self, source: &SourceTask, cx: &App) -> impl IntoElement {
+        let missing = self.tr(cx, "未提供", "Not provided");
+        let unnamed = self.tr(cx, "名称未提供", "Name unavailable");
         let creator = source
             .metadata
             .creator
             .as_ref()
-            .and_then(|p| nonblank(&p.name));
-        let assignees = source
+            .map(|person| source.metadata.person_name(person).unwrap_or(unnamed))
+            .unwrap_or(missing)
+            .to_owned();
+        let names = source
             .metadata
             .assignees
             .iter()
-            .filter_map(|p| nonblank(&p.name))
+            .map(|person| source.metadata.person_name(person).unwrap_or(unnamed))
             .collect::<Vec<_>>()
             .join(", ");
+        let assignees = nonblank(&names).unwrap_or_else(|| missing.to_owned());
+        let created =
+            local_time(source.metadata.created_at.as_deref()).unwrap_or_else(|| missing.to_owned());
+        // 只展示三项基本信息；不再引入折叠状态，也不重复显示编辑区已有的正文。
         div()
             .debug_selector(|| "source-detail-panel".into())
             .w_full()
             .min_w_0()
-            .rounded_md()
-            .overflow_hidden()
-            .p_3()
-            .bg(cx.theme().muted)
+            .flex_shrink_0()
             .flex()
-            .flex_col()
-            .gap_2()
-            .child(source.title.clone())
-            .when_some(creator, |d, v| {
-                d.child(format!("{}: {v}", self.tr(cx, "创建人", "Created by")))
-            })
-            .when(!assignees.is_empty(), |d| {
-                d.child(format!(
-                    "{}: {assignees}",
-                    self.tr(cx, "负责人", "Assignees")
-                ))
-            })
-            .when_some(local_time(source.metadata.created_at.as_deref()), |d, v| {
-                d.child(format!("{}: {v}", self.tr(cx, "创建时间", "Created")))
-            })
-            .when_some(local_time(source.metadata.due_at.as_deref()), |d, v| {
-                d.child(format!("{}: {v}", self.tr(cx, "截止时间", "Due")))
-            })
-            .when_some(
-                local_time(source.metadata.completed_at.as_deref()),
-                |d, v| d.child(format!("{}: {v}", self.tr(cx, "结束时间", "Completed"))),
+            .flex_wrap()
+            .gap_x_4()
+            .gap_y_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .children(
+                [
+                    (
+                        "source-creator",
+                        self.tr(cx, "创建人", "Created by"),
+                        creator,
+                    ),
+                    (
+                        "source-assignees",
+                        self.tr(cx, "负责人", "Assignees"),
+                        assignees,
+                    ),
+                    (
+                        "source-created",
+                        self.tr(cx, "创建时间", "Created"),
+                        created,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, label, value)| {
+                    div()
+                        .debug_selector(move || id.into())
+                        .min_w_0()
+                        .whitespace_normal()
+                        .child(format!("{label}: {value}"))
+                }),
             )
-            .child(self.tr(
-                cx,
-                if source.completed {
-                    "已完成"
-                } else {
-                    "未完成"
-                },
-                if source.completed {
-                    "Completed"
-                } else {
-                    "Incomplete"
-                },
-            ))
-            .when(!source.description.is_empty(), |d| {
-                d.child(self.markdown("source-description", source.description.clone()))
-            })
     }
 }
 // 实心圆勾只用于详情状态；是否完成沿用 Filter 的正文及附件判定。
@@ -323,16 +350,26 @@ fn nonblank(value: &str) -> Option<String> {
         Some(value.to_owned())
     }
 }
-fn local_time(value: Option<&str>) -> Option<String> {
-    value
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|v| *v > 0)
-        .and_then(chrono::DateTime::from_timestamp_millis)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
+pub(super) fn timestamp(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value = value?;
+    // 飞书返回毫秒时间戳，本地成功记录使用 RFC 3339；共享同一显示格式。
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.to_utc())
+        .ok()
+        .or_else(|| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|v| *v > 0)
+                .and_then(chrono::DateTime::from_timestamp_millis)
         })
+}
+pub(super) fn local_time(value: Option<&str>) -> Option<String> {
+    timestamp(value).map(|t| {
+        t.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
 }
 // 明确字段，渲染时不会把缺失值误当成需要占位的一行。
 struct TaskSummary {
@@ -347,7 +384,7 @@ fn task_summary(source: &SourceTask) -> TaskSummary {
         .metadata
         .assignees
         .iter()
-        .filter_map(|p| nonblank(&p.name))
+        .filter_map(|person| source.metadata.person_name(person))
         .collect::<Vec<_>>()
         .join(", ");
     // 摘要按字符截断，不会切断 UTF-8；折叠 Markdown 常见标记与换行。
@@ -433,6 +470,37 @@ mod summary_tests {
             source.metadata.created_at = Some(invalid.into());
             assert_eq!(task_summary(&source).created, None);
         }
+    }
+
+    #[test]
+    fn summary_uses_resolved_names_without_showing_user_ids() {
+        let mut source = SourceTask {
+            guid: "names".into(),
+            title: "Title".into(),
+            description: String::new(),
+            url: String::new(),
+            due: None,
+            completed: false,
+            metadata: Default::default(),
+        };
+        source.metadata.assignees = vec![
+            lark2tapd_core::SourcePerson {
+                id: "ou_found".into(),
+                name: String::new(),
+            },
+            lark2tapd_core::SourcePerson {
+                id: "ou_missing".into(),
+                name: "ou_missing".into(),
+            },
+        ];
+        source
+            .metadata
+            .resolved_names
+            .insert("ou_found".into(), "已查询姓名".into());
+        assert_eq!(
+            task_summary(&source).assignees.as_deref(),
+            Some("已查询姓名")
+        );
     }
 
     #[test]

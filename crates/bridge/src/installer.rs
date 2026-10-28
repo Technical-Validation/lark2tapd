@@ -107,29 +107,12 @@ pub fn install_cli(tool: CliTool, tools_dir: &Path) -> Result<PathBuf> {
     install_with(tool, tools_dir, &mut crate::process::run)
 }
 
-/// 版本诊断不是身份认证或远程连接测试；不返回未经筛选的 CLI 输出。
+/// 检查可执行文件及 CLI 身份，版本号只作诊断，不设版本白名单。
+/// 这不是身份认证或远程连接测试；不返回未经筛选的 CLI 输出。
 /// TAPD 自身可能查询更新并写入版本缓存，因此也必须由用户主动触发。
 pub fn probe_cli(tool: CliTool, path: &Path) -> Result<String> {
     ensure!(path.is_absolute() && path.is_file(), CLI_PATH_ERROR);
     probe_with(tool, path, &[], &mut crate::process::run)
-}
-
-/// 产品配置入口与连接诊断共用同一份已验证的协议版本范围。
-pub fn probe_supported_cli(tool: CliTool, path: &Path) -> Result<String> {
-    let version = probe_cli(tool, path)?;
-    let supported = match tool {
-        CliTool::Lark => version == "1.0.96",
-        CliTool::Tapd => matches!(version.as_str(), "1.8.1" | "1.15.0"),
-    };
-    ensure!(
-        supported,
-        "Unsupported CLI version {version}; supported versions: {}",
-        match tool {
-            CliTool::Lark => "Lark 1.0.96",
-            CliTool::Tapd => "TAPD 1.8.1 or 1.15.0",
-        }
-    );
-    Ok(version)
 }
 
 type Runner<'a> =

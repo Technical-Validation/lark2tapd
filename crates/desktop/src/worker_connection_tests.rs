@@ -66,7 +66,7 @@ impl ConnectionBackend for Backend {
                 CliTool::Lark => &settings.lark_path,
                 CliTool::Tapd => &settings.tapd_path,
             };
-            return probe_supported_cli(tool, std::path::Path::new(path));
+            return probe_cli(tool, std::path::Path::new(path));
         }
         anyhow::ensure!(!self.fail_probe, "CLI is not executable");
         Ok("fake CLI 1.0.0".into())
@@ -999,7 +999,7 @@ fn readiness_runs_version_and_rejects_a_plain_file() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lark-cli");
-    std::fs::write(&path, "#!/bin/sh\necho 'lark-cli version 1.0.96'\n").unwrap();
+    std::fs::write(&path, "#!/bin/sh\necho 'lark-cli version 1.0.98'\n").unwrap();
     let settings = Settings {
         lark_path: path.to_string_lossy().into_owned(),
         ..Default::default()
@@ -1322,9 +1322,207 @@ fn tapd_check_does_not_probe_missing_lark_cli() {
     assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
 }
 
-// CLI 的业务命令能成功返回也不能绕过协议门禁，更不能先访问凭据。
+// 回归用户升级 CLI 后被桌面入口拦截：真实 actor 和子进程通过完整刷新链路。
 #[test]
-fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
+fn cli_versions_outside_old_allowlist_reach_desktop_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut settings = Settings::default();
+    for (tool, version) in [
+        (CliTool::Lark, "lark-cli version 1.0.98"),
+        (CliTool::Tapd, "99.0.0"),
+    ] {
+        let path = root.path().join(format!("{tool:?}-cli"));
+        std::fs::write(&path, format!(r#"#!/usr/bin/env python3
+import sys,json
+a=sys.argv[1:]
+if a==['--version']: print('{version}')
+elif a==['--help']: print('Usage: tapd-cli [options] [command]')
+elif a==['auth','status','--json','--verify']:
+ print(json.dumps({{'appId':'injected-secret-app-id','brand':'feishu','identity':'user','verified':True,'identities':{{'user':{{'openId':'user'}}}}}}))
+elif a==['user','info']: print(json.dumps({{'status':1,'data':{{'id':'1'}}}}))
+elif a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({{'ok':True,'data':{{'items':[],'has_more':False}}}}))
+else: sys.exit(99)
+"#)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match tool {
+            CliTool::Lark => settings.lark_path = path.display().to_string(),
+            CliTool::Tapd => settings.tapd_path = path.display().to_string(),
+        }
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Engine::open(&root.path().join("preferences-live.db"))
+            .await
+            .unwrap()
+            .save_settings(settings)
+            .await
+            .unwrap();
+    });
+    let backend = Arc::new(Backend {
+        native_probe: true,
+        credentials: Mutex::new(credentials()),
+        ..Default::default()
+    });
+    let worker = start_with_backend(root.path().into(), Mode::Live, backend.clone());
+    until(&worker, |event| {
+        matches!(event, Event::ConnectionStatus { .. })
+    });
+    send(&worker, Job::Refresh);
+    let events = until(&worker, |event| {
+        matches!(
+            event,
+            Event::State {
+                message: "refreshed",
+                ..
+            } | Event::Error(_)
+        )
+    });
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::State {
+                message: "refreshed",
+                ..
+            }
+        )),
+        "desktop refresh did not complete"
+    );
+    assert!(backend.loads.load(Ordering::SeqCst) > 0);
+    assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
+}
+
+// 会话补查经过真正的后台队列与 SQLite，且展示缓存不能被普通刷新清掉。
+#[test]
+fn selected_conversation_read_publishes_and_preserves_per_message_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut settings = Settings::default();
+    for (tool, version) in [
+        (CliTool::Lark, "lark-cli version 1.0.98"),
+        (CliTool::Tapd, "99.0.0"),
+    ] {
+        let path = root.path().join(format!("{tool:?}-cli"));
+        std::fs::write(&path, format!(r#"#!/usr/bin/env python3
+import sys,json
+a=sys.argv[1:]
+if a==['--version']: print('{version}')
+elif a==['--help']: print('Usage: tapd-cli [options] [command]')
+elif a==['auth','status','--json','--verify']:
+ print(json.dumps({{'appId':'injected-secret-app-id','brand':'feishu','identity':'user','verified':True,'identities':{{'user':{{'openId':'self'}}}}}}))
+elif a==['user','info']: print(json.dumps({{'status':1,'data':{{'id':'1'}}}}))
+elif a[:3]==['api','POST','/open-apis/task/v2/tasks/search']:
+ print(json.dumps({{'ok':True,'data':{{'items':[{{'id':'task'}}],'has_more':False}}}}))
+elif a[:3]==['task','tasks','get']:
+ print(json.dumps({{'ok':True,'data':{{'task':{{'guid':'task','summary':'Task','creator':{{'id':'self','name':'Creator'}},'origin':{{'refer_resources':[{{'type':'message','source_message':{{'message_id':'123','content':'hello'}}}}]}}}}}}}}))
+elif a[:3]==['api','POST','/open-apis/im/v1/messages/search']:
+ assert json.load(sys.stdin)['query']=='hello'
+ with open(__file__+'.matched','a') as f:f.write('lookup\n')
+ print(json.dumps({{'ok':True,'data':{{'items':[{{'meta_data':{{'message_id':'om_one'}}}}],'has_more':False}}}}))
+elif a[:3]==['api','GET','/open-apis/im/v1/messages/mget']:
+ print(json.dumps({{'ok':True,'data':{{'items':[{{'message_id':'om_one','msg_type':'text','chat_id':'oc_chat','message_position':'1','body':{{'content':'{{"text":"hello"}}'}},'sender':{{'id':'ou_sender','sender_name':'Sender'}}}}]}}}}))
+else: sys.exit(99)
+"#)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match tool {
+            CliTool::Lark => settings.lark_path = path.display().to_string(),
+            CliTool::Tapd => settings.tapd_path = path.display().to_string(),
+        }
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Engine::open(&root.path().join("preferences-live.db"))
+            .await
+            .unwrap()
+            .save_settings(settings)
+            .await
+            .unwrap();
+    });
+    let backend = Arc::new(Backend {
+        native_probe: true,
+        credentials: Mutex::new(credentials()),
+        ..Default::default()
+    });
+    let worker = start_with_backend(root.path().into(), Mode::Live, backend);
+    until(&worker, |event| {
+        matches!(event, Event::ConnectionStatus { .. })
+    });
+    send(&worker, Job::Refresh);
+    let events = until(&worker, |event| {
+        matches!(
+            event,
+            Event::State {
+                message: "refreshed",
+                ..
+            } | Event::Error(_)
+        )
+    });
+    let (profile, source) = events
+        .iter()
+        .find_map(|event| match event {
+            Event::State {
+                profile,
+                snapshot,
+                message: "refreshed",
+                ..
+            } => Some((profile.clone(), snapshot.records[0].source.clone())),
+            _ => None,
+        })
+        .expect("initial task refresh");
+    worker
+        .jobs
+        .send(Request {
+            sequence: 0,
+            profile,
+            job: Job::ResolveConversation {
+                source: Box::new(source),
+                session: 123,
+            },
+        })
+        .unwrap();
+    let events = until(&worker, |event| {
+        matches!(event, Event::Conversation(_) | Event::Error(_))
+    });
+    assert!(events.iter().any(|event| matches!(event, Event::State { snapshot, .. } if snapshot.records[0].source.metadata.matched_messages.contains_key("123"))));
+    let result = events
+        .iter()
+        .find_map(|event| {
+            if let Event::Conversation(result) = event {
+                Some(result)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(result.session, 123);
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        result.source.metadata.message_details["om_one"]
+            .sender
+            .as_ref()
+            .unwrap()
+            .name,
+        "Sender"
+    );
+    send(&worker, Job::Refresh);
+    let events = until(&worker, |event| {
+        matches!(
+            event,
+            Event::State {
+                message: "refreshed",
+                ..
+            } | Event::Error(_)
+        )
+    });
+    assert!(events.iter().any(|event| matches!(event, Event::State { snapshot, message: "refreshed", .. } if snapshot.records[0].source.metadata.matched_messages.contains_key("123"))));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("Lark-cli.matched")).unwrap(),
+        "lookup\n"
+    );
+}
+
+// 即使伪装程序的业务命令能返回数据，也必须先拒绝无法识别的 CLI，不能访问凭据。
+#[test]
+fn unrecognized_cli_blocks_account_business_before_credentials_or_commands() {
     use std::os::unix::fs::PermissionsExt;
     for bad_tool in [CliTool::Lark, CliTool::Tapd] {
         let root = tempfile::tempdir().unwrap();
@@ -1336,7 +1534,7 @@ fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
         for tool in [CliTool::Lark, CliTool::Tapd] {
             let path = root.path().join(format!("{tool:?}-cli"));
             let version = if tool == bad_tool {
-                "99.0.0"
+                "not-a-version"
             } else if tool == CliTool::Lark {
                 "1.0.96"
             } else {
@@ -1354,7 +1552,7 @@ fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
                 CliTool::Tapd => settings.tapd_path = path.display().to_string(),
             }
         }
-        // 正对照：不经过应用门禁时，未知版本确实能成功执行身份业务命令。
+        // 正对照：只看业务响应不足以证明这是正确的 CLI。
         let mut business_credentials = credentials();
         business_credentials.lark_user_token.clear();
         assert!(
@@ -1391,6 +1589,9 @@ fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
             metadata: Default::default(),
         };
         let draft = Draft {
+            workitem_kind: "story".into(),
+            workitem_type_id: "7".into(),
+            include_source_link: true,
             title: "title".into(),
             title_prefix: String::new(),
             attachments: vec![],
@@ -1403,7 +1604,7 @@ fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
             Job::Refresh,
             Job::LoadProjects,
             Job::LoadMembers("1".into()),
-            Job::Submit("task".into(), draft, source),
+            Job::Submit("task".into(), draft, source, None),
             Job::Recover {
                 guid: "task".into(),
                 workspace: "1".into(),
@@ -1420,15 +1621,15 @@ fn unsupported_cli_blocks_account_business_before_credentials_or_commands() {
                 })
                 .unwrap();
             let events = until(&worker, |e| matches!(e, Event::Error(_)));
-            assert!(events.iter().any(|e| matches!(e, Event::Error(message) if message.contains("supported") || message.contains("Unsupported"))), "missing version error");
+            assert!(events.iter().any(|e| matches!(e, Event::Error(message) if message.contains("unexpected version identity"))), "missing CLI identity error");
             assert_eq!(
                 backend.loads.load(Ordering::SeqCst),
                 loads,
-                "credentials accessed before compatibility gate"
+                "credentials accessed before CLI identity check"
             );
             assert!(
                 !marker.exists(),
-                "business CLI called before compatibility gate"
+                "business CLI called before CLI identity check"
             );
         }
         assert_eq!(backend.saves.load(Ordering::SeqCst), 0);
